@@ -92,6 +92,12 @@ class AlgorithmConfig:
     """filter out low reward samples if online filtering"""
     filter_high: float = 0.99
     """filter out high reward samples if online filtering"""
+    use_sdpo_t: bool = False
+    """enable SDPO-T (student: prompt, teacher: prompt + text feedback)"""
+    sdpo_coef: float = 0.0
+    """coefficient for SDPO-T logits distillation loss"""
+    sdpo_granularity: str = "logits"
+    """SDPO-T granularity, currently only supports `logits`"""
 
 
 @dataclass
@@ -160,6 +166,9 @@ class PPOConfig:
         self.worker.actor.use_kl_loss = self.algorithm.use_kl_loss
         self.worker.actor.kl_penalty = self.algorithm.kl_penalty
         self.worker.actor.kl_coef = self.algorithm.kl_coef
+        self.worker.actor.use_sdpo_t = self.algorithm.use_sdpo_t
+        self.worker.actor.sdpo_coef = self.algorithm.sdpo_coef
+        self.worker.actor.sdpo_granularity = self.algorithm.sdpo_granularity
 
     def deep_post_init(self):
         recursive_post_init(self)

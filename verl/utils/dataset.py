@@ -154,7 +154,7 @@ class RLHFDataset(Dataset):
                 num_proc=filter_overlong_prompts_workers,
             )
 
-    def _build_messages(self, example: dict[str, Any]) -> list[dict[str, Any]]:
+    def _build_messages(self, example: dict[str, Any]) -> tuple[list[dict[str, Any]], str]:
         prompt_str: str = example[self.prompt_key]
         if self.format_prompt:
             format_prompt = Template(self.format_prompt.strip())
@@ -170,7 +170,7 @@ class RLHFDataset(Dataset):
                 if content:
                     content_list.append({"type": "text", "text": content})
 
-            return [{"role": "user", "content": content_list}]
+            return [{"role": "user", "content": content_list}], prompt_str
         elif self.video_key in example:
             content_list = []
             for i, content in enumerate(prompt_str.split("<video>")):
@@ -180,12 +180,12 @@ class RLHFDataset(Dataset):
                 if content:
                     content_list.append({"type": "text", "text": content})
 
-            return [{"role": "user", "content": content_list}]
+            return [{"role": "user", "content": content_list}], prompt_str
         else:
-            return [{"role": "user", "content": prompt_str}]
+            return [{"role": "user", "content": prompt_str}], prompt_str
 
     def _filter_overlong_prompts(self, example: dict[str, Any]) -> bool:
-        messages = self._build_messages(example)
+        messages, _ = self._build_messages(example)
         if self.image_key in example:
             prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
             images = example[self.image_key]
@@ -221,8 +221,9 @@ class RLHFDataset(Dataset):
 
     def __getitem__(self, index):
         example: dict = self.dataset[index]
-        messages = self._build_messages(example)
+        messages, prompt_text = self._build_messages(example)
         example.pop(self.prompt_key, None)
+        example["prompt_text"] = prompt_text
 
         if self.image_key in example:
             prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)

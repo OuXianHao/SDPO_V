@@ -19,6 +19,8 @@ import os
 from collections import defaultdict
 from typing import Any, Optional
 
+import torch.nn.functional as F
+
 import torch
 import torch.distributed as dist
 from einops import rearrange
@@ -154,6 +156,95 @@ class DataParallelPPOActor(BasePPOActor):
 
         return log_probs
 
+    def _forward_response_logits(
+        self,
+        micro_batch: dict[str, torch.Tensor],
+        temperature: float,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        responses = micro_batch["responses"]
+        response_length = responses.size(-1)
+        if input_ids is None:
+            input_ids = micro_batch["input_ids"]
+        if attention_mask is None:
+            attention_mask = micro_batch["attention_mask"]
+        if position_ids is None:
+            position_ids = micro_batch["position_ids"]
+
+        multi_modal_inputs = defaultdict(list)
+        if "multi_modal_inputs" in micro_batch:
+            multi_modal_inputs = batch_collate(micro_batch["multi_modal_inputs"])
+            multi_modal_inputs = {key: torch.cat(value, dim=0) for key, value in multi_modal_inputs.items()}
+        else:
+            multi_modal_inputs = {}
+
+        output = self.actor_module(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            **multi_modal_inputs,
+            use_cache=False,
+        )
+        logits: torch.Tensor = output.logits
+        logits = logits[:, -response_length - 1 : -1, :] / temperature
+        return logits
+
+    def _build_teacher_input_ids(self, model_inputs: dict[str, Any]) -> torch.Tensor:
+        input_ids = model_inputs["input_ids"]
+        responses = model_inputs["responses"]
+        response_length = responses.size(-1)
+        prompt_length = input_ids.size(-1) - response_length
+        pad_token_id = model_inputs.get("pad_token_id", 0)
+        teacher_input_ids = []
+        raw_prompt_ids = model_inputs["raw_prompt_ids"]
+        feedback_token_ids = model_inputs["feedback_token_ids"]
+
+        for i in range(input_ids.size(0)):
+            prompt_ids = list(raw_prompt_ids[i]) + list(feedback_token_ids[i])
+            if len(prompt_ids) > prompt_length:
+                prompt_ids = prompt_ids[-prompt_length:]
+            else:
+                prompt_ids = [pad_token_id] * (prompt_length - len(prompt_ids)) + prompt_ids
+
+            prompt_tensor = torch.tensor(prompt_ids, dtype=input_ids.dtype, device=input_ids.device)
+            teacher_input_ids.append(torch.cat([prompt_tensor, responses[i]], dim=0))
+
+        return torch.stack(teacher_input_ids, dim=0)
+
+    def _compute_sdpo_t_loss(self, model_inputs: dict[str, Any], temperature: float) -> tuple[torch.Tensor, dict[str, float]]:
+        response_mask = model_inputs["response_token_mask"].bool() & model_inputs["sdpo_valid_mask"].bool()
+        teacher_input_ids = self._build_teacher_input_ids(model_inputs)
+
+        with torch.no_grad():
+            teacher_logits = self._forward_response_logits(
+                model_inputs,
+                temperature=temperature,
+                input_ids=teacher_input_ids,
+                attention_mask=model_inputs["attention_mask"],
+                position_ids=model_inputs["position_ids"],
+            )
+
+        student_logits = self._forward_response_logits(model_inputs, temperature=temperature)
+
+        teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
+        student_log_probs = F.log_softmax(student_logits, dim=-1)
+        teacher_probs = teacher_log_probs.exp()
+        token_kl = torch.sum(teacher_probs * (teacher_log_probs - student_log_probs), dim=-1)
+
+        token_mask_f = response_mask.float()
+        denom = token_mask_f.sum().clamp_min(1.0)
+        sdpo_loss = (token_kl * token_mask_f).sum() / denom
+        sequence_kl = (token_kl * token_mask_f).sum(dim=-1) / token_mask_f.sum(dim=-1).clamp_min(1.0)
+
+        metrics = {
+            "sdpo/loss": sdpo_loss.detach().item(),
+            "sdpo/token_kl_mean": (token_kl * token_mask_f).sum().detach().item() / denom.detach().item(),
+            "sdpo/sequence_kl_mean": sequence_kl.mean().detach().item(),
+        }
+        return sdpo_loss, metrics
+
     def _optimizer_step(self) -> torch.Tensor:
         if isinstance(self.actor_module, FSDP):
             grad_norm = self.actor_module.clip_grad_norm_(self.config.max_grad_norm)
@@ -192,6 +283,9 @@ class DataParallelPPOActor(BasePPOActor):
         temperature = data.meta_info["temperature"]
         select_keys = ["input_ids", "attention_mask", "position_ids", "responses"]
         non_tensor_select_keys = ["multi_modal_inputs"]
+        if self.config.use_sdpo_t:
+            select_keys.extend(["sdpo_valid_mask", "response_token_mask"])
+            non_tensor_select_keys.extend(["raw_prompt_ids", "feedback_text", "feedback_token_ids", "pad_token_id"])
 
         data = data.select(select_keys, non_tensor_select_keys)
         if self.config.dynamic_batching:
@@ -223,6 +317,9 @@ class DataParallelPPOActor(BasePPOActor):
         select_keys = ["input_ids", "attention_mask", "position_ids", "responses", "response_mask"]
         select_keys.extend(["old_log_probs", "ref_log_probs", "advantages"])
         non_tensor_select_keys = ["multi_modal_inputs"]
+        if self.config.use_sdpo_t:
+            select_keys.extend(["sdpo_valid_mask", "response_token_mask"])
+            non_tensor_select_keys.extend(["raw_prompt_ids", "feedback_text", "feedback_token_ids", "pad_token_id"])
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
@@ -283,6 +380,11 @@ class DataParallelPPOActor(BasePPOActor):
                         metrics["actor/kl_coef"] = self.config.kl_coef
                     else:
                         loss = pg_loss
+
+                    if self.config.use_sdpo_t and self.config.sdpo_coef > 0:
+                        sdpo_loss, sdpo_metrics = self._compute_sdpo_t_loss(model_inputs, temperature=temperature)
+                        loss = loss + self.config.sdpo_coef * sdpo_loss
+                        append_to_dict(metrics, sdpo_metrics)
 
                     loss = loss * torch.sum(response_mask) * self.world_size / total_response_tokens
                     loss.backward()
