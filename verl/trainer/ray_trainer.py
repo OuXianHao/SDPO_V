@@ -449,24 +449,22 @@ class RayPPOTrainer:
         print("Finish validation.")
         return {"val/reward_score": self.val_reward_score, **val_reward_metrics, **val_length_metrics}
 
-    def _build_feedback_text(self, batch: DataProto) -> tuple[np.ndarray, np.ndarray]:
+    def _build_feedback_text(self, batch: DataProto) -> np.ndarray:
         response_ids = batch.batch["responses"]
         response_lengths = torch.sum(batch.batch["response_mask"], dim=-1)
-        feedback_texts, feedback_token_ids = [], []
+        feedback_texts = []
         for i in range(len(batch)):
             cur_len = int(response_lengths[i].item())
             response_text = self.tokenizer.decode(response_ids[i][:cur_len], skip_special_tokens=True)
             score = float(batch.batch["token_level_scores"][i].sum().item())
             feedback = f"Response quality score: {score:.4f}. Improve correctness and faithfulness.\n[Response]: {response_text}"
             feedback_texts.append(feedback)
-            feedback_token_ids.append(self.tokenizer.encode(f"\n[Feedback]: {feedback}", add_special_tokens=False))
 
-        return np.array(feedback_texts, dtype=object), np.array(feedback_token_ids, dtype=object)
+        return np.array(feedback_texts, dtype=object)
 
     def _attach_sdpo_fields(self, batch: DataProto) -> DataProto:
-        feedback_text, feedback_token_ids = self._build_feedback_text(batch)
+        feedback_text = self._build_feedback_text(batch)
         batch.non_tensor_batch["feedback_text"] = feedback_text
-        batch.non_tensor_batch["feedback_token_ids"] = feedback_token_ids
         batch.batch["sdpo_valid_mask"] = torch.ones_like(batch.batch["response_mask"], dtype=torch.bool)
         batch.batch["response_token_mask"] = batch.batch["response_mask"].clone().bool()
         return batch

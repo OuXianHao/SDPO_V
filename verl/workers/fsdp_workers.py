@@ -443,6 +443,10 @@ class FSDPWorker(Worker):
                 config=self.config.actor,
                 actor_module=self.fsdp_module,
                 actor_optimizer=self.optimizer,
+                processor=self.processor,
+                min_pixels=self.config.data.min_pixels,
+                max_pixels=self.config.data.max_pixels,
+                video_fps=self.config.data.video_fps,
             )
 
         if self._has_critic:
@@ -531,14 +535,8 @@ class FSDPWorker(Worker):
                         # see https://github.com/hiyouga/EasyR1/pull/339
                         multi_modal_inputs = dict(self.processor.image_processor(images=images, return_tensors="pt"))
                     elif len(videos) != 0:
-                        print(f"[DEBUG] processor class: {self.processor.__class__.__name__}")
-                        print(f"[DEBUG] image_processor class: {self.processor.image_processor.__class__.__name__}")
-                        print(f"[DEBUG] has video_processor: {hasattr(self.processor, 'video_processor')}")
                         if hasattr(self.processor, "video_processor") and self.processor.video_processor is not None:
-                            print(f"[DEBUG] video_processor class: {self.processor.video_processor.__class__.__name__}")
-                            multi_modal_inputs = dict(
-                                self.processor.video_processor(videos=videos, return_tensors="pt")
-                            )
+                            multi_modal_inputs = dict(self.processor.video_processor(videos=videos, return_tensors="pt"))
                         else:
                             # fallback for older processor implementations
                             multi_modal_inputs = dict(

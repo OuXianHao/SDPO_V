@@ -30,6 +30,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from ...protocol import DataProto, batch_collate
 from ...trainer.core_algos import average_loss, compute_kl, compute_policy_loss
+from ...utils.dataset import process_image, process_video
 from ...utils import torch_functional as VF
 from ...utils.py_functional import append_to_dict
 from ...utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
@@ -53,6 +54,10 @@ class DataParallelPPOActor(BasePPOActor):
         config: ActorConfig,
         actor_module: nn.Module,
         actor_optimizer: Optional[torch.optim.Optimizer] = None,
+        processor: Optional[Any] = None,
+        min_pixels: Optional[int] = None,
+        max_pixels: Optional[int] = None,
+        video_fps: float = 2.0,
     ):
         """
         When optimizer is None, it is Reference Policy
@@ -62,6 +67,10 @@ class DataParallelPPOActor(BasePPOActor):
         self.world_size = int(os.getenv("WORLD_SIZE", "1"))
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
+        self.processor = processor
+        self.min_pixels = min_pixels
+        self.max_pixels = max_pixels
+        self.video_fps = video_fps
         if config.use_torch_compile:
             self.log_probs_from_logits = torch.compile(VF.log_probs_from_logits, dynamic=True)
         else:
@@ -163,6 +172,7 @@ class DataParallelPPOActor(BasePPOActor):
         input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
+        multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
         responses = micro_batch["responses"]
         response_length = responses.size(-1)
@@ -172,52 +182,168 @@ class DataParallelPPOActor(BasePPOActor):
             attention_mask = micro_batch["attention_mask"]
         if position_ids is None:
             position_ids = micro_batch["position_ids"]
+        if position_ids.dim() == 3:  # qwen2vl/qwen3vl mrope
+            position_ids = position_ids.transpose(0, 1)
 
-        multi_modal_inputs = defaultdict(list)
-        if "multi_modal_inputs" in micro_batch:
-            multi_modal_inputs = batch_collate(micro_batch["multi_modal_inputs"])
-            multi_modal_inputs = {key: torch.cat(value, dim=0) for key, value in multi_modal_inputs.items()}
+        if multi_modal_inputs is None:
+            mm_inputs = defaultdict(list)
+            if "multi_modal_inputs" in micro_batch:
+                mm_inputs = batch_collate(micro_batch["multi_modal_inputs"])
+                mm_inputs = {key: torch.cat(value, dim=0) for key, value in mm_inputs.items()}
+            else:
+                mm_inputs = {}
         else:
-            multi_modal_inputs = {}
+            mm_inputs = multi_modal_inputs
 
         output = self.actor_module(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            **multi_modal_inputs,
+            **mm_inputs,
             use_cache=False,
         )
         logits: torch.Tensor = output.logits
         logits = logits[:, -response_length - 1 : -1, :] / temperature
         return logits
 
-    def _build_teacher_inputs(self, model_inputs: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        input_ids = model_inputs["input_ids"]
+    def _build_teacher_message_content(self, prompt_text: str, multi_modal_data: Optional[dict[str, Any]]) -> Any:
+        if multi_modal_data is None:
+            return prompt_text
+
+        if "videos" in multi_modal_data:
+            marker = "<video>"
+            media_type = "video"
+        elif "images" in multi_modal_data:
+            marker = "<image>"
+            media_type = "image"
+        else:
+            return prompt_text
+
+        content_list = []
+        for idx, content in enumerate(prompt_text.split(marker)):
+            if idx != 0:
+                content_list.append({"type": media_type})
+            if content:
+                content_list.append({"type": "text", "text": content})
+        return content_list
+
+    def _build_teacher_inputs(
+        self, model_inputs: dict[str, Any]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        if self.processor is None:
+            raise RuntimeError("SDPO-T multimodal teacher reconstruction requires a processor on actor worker.")
+
+        device = model_inputs["input_ids"].device
         responses = model_inputs["responses"]
         response_mask = model_inputs["response_mask"]
-        raw_prompt_ids = model_inputs["raw_prompt_ids"]
-        feedback_token_ids = model_inputs["feedback_token_ids"]
+        prompt_texts = model_inputs["prompt_text"]
+        feedback_texts = model_inputs["feedback_text"]
+        batch_multi_modal_data = model_inputs.get("multi_modal_data", None)
         pad_token_ids = model_inputs.get("pad_token_id", None)
 
         teacher_sequences: list[torch.Tensor] = []
         teacher_attention_masks: list[torch.Tensor] = []
+        teacher_position_ids: list[torch.Tensor] = []
+        teacher_multi_modal_inputs: list[dict[str, torch.Tensor]] = []
 
-        for i in range(input_ids.size(0)):
-            prompt_ids = list(raw_prompt_ids[i]) + list(feedback_token_ids[i])
-            prompt_tensor = torch.tensor(prompt_ids, dtype=input_ids.dtype, device=input_ids.device)
-            sequence_ids = torch.cat([prompt_tensor, responses[i]], dim=0)
+        for i in range(responses.size(0)):
+            prompt_text = str(prompt_texts[i])
+            feedback_text = str(feedback_texts[i])
+            multi_modal_data = None if batch_multi_modal_data is None else batch_multi_modal_data[i]
+            teacher_prompt_text = f"{prompt_text}\n[Feedback]: {feedback_text}"
+            teacher_messages = [
+                {
+                    "role": "user",
+                    "content": self._build_teacher_message_content(teacher_prompt_text, multi_modal_data),
+                }
+            ]
+            teacher_prompt = self.processor.apply_chat_template(
+                teacher_messages,
+                add_generation_prompt=True,
+                tokenize=False,
+            )
 
-            prompt_attention = torch.ones((len(prompt_ids),), dtype=response_mask.dtype, device=input_ids.device)
-            sequence_attention = torch.cat([prompt_attention, response_mask[i]], dim=0)
+            processor_inputs: dict[str, Any]
+            if multi_modal_data is not None and "videos" in multi_modal_data:
+                processed_videos = []
+                video_fps_list = []
+                for video in multi_modal_data["videos"]:
+                    processed_video, video_sample_fps = process_video(
+                        video,
+                        self.min_pixels,
+                        self.max_pixels,
+                        self.video_fps,
+                        return_fps=True,
+                    )
+                    processed_videos.append(processed_video)
+                    video_fps_list.append(video_sample_fps)
+                processor_inputs = dict(
+                    self.processor(videos=processed_videos, text=[teacher_prompt], add_special_tokens=False, return_tensors="pt")
+                )
+                if "second_per_grid_ts" in self.processor.model_input_names and len(video_fps_list) > 0:
+                    processor_inputs["second_per_grid_ts"] = torch.tensor(
+                        [2.0 / max(float(video_sample_fps), 1e-6) for video_sample_fps in video_fps_list],
+                        dtype=torch.float32,
+                    )
+            elif multi_modal_data is not None and "images" in multi_modal_data:
+                processed_images = [process_image(image, self.min_pixels, self.max_pixels) for image in multi_modal_data["images"]]
+                processor_inputs = dict(
+                    self.processor(processed_images, [teacher_prompt], add_special_tokens=False, return_tensors="pt")
+                )
+            else:
+                processor_inputs = dict(self.processor(text=[teacher_prompt], add_special_tokens=False, return_tensors="pt"))
+
+            prompt_ids = processor_inputs.pop("input_ids")[0]
+            prompt_attention = processor_inputs.pop("attention_mask")[0]
+
+            if (
+                hasattr(self.processor, "image_processor")
+                and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__
+            ):
+                if "Qwen3VLProcessor" in self.processor.__class__.__name__:
+                    from ...models.transformers.qwen3_vl import get_rope_index
+                else:
+                    from ...models.transformers.qwen2_vl import get_rope_index
+
+                prompt_position = get_rope_index(
+                    self.processor,
+                    input_ids=prompt_ids,
+                    image_grid_thw=processor_inputs.get("image_grid_thw", None),
+                    video_grid_thw=processor_inputs.get("video_grid_thw", None),
+                    second_per_grid_ts=processor_inputs.get("second_per_grid_ts", None),
+                    attention_mask=prompt_attention,
+                )
+                text_position_ids = torch.arange(len(prompt_ids)).unsqueeze(0)
+                prompt_position = torch.cat((text_position_ids, prompt_position), dim=0)
+            else:
+                prompt_position = torch.clamp(prompt_attention.cumsum(dim=0) - 1, min=0)
+
+            sequence_ids = torch.cat([prompt_ids.to(dtype=responses.dtype), responses[i].cpu()], dim=0)
+            sequence_attention = torch.cat([prompt_attention.to(dtype=response_mask.dtype), response_mask[i].cpu()], dim=0)
+
+            response_delta = torch.arange(1, responses.size(-1) + 1)
+            if prompt_position.dim() == 2:
+                response_delta = response_delta.view(1, -1).expand(prompt_position.size(0), -1)
+                sequence_position = torch.cat([prompt_position, prompt_position[:, -1:] + response_delta], dim=-1)
+            else:
+                sequence_position = torch.cat([prompt_position, prompt_position[-1:] + response_delta], dim=-1)
+
+            for key, value in processor_inputs.items():
+                processor_inputs[key] = value.cpu()
 
             teacher_sequences.append(sequence_ids)
             teacher_attention_masks.append(sequence_attention)
+            teacher_position_ids.append(sequence_position)
+            teacher_multi_modal_inputs.append(processor_inputs)
 
         max_length = max(sequence_ids.size(0) for sequence_ids in teacher_sequences)
         padded_input_ids = []
         padded_attention_masks = []
+        padded_position_ids = []
 
-        for i, (sequence_ids, sequence_attention) in enumerate(zip(teacher_sequences, teacher_attention_masks)):
+        for i, (sequence_ids, sequence_attention, sequence_position) in enumerate(
+            zip(teacher_sequences, teacher_attention_masks, teacher_position_ids)
+        ):
             pad_length = max_length - sequence_ids.size(0)
             if pad_length > 0:
                 if pad_token_ids is None:
@@ -227,24 +353,36 @@ class DataParallelPPOActor(BasePPOActor):
                 left_pad_ids = torch.full(
                     (pad_length,),
                     fill_value=pad_token_id,
-                    dtype=input_ids.dtype,
-                    device=input_ids.device,
+                    dtype=responses.dtype,
+                    device=sequence_ids.device,
                 )
-                left_pad_attention = torch.zeros((pad_length,), dtype=response_mask.dtype, device=input_ids.device)
+                left_pad_attention = torch.zeros((pad_length,), dtype=response_mask.dtype, device=sequence_ids.device)
                 sequence_ids = torch.cat([left_pad_ids, sequence_ids], dim=0)
                 sequence_attention = torch.cat([left_pad_attention, sequence_attention], dim=0)
+                if sequence_position.dim() == 2:
+                    left_pad_position = torch.zeros((sequence_position.size(0), pad_length), dtype=sequence_position.dtype)
+                else:
+                    left_pad_position = torch.zeros((pad_length,), dtype=sequence_position.dtype)
+                sequence_position = torch.cat([left_pad_position, sequence_position], dim=-1)
 
             padded_input_ids.append(sequence_ids)
             padded_attention_masks.append(sequence_attention)
+            padded_position_ids.append(sequence_position)
 
-        teacher_input_ids = torch.stack(padded_input_ids, dim=0)
-        teacher_attention_mask = torch.stack(padded_attention_masks, dim=0)
-        teacher_position_ids = torch.clamp(teacher_attention_mask.cumsum(dim=-1) - 1, min=0)
-        return teacher_input_ids, teacher_attention_mask, teacher_position_ids
+        teacher_input_ids = torch.stack(padded_input_ids, dim=0).to(device)
+        teacher_attention_mask = torch.stack(padded_attention_masks, dim=0).to(device)
+        teacher_position_ids = torch.stack(padded_position_ids, dim=0).to(device)
+        teacher_multi_modal_inputs_batch = batch_collate(teacher_multi_modal_inputs)
+        teacher_multi_modal_inputs_batch = {
+            key: torch.cat(value, dim=0).to(device) for key, value in teacher_multi_modal_inputs_batch.items()
+        }
+        return teacher_input_ids, teacher_attention_mask, teacher_position_ids, teacher_multi_modal_inputs_batch
 
     def _compute_sdpo_t_loss(self, model_inputs: dict[str, Any], temperature: float) -> tuple[torch.Tensor, dict[str, float]]:
         response_mask = model_inputs["response_token_mask"].bool() & model_inputs["sdpo_valid_mask"].bool()
-        teacher_input_ids, teacher_attention_mask, teacher_position_ids = self._build_teacher_inputs(model_inputs)
+        teacher_input_ids, teacher_attention_mask, teacher_position_ids, teacher_multi_modal_inputs = self._build_teacher_inputs(
+            model_inputs
+        )
 
         with torch.no_grad():
             teacher_logits = self._forward_response_logits(
@@ -253,6 +391,7 @@ class DataParallelPPOActor(BasePPOActor):
                 input_ids=teacher_input_ids,
                 attention_mask=teacher_attention_mask,
                 position_ids=teacher_position_ids,
+                multi_modal_inputs=teacher_multi_modal_inputs,
             )
             teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
             del teacher_logits
@@ -345,7 +484,7 @@ class DataParallelPPOActor(BasePPOActor):
         non_tensor_select_keys = ["multi_modal_inputs"]
         if self.config.use_sdpo_t:
             select_keys.extend(["sdpo_valid_mask", "response_token_mask"])
-            non_tensor_select_keys.extend(["raw_prompt_ids", "feedback_text", "feedback_token_ids", "pad_token_id"])
+            non_tensor_select_keys.extend(["prompt_text", "feedback_text", "multi_modal_data", "pad_token_id"])
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
