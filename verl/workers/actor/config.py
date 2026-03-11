@@ -138,6 +138,9 @@ class ActorConfig:
     use_kl_loss: bool = field(default=False, init=False)
     kl_penalty: str = field(default="kl", init=False)
     kl_coef: float = field(default=0.0, init=False)
+    use_sdpo_t: bool = field(default=False, init=False)
+    sdpo_coef: float = field(default=0.0, init=False)
+    sdpo_granularity: str = field(default="logits", init=False)
 
 
 @dataclass

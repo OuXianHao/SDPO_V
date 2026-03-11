@@ -208,6 +208,9 @@ class RayPPOTrainer:
         if config.algorithm.adv_estimator not in list(AdvantageEstimator):
             raise NotImplementedError(f"Unknown advantage estimator: {config.algorithm.adv_estimator}.")
 
+        if config.algorithm.use_sdpo_t and config.algorithm.sdpo_granularity != "logits":
+            raise ValueError("SDPO-T currently only supports `algorithm.sdpo_granularity=logits`.")
+
         if config.data.rollout_batch_size % config.worker.actor.global_batch_size != 0:
             raise ValueError("Rollout batch size must be divisible by actor global batch size.")
 
@@ -446,6 +449,28 @@ class RayPPOTrainer:
         print("Finish validation.")
         return {"val/reward_score": self.val_reward_score, **val_reward_metrics, **val_length_metrics}
 
+    def _build_feedback_text(self, batch: DataProto) -> tuple[np.ndarray, np.ndarray]:
+        response_ids = batch.batch["responses"]
+        response_lengths = torch.sum(batch.batch["response_mask"], dim=-1)
+        feedback_texts, feedback_token_ids = [], []
+        for i in range(len(batch)):
+            cur_len = int(response_lengths[i].item())
+            response_text = self.tokenizer.decode(response_ids[i][:cur_len], skip_special_tokens=True)
+            score = float(batch.batch["token_level_scores"][i].sum().item())
+            feedback = f"Response quality score: {score:.4f}. Improve correctness and faithfulness.\n[Response]: {response_text}"
+            feedback_texts.append(feedback)
+            feedback_token_ids.append(self.tokenizer.encode(f"\n[Feedback]: {feedback}", add_special_tokens=False))
+
+        return np.array(feedback_texts, dtype=object), np.array(feedback_token_ids, dtype=object)
+
+    def _attach_sdpo_fields(self, batch: DataProto) -> DataProto:
+        feedback_text, feedback_token_ids = self._build_feedback_text(batch)
+        batch.non_tensor_batch["feedback_text"] = feedback_text
+        batch.non_tensor_batch["feedback_token_ids"] = feedback_token_ids
+        batch.batch["sdpo_valid_mask"] = torch.ones_like(batch.batch["response_mask"], dtype=torch.bool)
+        batch.batch["response_token_mask"] = batch.batch["response_mask"].clone().bool()
+        return batch
+
     def _balance_batch(self, batch: DataProto, metrics: dict[str, Any], logging_prefix: str = "global_seqlen") -> None:
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
         attention_mask = batch.batch["attention_mask"]
@@ -485,6 +510,10 @@ class RayPPOTrainer:
             new_batch.non_tensor_batch["uid"] = np.array(
                 [str(uuid.uuid4()) for _ in range(len(new_batch.batch))], dtype=object
             )
+            if self.config.algorithm.use_sdpo_t:
+                new_batch.non_tensor_batch["pad_token_id"] = np.array(
+                    [self.tokenizer.pad_token_id for _ in range(len(new_batch.batch))], dtype=object
+                )
 
             # pop those keys for generation
             gen_batch = new_batch.pop(
@@ -512,6 +541,10 @@ class RayPPOTrainer:
 
             # repeat to align with repeated responses in rollout
             new_batch = new_batch.repeat(repeat_times=self.config.worker.rollout.n, interleave=True)
+            if self.config.algorithm.use_sdpo_t and "raw_prompt_ids" in gen_batch.non_tensor_batch:
+                new_batch.non_tensor_batch["raw_prompt_ids"] = np.repeat(
+                    gen_batch.non_tensor_batch["raw_prompt_ids"], self.config.worker.rollout.n
+                )
             new_batch = new_batch.union(gen_batch_output)
 
             # filter group
@@ -630,6 +663,9 @@ class RayPPOTrainer:
                         batch.batch["token_level_scores"] = reward_tensor
                         reward_metrics = {f"reward/{k}": v for k, v in reduce_metrics(reward_metrics).items()}
                         metrics.update(reward_metrics)
+
+                    if self.config.algorithm.use_sdpo_t:
+                        batch = self._attach_sdpo_fields(batch)
 
                     # apply kl penalty if available
                     if not self.config.algorithm.use_kl_loss and self.use_reference_policy:
