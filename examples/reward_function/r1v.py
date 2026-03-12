@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import re
+import os
 from typing import Any
 
 from mathruler.grader import grade_answer
@@ -21,6 +22,13 @@ from mathruler.grader import grade_answer
 # Metadata
 REWARD_NAME = "r1v"
 REWARD_TYPE = "sequential"
+
+
+def _normalize_response(response: str) -> str:
+    # Handle Qwen-VL style tag spacing variants such as "< think >...< /think >".
+    response = re.sub(r"\s*(<|>|/)\s*", r"\1", response)
+    # Avoid false negative fullmatch when model adds harmless leading/trailing newlines.
+    return response.strip()
 
 
 def format_reward(response: str) -> float:
@@ -43,8 +51,22 @@ def accuracy_reward(response: str, ground_truth: str) -> float:
 
 
 def compute_score(reward_input: dict[str, Any], format_weight: float = 0.5) -> dict[str, float]:
-    format_score = format_reward(reward_input["response"])
-    accuracy_score = accuracy_reward(reward_input["response"], reward_input["ground_truth"])
+    raw_response = reward_input["response"]
+    response = _normalize_response(raw_response)
+    format_score = format_reward(response)
+    accuracy_score = accuracy_reward(response, reward_input["ground_truth"])
+
+    if os.getenv("R1V_DEBUG", "0") == "1":
+        has_think = bool(re.search(r"<think>.*?</think>", response, re.DOTALL))
+        has_answer = bool(re.search(r"<answer>.*?</answer>", response, re.DOTALL))
+        print(
+            "[R1V_DEBUG] "
+            f"raw={raw_response!r} "
+            f"normalized={response!r} "
+            f"has_think={has_think} "
+            f"has_answer={has_answer}"
+        )
+
     return {
         "overall": (1 - format_weight) * accuracy_score + format_weight * format_score,
         "format": format_score,
