@@ -40,6 +40,17 @@ worker:
     padding_free: true
     dynamic_batching: true
     ulysses_size: 1
+    teacher_format_prompt: |
+      A conversation between User and Assistant. The user asks a question, and the Assistant solves it.
+
+      The Assistant must respond in exactly the following format:
+      <think>reasoning process here</think><answer>final answer here</answer>
+
+      Do not output any extra text before, between, or after the tags.
+
+      User: {{ content | trim }}
+      Assistant:
+      
     model:
       model_path: Qwen/Qwen2.5-7B-Instruct
       enable_gradient_checkpointing: true

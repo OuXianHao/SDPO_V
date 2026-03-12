@@ -269,8 +269,10 @@ class RLHFDataset(Dataset):
 
     def __getitem__(self, index):
         example: dict = self.dataset[index]
+        raw_prompt_text = example[self.prompt_key]
         messages, prompt_text = self._build_messages(example)
         example.pop(self.prompt_key, None)
+        example["raw_prompt_text"] = raw_prompt_text
         example["prompt_text"] = prompt_text
 
         if self.image_key in example:

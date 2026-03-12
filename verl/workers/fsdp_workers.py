@@ -444,9 +444,9 @@ class FSDPWorker(Worker):
                 actor_module=self.fsdp_module,
                 actor_optimizer=self.optimizer,
                 processor=self.processor,
-                min_pixels=self.config.data.min_pixels,
-                max_pixels=self.config.data.max_pixels,
-                video_fps=self.config.data.video_fps,
+                min_pixels=self.config.min_pixels,
+                max_pixels=self.config.max_pixels,
+                video_fps=self.config.video_fps,
             )
 
         if self._has_critic:

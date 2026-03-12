@@ -75,6 +75,14 @@ class DataParallelPPOActor(BasePPOActor):
             self.log_probs_from_logits = torch.compile(VF.log_probs_from_logits, dynamic=True)
         else:
             self.log_probs_from_logits = VF.log_probs_from_logits
+    def _render_teacher_prompt_text(self, content_text: str) -> str:
+        format_prompt = self.config.teacher_format_prompt
+        if format_prompt is None or format_prompt == "":
+            return content_text
+
+        from jinja2 import Template
+        template = Template(format_prompt.strip())
+        return template.render(content=content_text)
 
     def _forward_micro_batch(self, micro_batch: dict[str, torch.Tensor], temperature: float) -> torch.Tensor:
         """
@@ -236,7 +244,7 @@ class DataParallelPPOActor(BasePPOActor):
         device = model_inputs["input_ids"].device
         responses = model_inputs["responses"]
         response_mask = model_inputs["response_mask"]
-        prompt_texts = model_inputs["prompt_text"]
+        raw_prompt_texts = model_inputs["raw_prompt_text"]
         feedback_texts = model_inputs["feedback_text"]
         batch_multi_modal_data = model_inputs.get("multi_modal_data", None)
         pad_token_ids = model_inputs.get("pad_token_id", None)
@@ -247,10 +255,13 @@ class DataParallelPPOActor(BasePPOActor):
         teacher_multi_modal_inputs: list[dict[str, torch.Tensor]] = []
 
         for i in range(responses.size(0)):
-            prompt_text = str(prompt_texts[i])
+            raw_prompt_text = str(raw_prompt_texts[i])
             feedback_text = str(feedback_texts[i])
             multi_modal_data = None if batch_multi_modal_data is None else batch_multi_modal_data[i]
-            teacher_prompt_text = f"{prompt_text}\n[Feedback]: {feedback_text}"
+
+            teacher_content_text = f"{raw_prompt_text}\n\n[Feedback]: {feedback_text}"
+            teacher_prompt_text = self._render_teacher_prompt_text(teacher_content_text)
+
             teacher_messages = [
                 {
                     "role": "user",
@@ -484,7 +495,9 @@ class DataParallelPPOActor(BasePPOActor):
         non_tensor_select_keys = ["multi_modal_inputs"]
         if self.config.use_sdpo_t:
             select_keys.extend(["sdpo_valid_mask", "response_token_mask"])
-            non_tensor_select_keys.extend(["prompt_text", "feedback_text", "multi_modal_data", "pad_token_id"])
+            non_tensor_select_keys.extend(
+                ["raw_prompt_text", "prompt_text", "feedback_text", "multi_modal_data", "pad_token_id"]
+            )
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347

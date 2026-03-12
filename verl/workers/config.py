@@ -16,7 +16,7 @@ ActorRolloutRef config
 """
 
 from dataclasses import dataclass, field
-
+from typing import Optional
 from .actor import ActorConfig, FSDPConfig, LoraConfig, ModelConfig, OptimConfig, RefConfig
 from .critic import CriticConfig
 from .reward import RewardConfig
@@ -45,6 +45,11 @@ class WorkerConfig:
     ref: RefConfig = field(default_factory=RefConfig)
     reward: RewardConfig = field(default_factory=RewardConfig)
     rollout: RolloutConfig = field(default_factory=RolloutConfig)
+
+    # for multimodal actor-side teacher reconstruction
+    min_pixels: Optional[int] = None
+    max_pixels: Optional[int] = None
+    video_fps: float = 2.0
 
     def post_init(self):
         self.ref.micro_batch_size_per_device_for_experience = self.actor.micro_batch_size_per_device_for_experience

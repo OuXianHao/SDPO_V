@@ -133,6 +133,8 @@ class ActorConfig:
     fsdp: FSDPConfig = field(default_factory=FSDPConfig)
     offload: OffloadConfig = field(default_factory=OffloadConfig)
     # below are auto keys
+    teacher_format_prompt: Optional[str] = None
+    """Optional Jinja template string used to rebuild teacher prompts for SDPO-T."""
     global_batch_size_per_device: int = field(default=-1, init=False)
     disable_kl: bool = field(default=False, init=False)
     use_kl_loss: bool = field(default=False, init=False)

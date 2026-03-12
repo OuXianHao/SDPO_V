@@ -99,7 +99,9 @@ def main():
     ppo_config = OmegaConf.merge(default_config, cli_args)
     ppo_config: PPOConfig = OmegaConf.to_object(ppo_config)
     ppo_config.deep_post_init()
-
+    ppo_config.worker.min_pixels = ppo_config.data.min_pixels
+    ppo_config.worker.max_pixels = ppo_config.data.max_pixels
+    ppo_config.worker.video_fps = ppo_config.data.video_fps
     if not ray.is_initialized():
         runtime_env = {
             "env_vars": {
