@@ -1,15 +1,16 @@
 #!/bin/bash
 set -euo pipefail
-export CUDA_VISIBLE_DEVICES=4,5,6,7
 
-# 0. W&B：建议每次在当前 shell 显式指定
-# 注意：这里不要把真实 key 写进脚本里，运行前在终端 export 即可
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+
+# W&B
+# 真实 key 请在运行前于当前 shell 中 export
 # export WANDB_API_KEY='your_key_here'
 export WANDB_PROJECT='EasyR1-SDPO'
-export WANDB_NAME='qwen3vl8b_videor1_sdpot_promptfix_run1'
+export WANDB_NAME='qwen3vl8b_perceptiontest_sdpot_routeA_run2'
 export WANDB_MODE=online
 
-# 1. 隔离并安全启动 Ray
+# Ray
 echo "Cleaning up old Ray processes..."
 pkill -u $USER -f ray || true
 sleep 2
@@ -18,22 +19,20 @@ ray stop --force || true
 echo "Starting isolated Ray cluster..."
 ray start --head --port=6388 --dashboard-port=8266
 
-# 2. 环境变量设置
+# Env
 export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 export FORCE_QWENVL_VIDEO_READER="torchvision"
 echo "Using Python at: $(which python)"
 
-# 3. 路径配置
+# Paths
 MODEL_PATH="/ssd5/zhzhu/models/Qwen3-VL-8B-Instruct"
 DATA_ROOT="/ssd5/zhzhu/datasets/Video-R1-data"
-TRAIN_DATA="/ssd5/zhzhu/datasets/Video-R1-data/PerceptionTest_parquet_train_debug/train.fixed.parquet"
 
-# 如果你后面有单独的 val 集，建议换成真实 val
-VAL_DATA="${TRAIN_DATA}"
+TRAIN_DATA="/ssd5/zhzhu/datasets/Video-R1-data/PerceptionTest_parquet_qiyuan_train/train.parquet"
+VAL_DATA="/ssd5/zhzhu/datasets/Video-R1-data/PerceptionTest_parquet_qiyuan_val/train.parquet"
 
 python -c "import decord; print('✨ Decord 完美加载，底层组件齐全！')"
 
-# 4. 启动训练
 python -m verl.trainer.main \
   config=examples/config.yaml \
   data.train_files=${TRAIN_DATA} \
@@ -67,13 +66,13 @@ python -m verl.trainer.main \
   data.video_fps=0.5 \
   data.max_pixels=602112 \
   trainer.total_epochs=1 \
-  trainer.max_steps=100 \
+  trainer.max_steps=500 \
   trainer.val_before_train=false \
-  trainer.val_freq=20 \
+  trainer.val_freq=50 \
   trainer.save_freq=-1 \
   trainer.logger='["console","wandb"]' \
   trainer.project_name=EasyR1_SDPO \
-  trainer.experiment_name=qwen3vl8b_videor1_sdpot_promptfix_run1 \
+  trainer.experiment_name=qwen3vl8b_perceptiontest_sdpot_routeA_run2 \
   trainer.n_gpus_per_node=4 \
   algorithm.use_sdpo_t=true \
   algorithm.sdpo_coef=0.1 \
