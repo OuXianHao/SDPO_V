@@ -29,6 +29,7 @@ from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer, ProcessorMixin
 
 from . import torch_functional as VF
+from .debug_dump import DEBUG_DUMP_WRITER
 
 
 def collate_fn(features: list[dict[str, Any]]) -> dict[str, Any]:
@@ -371,5 +372,7 @@ class RLHFDataset(Dataset):
         example["attention_mask"] = attention_mask
         example["position_ids"] = position_ids
         example["raw_prompt_ids"] = raw_prompt_ids
+        if DEBUG_DUMP_WRITER.should_dump():
+            example["student_prompt_text"] = prompt
         example["ground_truth"] = example.pop(self.answer_key)
         return example

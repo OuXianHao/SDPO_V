@@ -28,6 +28,7 @@ from typing import Any, Optional, Type
 import numpy as np
 import ray
 import torch
+from jinja2 import Template
 from ray.experimental.tqdm_ray import tqdm
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PreTrainedTokenizer, ProcessorMixin
@@ -462,9 +463,26 @@ class RayPPOTrainer:
 
         return np.array(feedback_texts, dtype=object)
 
+    def _build_teacher_prompt_text(self, batch: DataProto) -> np.ndarray:
+        format_prompt = self.config.worker.actor.teacher_format_prompt
+        raw_prompt_texts = batch.non_tensor_batch["raw_prompt_text"]
+        feedback_texts = batch.non_tensor_batch["feedback_text"]
+
+        teacher_prompt_texts = []
+        for raw_prompt_text, feedback_text in zip(raw_prompt_texts, feedback_texts):
+            content_text = f"{raw_prompt_text}\n\n[Feedback]: {feedback_text}"
+            if format_prompt is None or format_prompt == "":
+                teacher_prompt_text = content_text
+            else:
+                teacher_prompt_text = Template(format_prompt.strip()).render(content=content_text)
+            teacher_prompt_texts.append(teacher_prompt_text)
+
+        return np.array(teacher_prompt_texts, dtype=object)
+
     def _attach_sdpo_fields(self, batch: DataProto) -> DataProto:
         feedback_text = self._build_feedback_text(batch)
         batch.non_tensor_batch["feedback_text"] = feedback_text
+        batch.non_tensor_batch["teacher_prompt_text"] = self._build_teacher_prompt_text(batch)
         batch.batch["sdpo_valid_mask"] = torch.ones_like(batch.batch["response_mask"], dtype=torch.bool)
         batch.batch["response_token_mask"] = batch.batch["response_mask"].clone().bool()
         return batch
@@ -635,6 +653,7 @@ class RayPPOTrainer:
                 # compute reward
                 if "token_level_scores" not in batch.batch:
                     with timer("reward", timing_raw):
+                        batch.meta_info["global_step"] = self.global_step
                         reward_ref = self.reward_fn.compute_reward.remote(batch)
 
                 # recompute old_log_probs
