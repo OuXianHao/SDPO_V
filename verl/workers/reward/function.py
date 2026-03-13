@@ -23,6 +23,7 @@ import torch
 from transformers import PreTrainedTokenizer
 
 from ...protocol import DataProto
+from ...utils.debug_dump import DEBUG_DUMP_WRITER
 from .config import RewardConfig
 
 
@@ -46,6 +47,42 @@ BatchRewardFunction = Callable[[list[RewardInput]], list[RewardScore]]
 class SequentialFunctionRewardManagerMixin:
     reward_fn: SequentialRewardFunction
 
+    def _build_debug_record(
+        self,
+        data: DataProto,
+        sample_index: int,
+        reward_input: RewardInput,
+        score: RewardScore,
+    ) -> dict[str, object]:
+        problem_ids = data.non_tensor_batch.get("problem_id")
+        if problem_ids is None:
+            problem_ids = data.non_tensor_batch.get("id")
+
+        global_step = data.meta_info.get("global_step") if isinstance(data.meta_info, dict) else None
+        return {
+            "global_step": global_step,
+            "sample_index": sample_index,
+            "problem_id": str(problem_ids[sample_index]) if problem_ids is not None else None,
+            "ground_truth": reward_input.get("ground_truth"),
+            "student_prompt_text": str(data.non_tensor_batch["student_prompt_text"][sample_index])
+            if "student_prompt_text" in data.non_tensor_batch
+            else str(data.non_tensor_batch["prompt_text"][sample_index])
+            if "prompt_text" in data.non_tensor_batch
+            else None,
+            "student_output_text": reward_input.get("response"),
+            "teacher_prompt_text": str(data.non_tensor_batch["teacher_prompt_text"][sample_index])
+            if "teacher_prompt_text" in data.non_tensor_batch
+            else None,
+            "teacher_output_text": None,
+            "feedback_text": str(data.non_tensor_batch["feedback_text"][sample_index])
+            if "feedback_text" in data.non_tensor_batch
+            else None,
+            "reward_input_response": reward_input.get("response"),
+            "format_score": score.get("format"),
+            "accuracy_score": score.get("accuracy"),
+            "overall_score": score.get("overall"),
+        }
+
     def compute_reward_sequential(self, data: DataProto) -> Tuple[torch.Tensor, dict[str, list[float]]]:
         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
         reward_metrics = defaultdict(list)
@@ -64,6 +101,13 @@ class SequentialFunctionRewardManagerMixin:
                     "ground_truth": data.non_tensor_batch["ground_truth"][i],
                 }
             )
+            if DEBUG_DUMP_WRITER.should_dump():
+                reward_input: RewardInput = {
+                    "response": response_str,
+                    "response_length": cur_response_length,
+                    "ground_truth": data.non_tensor_batch["ground_truth"][i],
+                }
+                DEBUG_DUMP_WRITER.append(self._build_debug_record(data, i, reward_input, score))
             reward_tensor[i, cur_response_length - 1] = score["overall"]
             for key, value in score.items():
                 reward_metrics[key].append(value)
@@ -73,6 +117,18 @@ class SequentialFunctionRewardManagerMixin:
 
 class BatchFunctionRewardManagerMixin:
     reward_fn: BatchRewardFunction
+
+    def _maybe_dump_debug_records(
+        self,
+        data: DataProto,
+        reward_inputs: list[RewardInput],
+        scores: list[RewardScore],
+    ) -> None:
+        if not DEBUG_DUMP_WRITER.should_dump():
+            return
+
+        for i, (reward_input, score) in enumerate(zip(reward_inputs, scores)):
+            DEBUG_DUMP_WRITER.append(self._build_debug_record(data, i, reward_input, score))
 
     def compute_reward_batch(self, data: DataProto) -> Tuple[torch.Tensor, dict[str, list[float]]]:
         reward_inputs = []
@@ -93,6 +149,7 @@ class BatchFunctionRewardManagerMixin:
             )
 
         scores = self.reward_fn(reward_inputs)
+        self._maybe_dump_debug_records(data, reward_inputs, scores)
         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
         reward_metrics = defaultdict(list)
         for i, score in enumerate(scores):
