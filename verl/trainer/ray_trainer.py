@@ -736,6 +736,7 @@ class RayPPOTrainer:
 
                 # update actor
                 if self.config.trainer.critic_warmup <= self.global_step:
+                    batch.meta_info["temperature"] = self.config.worker.rollout.temperature
                     with timer("update_actor", timing_raw):
                         actor_output = self.actor_rollout_ref_wg.update_actor(batch)
 

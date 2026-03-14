@@ -502,7 +502,12 @@ class DataParallelPPOActor(BasePPOActor):
 
         self.actor_module.train()
 
-        temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid slient error
+        if "temperature" not in data.meta_info:
+            raise KeyError(
+                "Missing meta_info[\"temperature\"] in update_policy; "
+                "ray_trainer must set it from config.worker.rollout.temperature before update_actor."
+            )
+        temperature = data.meta_info["temperature"]
         select_keys = ["input_ids", "attention_mask", "position_ids", "responses", "response_mask"]
         non_tensor_select_keys = ["multi_modal_inputs"]
         if self.config.loss_mode == "grpo_on_policy":
