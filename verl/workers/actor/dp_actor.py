@@ -65,6 +65,7 @@ class DataParallelPPOActor(BasePPOActor):
         self.world_size = int(os.getenv("WORLD_SIZE", "1"))
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
+        self.is_trainable_actor = self.actor_optimizer is not None
         self.processor = processor
         self.min_pixels = min_pixels
         self.max_pixels = max_pixels
@@ -74,7 +75,7 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             self.log_probs_from_logits = VF.log_probs_from_logits
 
-        if self.rank == 0:
+        if self.is_trainable_actor and self.rank == 0:
             print(f"[actor] selected loss_mode={self.config.loss_mode}")
             if self.config.loss_mode == "sdpo_logit":
                 print(
@@ -496,6 +497,9 @@ class DataParallelPPOActor(BasePPOActor):
         return log_probs
 
     def update_policy(self, data: DataProto) -> dict[str, Any]:
+        if not self.is_trainable_actor:
+            raise RuntimeError("update_policy is only valid for trainable actor instances, not reference policy.")
+
         self.actor_module.train()
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid slient error
