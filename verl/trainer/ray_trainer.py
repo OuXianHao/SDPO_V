@@ -255,6 +255,8 @@ class RayPPOTrainer:
 
         if self.loss_mode == "grpo_on_policy" and config.worker.actor.ppo_epochs != 1:
             raise ValueError("grpo_on_policy requires actor.ppo_epochs=1 for strict on-policy single update.")
+        if self.loss_mode == "sdpo_logit" and config.worker.actor.ppo_epochs != 1:
+            raise ValueError("sdpo_logit requires actor.ppo_epochs=1 for clean standalone online SDPO.")
 
         if config.trainer.max_steps is not None:
             self.training_steps = config.trainer.max_steps
@@ -700,7 +702,8 @@ class RayPPOTrainer:
                         batch.batch["token_level_scores"] = reward_tensor
                         reward_metrics = {f"reward/{k}": v for k, v in reduce_metrics(reward_metrics).items()}
                         metrics.update(reward_metrics)
-
+                    # In sdpo_logit mode, reward is used only to construct teacher feedback text,
+                    # not to compute PPO/GRPO advantages or the main optimization objective.
                     if self.config.algorithm.loss_mode == "sdpo_logit":
                         batch = self._attach_sdpo_fields(batch, mode=self.config.algorithm.sdpo_feedback_mode)
                     else:

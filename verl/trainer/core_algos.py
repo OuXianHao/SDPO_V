@@ -206,8 +206,9 @@ def compute_grpo_outcome_advantage(
 
     for idx in id2score:
         assert len(id2score[idx]) > 1, "GRPO needs rollout.n > 1."
-        id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
-        id2std[idx] = torch.std(torch.tensor(id2score[idx]))
+        group_scores = torch.stack(id2score[idx])
+        id2mean[idx] = group_scores.mean()
+        id2std[idx] = group_scores.std()
 
     for i in range(bsz):
         scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + eps)
@@ -549,6 +550,12 @@ def compute_sdpo_logit_loss(
     divergence: Literal["forward_kl", "reverse_kl"] = "forward_kl",
     use_tail: bool = True,
 ) -> tuple[torch.Tensor, dict[str, float]]:
+    """
+    Standalone SDPO logit-level loss.
+
+    This implementation uses a student top-K + aggregated-tail approximation
+    rather than exact full-vocabulary KL over all logits.
+    """
     if student_logits.shape != teacher_logits.shape:
         raise ValueError("student_logits and teacher_logits must have the same shape.")
     if student_logits.shape[:2] != response_mask.shape:

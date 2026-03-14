@@ -397,7 +397,11 @@ class DataParallelPPOActor(BasePPOActor):
         return teacher_input_ids, teacher_attention_mask, teacher_position_ids, teacher_multi_modal_inputs_batch
 
     def _compute_sdpo_logit_loss(self, model_inputs: dict[str, Any], temperature: float) -> tuple[torch.Tensor, dict[str, float]]:
-        response_mask = model_inputs["response_token_mask"].bool() & model_inputs["sdpo_valid_mask"].bool()
+        response_mask = (
+            model_inputs["response_mask"].bool()
+            & model_inputs["response_token_mask"].bool()
+            & model_inputs["sdpo_valid_mask"].bool()
+        )
         if response_mask.shape != model_inputs["responses"].shape:
             raise ValueError("response_token_mask must align with sampled responses shape.")
         teacher_input_ids, teacher_attention_mask, teacher_position_ids, teacher_multi_modal_inputs = self._build_teacher_inputs(
