@@ -4,20 +4,20 @@ set -euo pipefail
 export CUDA_VISIBLE_DEVICES=4,5,6,7
 
 # W&B
-# 真实 key 请在运行前于当前 shell 中 export
-# export WANDB_API_KEY='your_key_here'
+# 请先在当前 shell 中 export WANDB_API_KEY='your_key_here'
 export WANDB_PROJECT='EasyR1-SDPO'
-export WANDB_NAME='qwen3vl8b_perceptiontest_sdpot_routeA_run3'
+export WANDB_NAME='qwen3vl8b_perceptiontest_sdpo_logit_run4'
 export WANDB_MODE=online
 
 # SDPO debug dump
+# 正式训练也保留 debug dump；500 条会比较大，但便于排查 teacher feedback / prompt / samples
 export SDPO_DEBUG_DUMP=1
-export SDPO_DEBUG_DUMP_PATH="/ssd5/xhou/outputs/sdpo_debug_run3.jsonl"
-export SDPO_DEBUG_MAX_SAMPLES=20
+export SDPO_DEBUG_DUMP_PATH="/ssd5/xhou/outputs/sdpo_debug_run4.jsonl"
+export SDPO_DEBUG_MAX_SAMPLES=500
 
 # Ray
 echo "Cleaning up old Ray processes..."
-pkill -u $USER -f ray || true
+pkill -u "$USER" -f ray || true
 sleep 2
 ray stop --force || true
 
@@ -36,19 +36,25 @@ DATA_ROOT="/ssd5/zhzhu/datasets/Video-R1-data"
 TRAIN_DATA="/ssd5/zhzhu/datasets/Video-R1-data/PerceptionTest_parquet_qiyuan_train/train.parquet"
 VAL_DATA="/ssd5/zhzhu/datasets/Video-R1-data/PerceptionTest_parquet_qiyuan_val/train.parquet"
 
+# Quick env check
 python -c "import decord; print('✨ Decord 完美加载，底层组件齐全！')"
 
 python -m verl.trainer.main \
   config=examples/config.yaml \
-  data.train_files=${TRAIN_DATA} \
-  data.val_files=${VAL_DATA} \
+  data.train_files="${TRAIN_DATA}" \
+  data.val_files="${VAL_DATA}" \
   data.prompt_key=problem \
   data.answer_key=answer \
   data.video_key=videos \
-  data.image_dir=${DATA_ROOT} \
+  data.image_dir="${DATA_ROOT}" \
   data.format_prompt=./examples/format_prompt/r1v.jinja \
+  data.rollout_batch_size=8 \
+  data.max_prompt_length=3500 \
+  data.max_response_length=2048 \
+  data.video_fps=0.5 \
+  data.max_pixels=602112 \
   worker.reward.reward_function=./examples/reward_function/r1v.py:compute_score \
-  worker.actor.model.model_path=${MODEL_PATH} \
+  worker.actor.model.model_path="${MODEL_PATH}" \
   worker.actor.model.enable_gradient_checkpointing=true \
   worker.actor.model.lora.rank=0 \
   worker.actor.optim.lr=1e-6 \
@@ -59,26 +65,24 @@ python -m verl.trainer.main \
   worker.actor.dynamic_batching=false \
   worker.actor.offload.offload_params=true \
   worker.actor.offload.offload_optimizer=true \
+  worker.actor.ppo_epochs=1 \
   worker.rollout.n=2 \
   worker.rollout.temperature=0.7 \
   worker.rollout.tensor_parallel_size=1 \
-  worker.rollout.gpu_memory_utilization=0.35 \
-  worker.rollout.max_model_len=12288 \
-  worker.rollout.max_num_batched_tokens=12288 \
-  data.rollout_batch_size=8 \
-  data.max_prompt_length=5000 \
-  data.max_response_length=4096 \
-  data.video_fps=0.5 \
-  data.max_pixels=602112 \
+  worker.rollout.gpu_memory_utilization=0.50 \
+  worker.rollout.max_model_len=8192 \
+  worker.rollout.max_num_batched_tokens=8192 \
   trainer.total_epochs=1 \
-  trainer.max_steps=500 \
+  trainer.max_steps=2000 \
   trainer.val_before_train=false \
-  trainer.val_freq=50 \
-  trainer.save_freq=-1 \
+  trainer.val_freq=200 \
+  trainer.save_freq=200 \
   trainer.logger='["console","wandb"]' \
   trainer.project_name=EasyR1_SDPO \
-  trainer.experiment_name=qwen3vl8b_perceptiontest_sdpot_routeA_run3 \
+  trainer.experiment_name=qwen3vl8b_perceptiontest_sdpo_logit_run4 \
   trainer.n_gpus_per_node=4 \
-  algorithm.use_sdpo_t=true \
-  algorithm.sdpo_coef=0.1 \
-  algorithm.sdpo_granularity=logits
+  algorithm.loss_mode=sdpo_logit \
+  algorithm.sdpo_topk=100 \
+  algorithm.sdpo_divergence=forward_kl \
+  algorithm.sdpo_use_tail=true \
+  algorithm.sdpo_feedback_mode=scalar_text
