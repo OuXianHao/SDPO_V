@@ -760,7 +760,7 @@ class RayPPOTrainer:
 
             # collect metrics
             num_gpus = self.resource_pool_manager.get_num_gpus()
-            metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+            metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic, loss_mode=self.loss_mode))
             metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
             metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, num_gpus=num_gpus))
 

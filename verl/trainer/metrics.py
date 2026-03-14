@@ -45,8 +45,17 @@ def compute_length_metrics(batch: DataProto) -> dict[str, Any]:
     }
 
 
-def compute_data_metrics(batch: DataProto, use_critic: bool = False) -> dict[str, Any]:
+def compute_data_metrics(batch: DataProto, use_critic: bool = False, loss_mode: str = "grpo_on_policy") -> dict[str, Any]:
     sequence_score = batch.batch["token_level_scores"].sum(-1)
+
+    if loss_mode == "sdpo_logit":
+        return {
+            "sdpo/score/mean": torch.mean(sequence_score).detach().item(),
+            "sdpo/score/max": torch.max(sequence_score).detach().item(),
+            "sdpo/score/min": torch.min(sequence_score).detach().item(),
+            **compute_length_metrics(batch),
+        }
+
     sequence_reward = batch.batch["token_level_rewards"].sum(-1)
 
     advantages = batch.batch["advantages"]
