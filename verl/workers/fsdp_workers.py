@@ -82,6 +82,13 @@ class FSDPWorker(Worker):
         if not dist.is_initialized():
             dist.init_process_group(backend="nccl")
 
+        if torch.cuda.is_available():
+            self._device = torch.device("cuda", torch.cuda.current_device())
+            self._barrier_device_ids = [self._device.index]
+        else:
+            self._device = torch.device("cpu")
+            self._barrier_device_ids = None
+
         # improve numerical stability
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
@@ -199,6 +206,9 @@ class FSDPWorker(Worker):
         else:
             torch_dtype = PrecisionType.to_dtype(fsdp_config.torch_dtype)
 
+        # transformers deprecates torch_dtype in favor of dtype; pass dtype explicitly
+        model_dtype_kwargs = {"dtype": torch_dtype}
+
         if role == "critic":
             AutoClass = AutoModelForTokenClassification
         elif type(self.model_config) in AutoModelForImageTextToText._model_mapping.keys():
@@ -210,7 +220,7 @@ class FSDPWorker(Worker):
             model = AutoClass.from_pretrained(
                 model_config.model_path,
                 config=self.model_config,
-                torch_dtype=torch_dtype,
+                **model_dtype_kwargs,
                 attn_implementation="flash_attention_2",
                 device_map="cpu" if fsdp_config.enable_rank0_init else "cuda",
                 low_cpu_mem_usage=True,
@@ -220,7 +230,7 @@ class FSDPWorker(Worker):
             with no_init_weights(), init_empty_weights():
                 model = AutoClass.from_config(
                     self.model_config,
-                    torch_dtype=torch_dtype,
+                    **model_dtype_kwargs,
                     attn_implementation="flash_attention_2",
                     trust_remote_code=model_config.trust_remote_code,
                 )
@@ -271,7 +281,7 @@ class FSDPWorker(Worker):
             else:
                 self.print_rank0("No vision tower found.")
 
-        dist.barrier()
+        dist.barrier(device_ids=self._barrier_device_ids)
         print_model_size(model)
         print_gpu_memory_usage("After huggingface model init")
         mixed_precision = MixedPrecision(
@@ -485,7 +495,7 @@ class FSDPWorker(Worker):
             load_fsdp_model(self.fsdp_module)
 
         self.checkpoint_manager.save_checkpoint(path, save_model_only)
-        dist.barrier()
+        dist.barrier(device_ids=self._barrier_device_ids)
         if self._use_param_offload:
             offload_fsdp_model(self.fsdp_module)
 
@@ -496,7 +506,7 @@ class FSDPWorker(Worker):
             load_fsdp_model(self.fsdp_module)
 
         self.checkpoint_manager.load_checkpoint(path)
-        dist.barrier()
+        dist.barrier(device_ids=self._barrier_device_ids)
         if self._use_param_offload:
             offload_fsdp_model(self.fsdp_module)
 
