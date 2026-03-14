@@ -21,6 +21,7 @@ data:
   filter_overlong_prompts: true
 
 algorithm:
+  loss_mode: grpo_on_policy
   adv_estimator: grpo
   disable_kl: false
   use_kl_loss: true
@@ -30,6 +31,10 @@ algorithm:
   filter_key: overall
   filter_low: 0.01
   filter_high: 0.99
+  sdpo_topk: 100
+  sdpo_divergence: forward_kl
+  sdpo_use_tail: true
+  sdpo_feedback_mode: scalar_text
 
 worker:
   actor:

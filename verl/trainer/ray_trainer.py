@@ -192,25 +192,38 @@ class RayPPOTrainer:
         self.use_reward_model = Role.RewardModel in role_worker_mapping
         self.ray_worker_group_cls = ray_worker_group_cls
 
+        self.loss_mode = config.algorithm.loss_mode
+        print(f"[trainer] selected loss_mode={self.loss_mode}")
+        if self.loss_mode == "sdpo_logit":
+            print(
+                f"[trainer] sdpo settings: topk={config.algorithm.sdpo_topk}, "
+                f"divergence={config.algorithm.sdpo_divergence}, use_tail={config.algorithm.sdpo_use_tail}, "
+                f"feedback_mode={config.algorithm.sdpo_feedback_mode}"
+            )
+
         # define KL control
-        if config.algorithm.disable_kl:
+        if config.algorithm.disable_kl or self.loss_mode == "sdpo_logit":
             self.use_reference_policy = False
             self.kl_ctrl = FixedKLController(init_kl_coef=0.0)
-            print("KL is disabled, no KL metrics will be logged. Please set `kl_coef=0` to log KL metrics.")
+            if config.algorithm.disable_kl:
+                print("KL is disabled, no KL metrics will be logged. Please set `kl_coef=0` to log KL metrics.")
         else:
             self.use_reference_policy = True
             self.kl_ctrl = get_kl_controller(config.algorithm)
 
-        if config.algorithm.adv_estimator == AdvantageEstimator.GAE:
+        if self.loss_mode == "sdpo_logit":
+            self.use_critic = False
+        elif config.algorithm.adv_estimator == AdvantageEstimator.GAE:
             self.use_critic = True
         else:
             self.use_critic = False
 
-        if config.algorithm.adv_estimator not in list(AdvantageEstimator):
+        if self.loss_mode == "grpo_on_policy" and config.algorithm.adv_estimator not in list(AdvantageEstimator):
             raise NotImplementedError(f"Unknown advantage estimator: {config.algorithm.adv_estimator}.")
 
-        if config.algorithm.use_sdpo_t and config.algorithm.sdpo_granularity != "logits":
-            raise ValueError("SDPO-T currently only supports `algorithm.sdpo_granularity=logits`.")
+        if config.algorithm.loss_mode not in ("grpo_on_policy", "sdpo_logit"):
+            raise ValueError("algorithm.loss_mode must be one of {`grpo_on_policy`, `sdpo_logit`}.")
+        print(f"[trainer] teacher feedback fields enabled={config.algorithm.loss_mode == 'sdpo_logit'}")
 
         if config.data.rollout_batch_size % config.worker.actor.global_batch_size != 0:
             raise ValueError("Rollout batch size must be divisible by actor global batch size.")
@@ -234,10 +247,14 @@ class RayPPOTrainer:
                 )
 
         if (
-            config.algorithm.adv_estimator in (AdvantageEstimator.GRPO, AdvantageEstimator.RLOO)
+            self.loss_mode == "grpo_on_policy"
+            and config.algorithm.adv_estimator in (AdvantageEstimator.GRPO, AdvantageEstimator.RLOO)
             and config.worker.rollout.n == 1
         ):
             raise ValueError("GRPO and RLOO algorithm need `config.worker.rollout.n > 1`.")
+
+        if self.loss_mode == "grpo_on_policy" and config.worker.actor.ppo_epochs != 1:
+            raise ValueError("grpo_on_policy requires actor.ppo_epochs=1 for strict on-policy single update.")
 
         if config.trainer.max_steps is not None:
             self.training_steps = config.trainer.max_steps
@@ -479,7 +496,9 @@ class RayPPOTrainer:
 
         return np.array(teacher_prompt_texts, dtype=object)
 
-    def _attach_sdpo_fields(self, batch: DataProto) -> DataProto:
+    def _attach_sdpo_fields(self, batch: DataProto, mode: str = "scalar_text") -> DataProto:
+        if mode != "scalar_text":
+            raise ValueError(f"Unsupported sdpo feedback mode: {mode}")
         feedback_text = self._build_feedback_text(batch)
         batch.non_tensor_batch["feedback_text"] = feedback_text
         batch.non_tensor_batch["teacher_prompt_text"] = self._build_teacher_prompt_text(batch)
@@ -526,7 +545,7 @@ class RayPPOTrainer:
             new_batch.non_tensor_batch["uid"] = np.array(
                 [str(uuid.uuid4()) for _ in range(len(new_batch.batch))], dtype=object
             )
-            if self.config.algorithm.use_sdpo_t:
+            if self.config.algorithm.loss_mode == "sdpo_logit":
                 new_batch.non_tensor_batch["pad_token_id"] = np.array(
                     [self.tokenizer.pad_token_id for _ in range(len(new_batch.batch))], dtype=object
                 )
@@ -557,7 +576,7 @@ class RayPPOTrainer:
 
             # repeat to align with repeated responses in rollout
             new_batch = new_batch.repeat(repeat_times=self.config.worker.rollout.n, interleave=True)
-            if self.config.algorithm.use_sdpo_t and "raw_prompt_ids" in gen_batch.non_tensor_batch:
+            if self.config.algorithm.loss_mode == "sdpo_logit" and "raw_prompt_ids" in gen_batch.non_tensor_batch:
                 new_batch.non_tensor_batch["raw_prompt_ids"] = np.repeat(
                     gen_batch.non_tensor_batch["raw_prompt_ids"], self.config.worker.rollout.n
                 )
@@ -656,10 +675,11 @@ class RayPPOTrainer:
                         batch.meta_info["global_step"] = self.global_step
                         reward_ref = self.reward_fn.compute_reward.remote(batch)
 
-                # recompute old_log_probs
-                with timer("old", timing_raw):
-                    old_log_probs = self.actor_rollout_ref_wg.compute_log_probs(batch)
-                    batch = batch.union(old_log_probs)
+                # recompute old_log_probs (only needed by on-policy GRPO objective)
+                if self.loss_mode == "grpo_on_policy":
+                    with timer("old", timing_raw):
+                        old_log_probs = self.actor_rollout_ref_wg.compute_log_probs(batch)
+                        batch = batch.union(old_log_probs)
 
                 # compute ref_log_probs
                 if self.use_reference_policy:
@@ -681,24 +701,27 @@ class RayPPOTrainer:
                         reward_metrics = {f"reward/{k}": v for k, v in reduce_metrics(reward_metrics).items()}
                         metrics.update(reward_metrics)
 
-                    if self.config.algorithm.use_sdpo_t:
-                        batch = self._attach_sdpo_fields(batch)
-
-                    # apply kl penalty if available
-                    if not self.config.algorithm.use_kl_loss and self.use_reference_policy:
-                        # apply kl penalty to reward
-                        batch, kl_metrics = apply_kl_penalty(batch, self.kl_ctrl, self.config.algorithm.kl_penalty)
-                        metrics.update(kl_metrics)
+                    if self.config.algorithm.loss_mode == "sdpo_logit":
+                        batch = self._attach_sdpo_fields(batch, mode=self.config.algorithm.sdpo_feedback_mode)
                     else:
-                        batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+                        # apply kl penalty if available
+                        if not self.config.algorithm.use_kl_loss and self.use_reference_policy:
+                            # apply kl penalty to reward
+                            batch, kl_metrics = apply_kl_penalty(batch, self.kl_ctrl, self.config.algorithm.kl_penalty)
+                            metrics.update(kl_metrics)
+                        else:
+                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
-                    # compute advantages, executed on the driver process
-                    batch = compute_advantage(
-                        batch,
-                        adv_estimator=self.config.algorithm.adv_estimator,
-                        gamma=self.config.algorithm.gamma,
-                        lam=self.config.algorithm.lam,
-                    )
+                        # compute advantages, executed on the driver process
+                        batch = compute_advantage(
+                            batch,
+                            adv_estimator=self.config.algorithm.adv_estimator,
+                            gamma=self.config.algorithm.gamma,
+                            lam=self.config.algorithm.lam,
+                        )
+                        metrics["grpo/reward_mean"] = batch.batch["token_level_scores"].sum(dim=-1).float().mean().item()
+                        metrics["grpo/adv_mean"] = batch.batch["advantages"].float().mean().item()
+                        metrics["grpo/adv_std"] = batch.batch["advantages"].float().std().item()
 
                 # update critic
                 if self.use_critic:

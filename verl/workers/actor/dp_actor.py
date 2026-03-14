@@ -19,8 +19,6 @@ import os
 from collections import defaultdict
 from typing import Any, Optional
 
-import torch.nn.functional as F
-
 import torch
 import torch.distributed as dist
 from einops import rearrange
@@ -29,7 +27,7 @@ from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from ...protocol import DataProto, batch_collate
-from ...trainer.core_algos import average_loss, compute_kl, compute_policy_loss
+from ...trainer.core_algos import compute_grpo_loss, compute_sdpo_logit_loss
 from ...utils.dataset import process_image, process_video
 from ...utils import torch_functional as VF
 from ...utils.py_functional import append_to_dict
@@ -75,6 +73,15 @@ class DataParallelPPOActor(BasePPOActor):
             self.log_probs_from_logits = torch.compile(VF.log_probs_from_logits, dynamic=True)
         else:
             self.log_probs_from_logits = VF.log_probs_from_logits
+
+        if self.rank == 0:
+            print(f"[actor] selected loss_mode={self.config.loss_mode}")
+            if self.config.loss_mode == "sdpo_logit":
+                print(
+                    f"[actor] sdpo settings: topk={self.config.sdpo_topk}, "
+                    f"divergence={self.config.sdpo_divergence}, use_tail={self.config.sdpo_use_tail}"
+                )
+
     def _render_teacher_prompt_text(self, content_text: str) -> str:
         format_prompt = self.config.teacher_format_prompt
         if format_prompt is None or format_prompt == "":
@@ -389,8 +396,10 @@ class DataParallelPPOActor(BasePPOActor):
         }
         return teacher_input_ids, teacher_attention_mask, teacher_position_ids, teacher_multi_modal_inputs_batch
 
-    def _compute_sdpo_t_loss(self, model_inputs: dict[str, Any], temperature: float) -> tuple[torch.Tensor, dict[str, float]]:
+    def _compute_sdpo_logit_loss(self, model_inputs: dict[str, Any], temperature: float) -> tuple[torch.Tensor, dict[str, float]]:
         response_mask = model_inputs["response_token_mask"].bool() & model_inputs["sdpo_valid_mask"].bool()
+        if response_mask.shape != model_inputs["responses"].shape:
+            raise ValueError("response_token_mask must align with sampled responses shape.")
         teacher_input_ids, teacher_attention_mask, teacher_position_ids, teacher_multi_modal_inputs = self._build_teacher_inputs(
             model_inputs
         )
@@ -404,25 +413,20 @@ class DataParallelPPOActor(BasePPOActor):
                 position_ids=teacher_position_ids,
                 multi_modal_inputs=teacher_multi_modal_inputs,
             )
-            teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
-            del teacher_logits
 
         student_logits = self._forward_response_logits(model_inputs, temperature=temperature)
-        student_log_probs = F.log_softmax(student_logits, dim=-1)
-        token_kl = torch.sum(teacher_log_probs.exp() * (teacher_log_probs - student_log_probs), dim=-1)
-        del student_logits
-        del student_log_probs
+        if teacher_logits.shape[:2] != student_logits.shape[:2]:
+            raise ValueError("Teacher and student response spans must align for sdpo_logit.")
 
-        token_mask_f = response_mask.float()
-        denom = token_mask_f.sum().clamp_min(1.0)
-        sdpo_loss = (token_kl * token_mask_f).sum() / denom
-        sequence_kl = (token_kl * token_mask_f).sum(dim=-1) / token_mask_f.sum(dim=-1).clamp_min(1.0)
-
-        metrics = {
-            "sdpo/loss": sdpo_loss.detach().item(),
-            "sdpo/token_kl_mean": (token_kl * token_mask_f).sum().detach().item() / denom.detach().item(),
-            "sdpo/sequence_kl_mean": sequence_kl.mean().detach().item(),
-        }
+        sdpo_loss, sdpo_metrics = compute_sdpo_logit_loss(
+            student_logits=student_logits,
+            teacher_logits=teacher_logits,
+            response_mask=response_mask,
+            topk=self.config.sdpo_topk,
+            divergence=self.config.sdpo_divergence,
+            use_tail=self.config.sdpo_use_tail,
+        )
+        metrics = {f"sdpo/{k}": v for k, v in sdpo_metrics.items()}
         return sdpo_loss, metrics
 
     def _optimizer_step(self) -> torch.Tensor:
@@ -486,18 +490,22 @@ class DataParallelPPOActor(BasePPOActor):
             log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
 
         return log_probs
+
     def update_policy(self, data: DataProto) -> dict[str, Any]:
         self.actor_module.train()
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid slient error
         select_keys = ["input_ids", "attention_mask", "position_ids", "responses", "response_mask"]
-        select_keys.extend(["old_log_probs", "ref_log_probs", "advantages"])
         non_tensor_select_keys = ["multi_modal_inputs"]
-        if self.config.use_sdpo_t:
+        if self.config.loss_mode == "grpo_on_policy":
+            select_keys.extend(["old_log_probs", "advantages"])
+        elif self.config.loss_mode == "sdpo_logit":
             select_keys.extend(["sdpo_valid_mask", "response_token_mask"])
             non_tensor_select_keys.extend(
                 ["raw_prompt_text", "prompt_text", "feedback_text", "multi_modal_data", "pad_token_id"]
             )
+        else:
+            raise ValueError(f"Unknown actor.loss_mode: {self.config.loss_mode}")
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
@@ -525,51 +533,31 @@ class DataParallelPPOActor(BasePPOActor):
                 for micro_batch in micro_batches:
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
                     response_mask = model_inputs["response_mask"]
-                    old_log_probs = model_inputs["old_log_probs"]
-                    advantages = model_inputs["advantages"]
+                    if self.config.loss_mode == "grpo_on_policy":
+                        old_log_probs = model_inputs["old_log_probs"]
+                        advantages = model_inputs["advantages"]
 
-                    # all return: (bsz, response_length)
-                    log_probs = self._forward_micro_batch(model_inputs, temperature=temperature)
-
-                    pg_loss, pg_metrics = compute_policy_loss(
-                        old_log_probs=old_log_probs,
-                        log_probs=log_probs,
-                        advantages=advantages,
-                        response_mask=response_mask,
-                        clip_ratio_low=self.config.clip_ratio_low,
-                        clip_ratio_high=self.config.clip_ratio_high,
-                        clip_ratio_dual=self.config.clip_ratio_dual,
-                        tau_positive=self.config.tau_positive,
-                        tau_negative=self.config.tau_negative,
-                        loss_type=self.config.loss_type,
-                        loss_avg_mode=self.config.loss_avg_mode,
-                    )
-                    if self.config.use_kl_loss and "ref_log_probs" in model_inputs:
-                        ref_log_probs = model_inputs["ref_log_probs"]
-                        # compute kl loss
-                        kld = compute_kl(
+                        log_probs = self._forward_micro_batch(model_inputs, temperature=temperature)
+                        loss, grpo_metrics = compute_grpo_loss(
+                            old_log_probs=old_log_probs,
                             log_probs=log_probs,
-                            ref_log_probs=ref_log_probs,
-                            kl_penalty=self.config.kl_penalty,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            clip_ratio_low=self.config.clip_ratio_low,
+                            clip_ratio_high=self.config.clip_ratio_high,
+                            clip_ratio_dual=self.config.clip_ratio_dual,
+                            loss_avg_mode=self.config.loss_avg_mode,
                         )
-                        kl_loss = average_loss(kld, response_mask, mode=self.config.loss_avg_mode)
-                        loss = pg_loss + kl_loss * self.config.kl_coef
-                        metrics["actor/kl_loss"] = kl_loss.detach().item()
-                        metrics["actor/kl_coef"] = self.config.kl_coef
-                    else:
-                        loss = pg_loss
-
-                    if self.config.use_sdpo_t and self.config.sdpo_coef > 0:
-                        sdpo_loss, sdpo_metrics = self._compute_sdpo_t_loss(model_inputs, temperature=temperature)
-                        loss = loss + self.config.sdpo_coef * sdpo_loss
+                        loss = loss * torch.sum(response_mask) * self.world_size / total_response_tokens
+                        loss.backward()
+                        append_to_dict(metrics, {f"grpo/{k}": v for k, v in grpo_metrics.items()})
+                    elif self.config.loss_mode == "sdpo_logit":
+                        loss, sdpo_metrics = self._compute_sdpo_logit_loss(model_inputs, temperature=temperature)
+                        loss = loss * torch.sum(response_mask) * self.world_size / total_response_tokens
+                        loss.backward()
                         append_to_dict(metrics, sdpo_metrics)
-
-                    loss = loss * torch.sum(response_mask) * self.world_size / total_response_tokens
-                    loss.backward()
-
-                    batch_metrics = {f"actor/{k}": v for k, v in pg_metrics.items()}
-                    batch_metrics["actor/pg_loss"] = pg_loss.detach().item()
-                    append_to_dict(metrics, batch_metrics)
+                    else:
+                        raise ValueError(f"Unknown actor.loss_mode: {self.config.loss_mode}")
 
                 grad_norm = self._optimizer_step()
                 append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})

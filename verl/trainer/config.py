@@ -64,6 +64,8 @@ class DataConfig:
 
 @dataclass
 class AlgorithmConfig:
+    loss_mode: str = "grpo_on_policy"
+    """training objective mode, support `grpo_on_policy`, `sdpo_logit`"""
     gamma: float = 1.0
     """discount factor for ppo gae advantage estimator"""
     lam: float = 1.0
@@ -92,12 +94,10 @@ class AlgorithmConfig:
     """filter out low reward samples if online filtering"""
     filter_high: float = 0.99
     """filter out high reward samples if online filtering"""
-    use_sdpo_t: bool = False
-    """enable SDPO-T (student: prompt, teacher: prompt + text feedback)"""
-    sdpo_coef: float = 0.0
-    """coefficient for SDPO-T logits distillation loss"""
-    sdpo_granularity: str = "logits"
-    """SDPO-T granularity, currently only supports `logits`"""
+    sdpo_topk: int = 100
+    sdpo_divergence: str = "forward_kl"
+    sdpo_use_tail: bool = True
+    sdpo_feedback_mode: str = "scalar_text"
 
 
 @dataclass
@@ -166,9 +166,11 @@ class PPOConfig:
         self.worker.actor.use_kl_loss = self.algorithm.use_kl_loss
         self.worker.actor.kl_penalty = self.algorithm.kl_penalty
         self.worker.actor.kl_coef = self.algorithm.kl_coef
-        self.worker.actor.use_sdpo_t = self.algorithm.use_sdpo_t
-        self.worker.actor.sdpo_coef = self.algorithm.sdpo_coef
-        self.worker.actor.sdpo_granularity = self.algorithm.sdpo_granularity
+        self.worker.actor.loss_mode = self.algorithm.loss_mode
+        self.worker.actor.sdpo_topk = self.algorithm.sdpo_topk
+        self.worker.actor.sdpo_divergence = self.algorithm.sdpo_divergence
+        self.worker.actor.sdpo_use_tail = self.algorithm.sdpo_use_tail
+        self.worker.actor.sdpo_feedback_mode = self.algorithm.sdpo_feedback_mode
 
     def deep_post_init(self):
         recursive_post_init(self)

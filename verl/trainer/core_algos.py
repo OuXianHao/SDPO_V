@@ -509,6 +509,99 @@ def compute_policy_loss(
     return final_pg_loss, metrics
 
 
+def compute_grpo_loss(
+    old_log_probs: torch.Tensor,
+    log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    clip_ratio_low: float,
+    clip_ratio_high: float,
+    clip_ratio_dual: float,
+    loss_avg_mode: Literal["token", "seq"],
+) -> tuple[torch.Tensor, dict[str, float]]:
+    loss, metrics = compute_policy_loss(
+        old_log_probs=old_log_probs,
+        log_probs=log_probs,
+        advantages=advantages,
+        response_mask=response_mask,
+        clip_ratio_low=clip_ratio_low,
+        clip_ratio_high=clip_ratio_high,
+        clip_ratio_dual=clip_ratio_dual,
+        tau_positive=1.0,
+        tau_negative=1.0,
+        loss_type="default",
+        loss_avg_mode=loss_avg_mode,
+    )
+    ratio = torch.exp(torch.clamp(log_probs - old_log_probs, -20.0, 20.0))
+    metrics = {
+        "loss": loss.detach().item(),
+        "ratio_mean": VF.masked_mean(ratio, response_mask).detach().item(),
+        "clipfrac": metrics["pg_clipfrac_higher"],
+    }
+    return loss, metrics
+
+
+def compute_sdpo_logit_loss(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    response_mask: torch.Tensor,
+    topk: int = 100,
+    divergence: Literal["forward_kl", "reverse_kl"] = "forward_kl",
+    use_tail: bool = True,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    if student_logits.shape != teacher_logits.shape:
+        raise ValueError("student_logits and teacher_logits must have the same shape.")
+    if student_logits.shape[:2] != response_mask.shape:
+        raise ValueError("response_mask shape must match first two dims of logits.")
+    if divergence not in ("forward_kl", "reverse_kl"):
+        raise ValueError(f"Unsupported divergence: {divergence}")
+
+    vocab_size = student_logits.size(-1)
+    k = min(max(int(topk), 1), vocab_size)
+    mask_f = response_mask.float()
+    valid_count = mask_f.sum().clamp_min(1.0)
+
+    student_log_probs = F.log_softmax(student_logits, dim=-1)
+    teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
+    student_probs = student_log_probs.exp()
+    teacher_probs = teacher_log_probs.exp()
+
+    topk_values, topk_indices = torch.topk(student_log_probs, k=k, dim=-1)
+    student_topk_logp = topk_values
+    student_topk_prob = student_topk_logp.exp()
+    teacher_topk_logp = torch.gather(teacher_log_probs, dim=-1, index=topk_indices)
+    teacher_topk_prob = teacher_topk_logp.exp()
+
+    if divergence == "forward_kl":
+        token_loss = (teacher_topk_prob * (teacher_topk_logp - student_topk_logp)).sum(dim=-1)
+    else:
+        token_loss = (student_topk_prob * (student_topk_logp - teacher_topk_logp)).sum(dim=-1)
+
+    student_topk_mass = student_topk_prob.sum(dim=-1)
+    teacher_topk_mass = teacher_topk_prob.sum(dim=-1)
+    student_tail = (1.0 - student_topk_mass).clamp_min(1e-12)
+    teacher_tail = (1.0 - teacher_topk_mass).clamp_min(1e-12)
+
+    if use_tail:
+        if divergence == "forward_kl":
+            token_loss = token_loss + teacher_tail * (torch.log(teacher_tail) - torch.log(student_tail))
+        else:
+            token_loss = token_loss + student_tail * (torch.log(student_tail) - torch.log(teacher_tail))
+
+    loss = (token_loss * mask_f).sum() / valid_count
+    student_entropy = -(student_probs * student_log_probs).sum(dim=-1)
+    teacher_entropy = -(teacher_probs * teacher_log_probs).sum(dim=-1)
+    metrics = {
+        "logit_loss": loss.detach().item(),
+        "topk": float(k),
+        "topk_mass_mean": (student_topk_mass * mask_f).sum().detach().item() / valid_count.detach().item(),
+        "tail_mass_mean": (student_tail * mask_f).sum().detach().item() / valid_count.detach().item(),
+        "student_entropy": (student_entropy * mask_f).sum().detach().item() / valid_count.detach().item(),
+        "teacher_entropy": (teacher_entropy * mask_f).sum().detach().item() / valid_count.detach().item(),
+    }
+    return loss, metrics
+
+
 def compute_value_loss(
     vpreds: torch.Tensor,
     returns: torch.Tensor,
