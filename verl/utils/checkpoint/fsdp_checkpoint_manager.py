@@ -57,6 +57,10 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         processing_class: Union[PreTrainedTokenizer, ProcessorMixin],
     ):
         super().__init__(model, optimizer, lr_scheduler, processing_class)
+        if torch.cuda.is_available():
+            self._barrier_device_ids = [torch.cuda.current_device()]
+        else:
+            self._barrier_device_ids = None
 
     def load_checkpoint(self, path: Optional[str] = None):
         if path is None:
@@ -89,7 +93,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
 
     def save_checkpoint(self, path: str, save_model_only: bool = False):
         path = self.local_mkdir(path)
-        dist.barrier()
+        dist.barrier(device_ids=self._barrier_device_ids)
 
         # every rank will save its own model and optim shard
         model_path = os.path.join(path, f"model_world_size_{self.world_size}_rank_{self.rank}.pt")
@@ -115,7 +119,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             torch.save(extra_state_dict, extra_path)
 
         # wait for everyone to dump to local
-        dist.barrier()
+        dist.barrier(device_ids=self._barrier_device_ids)
 
         if self.rank == 0:
             hf_path = os.path.join(path, "huggingface")
@@ -151,8 +155,8 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 with open(os.path.join(lora_path, "adapter_config.json"), "w", encoding="utf-8") as f:
                     json.dump(peft_config, f, ensure_ascii=False, indent=4)
 
-            dist.barrier()
+            dist.barrier(device_ids=self._barrier_device_ids)
             if self.rank == 0:
                 print(f"[rank-{self.rank}]: Saved LoRA adapter to: {lora_path}")
 
-        dist.barrier()
+        dist.barrier(device_ids=self._barrier_device_ids)

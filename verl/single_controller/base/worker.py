@@ -135,11 +135,15 @@ class Worker(WorkerHelper):
             cuda_visible_devices = os.getenv("LOCAL_RANK", "0")
             torch.cuda.set_device(int(cuda_visible_devices))
 
+        # Ray exports local rank as RAY_LOCAL_RANK / RAY_LOCAL_WORLD_SIZE.
+        # Normalize to LOCAL_* and bind rank -> device explicitly before any distributed collectives.
+        local_world_size = int(os.getenv("LOCAL_WORLD_SIZE", os.getenv("RAY_LOCAL_WORLD_SIZE", "1")))
+        local_rank = int(os.getenv("LOCAL_RANK", os.getenv("RAY_LOCAL_RANK", "0")))
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+
         master_addr = os.getenv("MASTER_ADDR")
         master_port = os.getenv("MASTER_PORT")
-
-        local_world_size = int(os.getenv("LOCAL_WORLD_SIZE", "1"))
-        local_rank = int(os.getenv("LOCAL_RANK", "0"))
 
         store = {
             "_world_size": world_size,
