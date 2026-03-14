@@ -1,14 +1,19 @@
 #!/bin/bash
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=4,5,6,7
 
 # W&B
 # 真实 key 请在运行前于当前 shell 中 export
 # export WANDB_API_KEY='your_key_here'
 export WANDB_PROJECT='EasyR1-SDPO'
-export WANDB_NAME='qwen3vl8b_perceptiontest_sdpot_routeA_run2'
+export WANDB_NAME='qwen3vl8b_perceptiontest_sdpot_routeA_run3'
 export WANDB_MODE=online
+
+# SDPO debug dump
+export SDPO_DEBUG_DUMP=1
+export SDPO_DEBUG_DUMP_PATH="/ssd5/xhou/outputs/sdpo_debug_run3.jsonl"
+export SDPO_DEBUG_MAX_SAMPLES=20
 
 # Ray
 echo "Cleaning up old Ray processes..."
@@ -61,8 +66,8 @@ python -m verl.trainer.main \
   worker.rollout.max_model_len=12288 \
   worker.rollout.max_num_batched_tokens=12288 \
   data.rollout_batch_size=8 \
-  data.max_prompt_length=4096 \
-  data.max_response_length=256 \
+  data.max_prompt_length=5000 \
+  data.max_response_length=4096 \
   data.video_fps=0.5 \
   data.max_pixels=602112 \
   trainer.total_epochs=1 \
@@ -72,7 +77,7 @@ python -m verl.trainer.main \
   trainer.save_freq=-1 \
   trainer.logger='["console","wandb"]' \
   trainer.project_name=EasyR1_SDPO \
-  trainer.experiment_name=qwen3vl8b_perceptiontest_sdpot_routeA_run2 \
+  trainer.experiment_name=qwen3vl8b_perceptiontest_sdpot_routeA_run3 \
   trainer.n_gpus_per_node=4 \
   algorithm.use_sdpo_t=true \
   algorithm.sdpo_coef=0.1 \

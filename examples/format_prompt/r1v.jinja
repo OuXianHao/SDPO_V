@@ -1,9 +1,10 @@
 A conversation between User and Assistant. The user asks a question, and the Assistant solves it.
 
-The Assistant must respond in exactly the following format:
-<think>reasoning process here</think><answer>final answer here</answer>
+The Assistant may provide brief reasoning before the final answer.
+Keep the reasoning concise and focused on the visual evidence.
 
-Do not output any extra text before, between, or after the tags.
+The final answer must be enclosed in exactly one pair of <answer> and </answer> tags.
+Do not output any text after </answer>.
 
 User: {{ content | trim }}
 Assistant:
