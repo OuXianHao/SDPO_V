@@ -551,12 +551,14 @@ def compute_sdpo_logit_loss(
     topk: int = 100,
     divergence: Literal["forward_kl", "reverse_kl"] = "forward_kl",
     use_tail: bool = True,
+    approx_mode: Literal["topk", "full_vocab"] = "topk",
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """
     Standalone SDPO logit-level loss.
 
-    This implementation uses a student top-K + aggregated-tail approximation
-    rather than exact full-vocabulary KL over all logits.
+    This implementation supports two computation modes:
+    - "topk": student top-K + optional aggregated-tail approximation (default)
+    - "full_vocab": exact KL over the full vocabulary
     """
     if student_logits.shape != teacher_logits.shape:
         raise ValueError("student_logits and teacher_logits must have the same shape.")
@@ -564,6 +566,8 @@ def compute_sdpo_logit_loss(
         raise ValueError("response_mask shape must match first two dims of logits.")
     if divergence not in ("forward_kl", "reverse_kl"):
         raise ValueError(f"Unsupported divergence: {divergence}")
+    if approx_mode not in ("topk", "full_vocab"):
+        raise ValueError(f"Unsupported approx_mode: {approx_mode}")
 
     vocab_size = student_logits.size(-1)
     k = min(max(int(topk), 1), vocab_size)
@@ -575,29 +579,40 @@ def compute_sdpo_logit_loss(
     student_probs = student_log_probs.exp()
     teacher_probs = teacher_log_probs.exp()
 
-    topk_values, topk_indices = torch.topk(student_log_probs, k=k, dim=-1)
-    student_topk_logp = topk_values
-    student_topk_prob = student_topk_logp.exp()
-    teacher_topk_logp = torch.gather(teacher_log_probs, dim=-1, index=topk_indices)
-    teacher_topk_prob = teacher_topk_logp.exp()
+    if approx_mode == "topk":
+        topk_values, topk_indices = torch.topk(student_log_probs, k=k, dim=-1)
+        student_topk_logp = topk_values
+        student_topk_prob = student_topk_logp.exp()
+        teacher_topk_logp = torch.gather(teacher_log_probs, dim=-1, index=topk_indices)
+        teacher_topk_prob = teacher_topk_logp.exp()
 
-    if divergence == "forward_kl":
-        token_loss = (teacher_topk_prob * (teacher_topk_logp - student_topk_logp)).sum(dim=-1)
-        full_token_loss = (teacher_probs * (teacher_log_probs - student_log_probs)).sum(dim=-1)
-    else:
-        token_loss = (student_topk_prob * (student_topk_logp - teacher_topk_logp)).sum(dim=-1)
-        full_token_loss = (student_probs * (student_log_probs - teacher_log_probs)).sum(dim=-1)
-
-    student_topk_mass = student_topk_prob.sum(dim=-1)
-    teacher_topk_mass = teacher_topk_prob.sum(dim=-1)
-    student_tail = (1.0 - student_topk_mass).clamp_min(1e-12)
-    teacher_tail = (1.0 - teacher_topk_mass).clamp_min(1e-12)
-
-    if use_tail:
         if divergence == "forward_kl":
-            token_loss = token_loss + teacher_tail * (torch.log(teacher_tail) - torch.log(student_tail))
+            token_loss = (teacher_topk_prob * (teacher_topk_logp - student_topk_logp)).sum(dim=-1)
+            full_token_loss = (teacher_probs * (teacher_log_probs - student_log_probs)).sum(dim=-1)
         else:
-            token_loss = token_loss + student_tail * (torch.log(student_tail) - torch.log(teacher_tail))
+            token_loss = (student_topk_prob * (student_topk_logp - teacher_topk_logp)).sum(dim=-1)
+            full_token_loss = (student_probs * (student_log_probs - teacher_log_probs)).sum(dim=-1)
+
+        student_topk_mass = student_topk_prob.sum(dim=-1)
+        teacher_topk_mass = teacher_topk_prob.sum(dim=-1)
+        student_tail = (1.0 - student_topk_mass).clamp_min(1e-12)
+        teacher_tail = (1.0 - teacher_topk_mass).clamp_min(1e-12)
+
+        if use_tail:
+            if divergence == "forward_kl":
+                token_loss = token_loss + teacher_tail * (torch.log(teacher_tail) - torch.log(student_tail))
+            else:
+                token_loss = token_loss + student_tail * (torch.log(student_tail) - torch.log(teacher_tail))
+    else:
+        topk_indices = torch.empty(0, device=student_logits.device, dtype=torch.long)
+        if divergence == "forward_kl":
+            token_loss = (teacher_probs * (teacher_log_probs - student_log_probs)).sum(dim=-1)
+            full_token_loss = token_loss
+        else:
+            token_loss = (student_probs * (student_log_probs - teacher_log_probs)).sum(dim=-1)
+            full_token_loss = token_loss
+        student_topk_mass = torch.ones_like(token_loss)
+        student_tail = torch.zeros_like(token_loss)
 
     loss = (token_loss * mask_f).sum() / valid_count
     student_entropy = -(student_probs * student_log_probs).sum(dim=-1)
@@ -647,7 +662,9 @@ def compute_sdpo_logit_loss(
                 "batch_index": b,
                 "token_index": t,
                 "topk": int(k),
-                "selected_topk_token_ids": topk_indices[b, t].detach().cpu().tolist(),
+                "selected_topk_token_ids": (
+                    topk_indices[b, t].detach().cpu().tolist() if approx_mode == "topk" else []
+                ),
                 "teacher_top10_ids": teacher_top10_ids.detach().cpu().tolist(),
                 "teacher_top10_probs": teacher_top10_probs.detach().cpu().tolist(),
                 "student_top10_ids": student_top10_ids.detach().cpu().tolist(),
@@ -662,7 +679,8 @@ def compute_sdpo_logit_loss(
 
     metrics = {
         "logit_loss": loss.detach().item(),
-        "topk": float(k),
+        "topk": float(k if approx_mode == "topk" else vocab_size),
+        "approx_mode": 0.0 if approx_mode == "topk" else 1.0,
         "topk_mass_mean": (student_topk_mass * mask_f).sum().detach().item() / valid_count.detach().item(),
         "tail_mass_mean": (student_tail * mask_f).sum().detach().item() / valid_count.detach().item(),
         "student_entropy": (student_entropy * mask_f).sum().detach().item() / valid_count.detach().item(),

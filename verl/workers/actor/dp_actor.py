@@ -80,7 +80,8 @@ class DataParallelPPOActor(BasePPOActor):
             if self.config.loss_mode == "sdpo_logit":
                 print(
                     f"[actor] sdpo settings: topk={self.config.sdpo_topk}, "
-                    f"divergence={self.config.sdpo_divergence}, use_tail={self.config.sdpo_use_tail}"
+                    f"divergence={self.config.sdpo_divergence}, use_tail={self.config.sdpo_use_tail}, "
+                    f"approx_mode={self.config.sdpo_approx_mode}"
                 )
 
     def _render_teacher_prompt_text(self, content_text: str) -> str:
@@ -430,6 +431,7 @@ class DataParallelPPOActor(BasePPOActor):
             topk=self.config.sdpo_topk,
             divergence=self.config.sdpo_divergence,
             use_tail=self.config.sdpo_use_tail,
+            approx_mode=self.config.sdpo_approx_mode,
         )
         metrics = {f"sdpo/{k}": v for k, v in sdpo_metrics.items()}
         return sdpo_loss, metrics

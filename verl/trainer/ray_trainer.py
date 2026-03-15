@@ -198,6 +198,7 @@ class RayPPOTrainer:
             print(
                 f"[trainer] sdpo settings: topk={config.algorithm.sdpo_topk}, "
                 f"divergence={config.algorithm.sdpo_divergence}, use_tail={config.algorithm.sdpo_use_tail}, "
+                f"approx_mode={config.algorithm.sdpo_approx_mode}, "
                 f"feedback_mode={config.algorithm.sdpo_feedback_mode}"
             )
 
