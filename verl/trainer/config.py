@@ -97,6 +97,7 @@ class AlgorithmConfig:
     sdpo_topk: int = 100
     sdpo_divergence: str = "forward_kl"
     sdpo_use_tail: bool = True
+    sdpo_approx_mode: str = "topk"
     sdpo_feedback_mode: str = "scalar_text"
 
 
@@ -170,6 +171,7 @@ class PPOConfig:
         self.worker.actor.sdpo_topk = self.algorithm.sdpo_topk
         self.worker.actor.sdpo_divergence = self.algorithm.sdpo_divergence
         self.worker.actor.sdpo_use_tail = self.algorithm.sdpo_use_tail
+        self.worker.actor.sdpo_approx_mode = self.algorithm.sdpo_approx_mode
         self.worker.actor.sdpo_feedback_mode = self.algorithm.sdpo_feedback_mode
 
     def deep_post_init(self):
