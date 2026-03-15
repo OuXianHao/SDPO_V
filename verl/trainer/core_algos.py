@@ -21,6 +21,7 @@ implement PPO
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from enum import Enum
+import os
 from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
@@ -28,6 +29,7 @@ import torch
 import torch.nn.functional as F
 
 from ..utils import torch_functional as VF
+from ..utils.debug_dump import DEBUG_DUMP_WRITER
 
 
 if TYPE_CHECKING:
@@ -581,8 +583,10 @@ def compute_sdpo_logit_loss(
 
     if divergence == "forward_kl":
         token_loss = (teacher_topk_prob * (teacher_topk_logp - student_topk_logp)).sum(dim=-1)
+        full_token_loss = (teacher_probs * (teacher_log_probs - student_log_probs)).sum(dim=-1)
     else:
         token_loss = (student_topk_prob * (student_topk_logp - teacher_topk_logp)).sum(dim=-1)
+        full_token_loss = (student_probs * (student_log_probs - teacher_log_probs)).sum(dim=-1)
 
     student_topk_mass = student_topk_prob.sum(dim=-1)
     teacher_topk_mass = teacher_topk_prob.sum(dim=-1)
@@ -598,6 +602,64 @@ def compute_sdpo_logit_loss(
     loss = (token_loss * mask_f).sum() / valid_count
     student_entropy = -(student_probs * student_log_probs).sum(dim=-1)
     teacher_entropy = -(teacher_probs * teacher_log_probs).sum(dim=-1)
+
+    mass_ks = [1, 5, 10, 20, 50, 100]
+    student_sorted_probs = torch.sort(student_probs, dim=-1, descending=True).values
+    student_mass_metrics: dict[str, float] = {}
+    for mass_k in mass_ks:
+        cur_k = min(mass_k, vocab_size)
+        mass_at_k = student_sorted_probs[..., :cur_k].sum(dim=-1)
+        student_mass_metrics[f"mass@{mass_k}"] = (mass_at_k * mask_f).sum().detach().item() / valid_count.detach().item()
+
+    student_cdf = torch.cumsum(student_sorted_probs, dim=-1)
+    first_95 = (student_cdf >= 0.95).float().argmax(dim=-1) + 1
+    first_99 = (student_cdf >= 0.99).float().argmax(dim=-1) + 1
+
+    if DEBUG_DUMP_WRITER.should_dump() and os.getenv("SDPO_TOPK_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}:
+        max_positions = int(os.getenv("SDPO_TOPK_DEBUG_POSITIONS", "3"))
+        valid_positions = torch.nonzero(response_mask, as_tuple=False)
+        debug_positions = valid_positions[:max_positions]
+        for row_idx, col_idx in debug_positions:
+            b = int(row_idx.item())
+            t = int(col_idx.item())
+            teacher_pos_probs = teacher_probs[b, t]
+            student_pos_probs = student_probs[b, t]
+            teacher_pos_log_probs = teacher_log_probs[b, t]
+            student_pos_log_probs = student_log_probs[b, t]
+            teacher_top10_probs, teacher_top10_ids = torch.topk(teacher_pos_probs, k=min(10, vocab_size), dim=-1)
+            student_top10_probs, student_top10_ids = torch.topk(student_pos_probs, k=min(10, vocab_size), dim=-1)
+
+            teacher_sorted = torch.sort(teacher_pos_probs, descending=True).values
+            student_sorted = torch.sort(student_pos_probs, descending=True).values
+            mass_curves = {}
+            for mass_k in mass_ks:
+                cur_k = min(mass_k, vocab_size)
+                mass_curves[f"teacher_mass@{mass_k}"] = float(teacher_sorted[:cur_k].sum().item())
+                mass_curves[f"student_mass@{mass_k}"] = float(student_sorted[:cur_k].sum().item())
+
+            if divergence == "forward_kl":
+                full_pos_loss = float((teacher_pos_probs * (teacher_pos_log_probs - student_pos_log_probs)).sum().item())
+            else:
+                full_pos_loss = float((student_pos_probs * (student_pos_log_probs - teacher_pos_log_probs)).sum().item())
+
+            debug_record = {
+                "type": "sdpo_topk_debug",
+                "batch_index": b,
+                "token_index": t,
+                "topk": int(k),
+                "selected_topk_token_ids": topk_indices[b, t].detach().cpu().tolist(),
+                "teacher_top10_ids": teacher_top10_ids.detach().cpu().tolist(),
+                "teacher_top10_probs": teacher_top10_probs.detach().cpu().tolist(),
+                "student_top10_ids": student_top10_ids.detach().cpu().tolist(),
+                "student_top10_probs": student_top10_probs.detach().cpu().tolist(),
+                **mass_curves,
+                "teacher_entropy": float(teacher_entropy[b, t].detach().item()),
+                "student_entropy": float(student_entropy[b, t].detach().item()),
+                "loss_before_topk_mask": full_pos_loss,
+                "loss_after_topk_mask": float(token_loss[b, t].detach().item()),
+            }
+            DEBUG_DUMP_WRITER.append(debug_record)
+
     metrics = {
         "logit_loss": loss.detach().item(),
         "topk": float(k),
@@ -605,6 +667,9 @@ def compute_sdpo_logit_loss(
         "tail_mass_mean": (student_tail * mask_f).sum().detach().item() / valid_count.detach().item(),
         "student_entropy": (student_entropy * mask_f).sum().detach().item() / valid_count.detach().item(),
         "teacher_entropy": (teacher_entropy * mask_f).sum().detach().item() / valid_count.detach().item(),
+        "effective_topk_for_95_mass": (first_95.float() * mask_f).sum().detach().item() / valid_count.detach().item(),
+        "effective_topk_for_99_mass": (first_99.float() * mask_f).sum().detach().item() / valid_count.detach().item(),
+        **student_mass_metrics,
     }
     return loss, metrics
 
