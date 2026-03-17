@@ -406,6 +406,15 @@ class DataParallelPPOActor(BasePPOActor):
         )
         if response_mask.shape != model_inputs["responses"].shape:
             raise ValueError("response_token_mask must align with sampled responses shape.")
+
+        # Robustness: if every token is masked out (e.g. all groups skipped), return a safe zero loss.
+        if not torch.any(response_mask):
+            trainable_param = next((p for p in self.actor_module.parameters() if p.requires_grad), None)
+            if trainable_param is None:
+                raise RuntimeError("No trainable actor parameters found for zero sdpo loss fallback.")
+            zero_loss = trainable_param.sum() * 0.0
+            return zero_loss, {"sdpo_all_masked_batch": 1.0, "sdpo_valid_token_count": 0.0}
+
         teacher_input_ids, teacher_attention_mask, teacher_position_ids, teacher_multi_modal_inputs = self._build_teacher_inputs(
             model_inputs
         )
