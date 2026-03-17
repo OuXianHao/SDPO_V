@@ -511,8 +511,6 @@ class RayPPOTrainer:
 
         uids = batch.non_tensor_batch["uid"]
         accuracy_reward = np.asarray(batch.non_tensor_batch["accuracy_reward"], dtype=np.float32)
-        if len(uids) != len(batch):
-            raise ValueError("`uid` length must match batch size.")
         if len(accuracy_reward) != len(batch):
             raise ValueError("`accuracy_reward` length must match batch size.")
 
@@ -525,41 +523,20 @@ class RayPPOTrainer:
         num_all_correct_skipped = 0
         num_all_wrong_skipped = 0
         num_mixed_kept = 0
-        num_group_size_mismatch = 0
-        expected_group_size = int(self.config.worker.rollout.n)
 
-        debug_enabled = os.getenv("SDPO_SKIP_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
-        debug_max_groups = int(os.getenv("SDPO_SKIP_DEBUG_MAX_GROUPS", "8"))
-        debug_printed = 0
-
-        for uid, indices in uid2indices.items():
+        for indices in uid2indices.values():
             group_acc = accuracy_reward[indices]
-            group_size = len(indices)
-            if group_size != expected_group_size:
-                num_group_size_mismatch += 1
             all_correct = bool(np.all(np.isclose(group_acc, 1.0)))
             all_wrong = bool(np.all(np.isclose(group_acc, 0.0)))
 
             if all_correct:
                 sdpo_valid_mask[indices] = False
                 num_all_correct_skipped += 1
-                decision = "skip_all_correct"
             elif all_wrong:
                 sdpo_valid_mask[indices] = False
                 num_all_wrong_skipped += 1
-                decision = "skip_all_wrong"
             else:
                 num_mixed_kept += 1
-                decision = "keep_mixed"
-
-            if debug_enabled and debug_printed < debug_max_groups:
-                print(
-                    "[sdpo-skip-debug] "
-                    f"global_step={batch.meta_info.get('global_step', None)} "
-                    f"uid={uid} group_size={group_size} "
-                    f"group_accuracy={group_acc.tolist()} decision={decision}"
-                )
-                debug_printed += 1
 
         feedback_text = self._build_feedback_text(batch)
         batch.non_tensor_batch["feedback_text"] = feedback_text
@@ -571,7 +548,6 @@ class RayPPOTrainer:
             "sdpo/num_all_correct_skipped": float(num_all_correct_skipped),
             "sdpo/num_all_wrong_skipped": float(num_all_wrong_skipped),
             "sdpo/num_mixed_kept": float(num_mixed_kept),
-            "sdpo/num_group_size_mismatch": float(num_group_size_mismatch),
         }
         return batch, sdpo_skip_metrics
 
@@ -775,8 +751,6 @@ class RayPPOTrainer:
                                     "SDPO skip-by-group requires reward metric `accuracy`. "
                                     "Please ensure the active reward function returns it."
                                 )
-                            if len(reward_metrics["accuracy"]) != len(batch):
-                                raise ValueError("Reward metric `accuracy` must align with expanded rollout batch.")
                             batch.non_tensor_batch["accuracy_reward"] = np.asarray(
                                 reward_metrics["accuracy"], dtype=np.float32
                             )
