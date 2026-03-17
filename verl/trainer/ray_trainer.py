@@ -499,15 +499,57 @@ class RayPPOTrainer:
 
         return np.array(teacher_prompt_texts, dtype=object)
 
-    def _attach_sdpo_fields(self, batch: DataProto, mode: str = "scalar_text") -> DataProto:
+    def _attach_sdpo_fields(self, batch: DataProto, mode: str = "scalar_text") -> tuple[DataProto, dict[str, float]]:
         if mode != "scalar_text":
             raise ValueError(f"Unsupported sdpo feedback mode: {mode}")
+
+        if "accuracy_reward" not in batch.non_tensor_batch:
+            raise KeyError(
+                "Missing `accuracy_reward` in batch.non_tensor_batch. "
+                "SDPO skip-by-group requires binary accuracy reward from reward function."
+            )
+
+        uids = batch.non_tensor_batch["uid"]
+        accuracy_reward = np.asarray(batch.non_tensor_batch["accuracy_reward"], dtype=np.float32)
+        if len(accuracy_reward) != len(batch):
+            raise ValueError("`accuracy_reward` length must match batch size.")
+
+        # token-level mask consumed by sdpo_logit loss
+        sdpo_valid_mask = torch.ones_like(batch.batch["response_mask"], dtype=torch.bool)
+        uid2indices = defaultdict(list)
+        for idx, uid in enumerate(uids):
+            uid2indices[uid].append(idx)
+
+        num_all_correct_skipped = 0
+        num_all_wrong_skipped = 0
+        num_mixed_kept = 0
+
+        for indices in uid2indices.values():
+            group_acc = accuracy_reward[indices]
+            all_correct = bool(np.all(np.isclose(group_acc, 1.0)))
+            all_wrong = bool(np.all(np.isclose(group_acc, 0.0)))
+
+            if all_correct:
+                sdpo_valid_mask[indices] = False
+                num_all_correct_skipped += 1
+            elif all_wrong:
+                sdpo_valid_mask[indices] = False
+                num_all_wrong_skipped += 1
+            else:
+                num_mixed_kept += 1
+
         feedback_text = self._build_feedback_text(batch)
         batch.non_tensor_batch["feedback_text"] = feedback_text
         batch.non_tensor_batch["teacher_prompt_text"] = self._build_teacher_prompt_text(batch)
-        batch.batch["sdpo_valid_mask"] = torch.ones_like(batch.batch["response_mask"], dtype=torch.bool)
+        batch.batch["sdpo_valid_mask"] = sdpo_valid_mask
         batch.batch["response_token_mask"] = batch.batch["response_mask"].clone().bool()
-        return batch
+
+        sdpo_skip_metrics = {
+            "sdpo/num_all_correct_skipped": float(num_all_correct_skipped),
+            "sdpo/num_all_wrong_skipped": float(num_all_wrong_skipped),
+            "sdpo/num_mixed_kept": float(num_mixed_kept),
+        }
+        return batch, sdpo_skip_metrics
 
     def _balance_batch(self, batch: DataProto, metrics: dict[str, Any], logging_prefix: str = "global_seqlen") -> None:
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
@@ -701,12 +743,24 @@ class RayPPOTrainer:
                         # get token level scores asynchronously
                         reward_tensor, reward_metrics = ray.get(reward_ref)
                         batch.batch["token_level_scores"] = reward_tensor
+                        if self.config.algorithm.loss_mode == "sdpo_logit":
+                            if "accuracy" not in reward_metrics:
+                                raise KeyError(
+                                    "SDPO skip-by-group requires reward metric `accuracy`. "
+                                    "Please ensure the active reward function returns it."
+                                )
+                            batch.non_tensor_batch["accuracy_reward"] = np.asarray(
+                                reward_metrics["accuracy"], dtype=np.float32
+                            )
                         reward_metrics = {f"reward/{k}": v for k, v in reduce_metrics(reward_metrics).items()}
                         metrics.update(reward_metrics)
                     # In sdpo_logit mode, reward is used only to construct teacher feedback text,
                     # not to compute PPO/GRPO advantages or the main optimization objective.
                     if self.config.algorithm.loss_mode == "sdpo_logit":
-                        batch = self._attach_sdpo_fields(batch, mode=self.config.algorithm.sdpo_feedback_mode)
+                        batch, sdpo_skip_metrics = self._attach_sdpo_fields(
+                            batch, mode=self.config.algorithm.sdpo_feedback_mode
+                        )
+                        metrics.update(sdpo_skip_metrics)
                     else:
                         # apply kl penalty if available
                         if not self.config.algorithm.use_kl_loss and self.use_reference_policy:
