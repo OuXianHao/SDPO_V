@@ -32,6 +32,109 @@ from . import torch_functional as VF
 from .debug_dump import DEBUG_DUMP_WRITER
 
 
+_VIDEO_FIXED_FRAMES = 32
+_VIDEO_DEBUG_COUNTER = 0
+_VIDEO_SAMPLING_STATS = {
+    "fixed_ok": 0,
+    "fallback_backend_reject": 0,
+    "fallback_other_error": 0,
+    "short_video": 0,
+    "other_reason": 0,
+}
+
+
+def _infer_frame_count(video_obj: Any) -> Optional[int]:
+    """Best-effort frame count inference for debug/fallback logging."""
+    if video_obj is None:
+        return None
+    if isinstance(video_obj, (list, tuple)):
+        return len(video_obj)
+    if isinstance(video_obj, torch.Tensor):
+        if video_obj.ndim == 4:
+            # Common layouts: (T,H,W,C) / (T,C,H,W)
+            return int(video_obj.shape[0])
+        return None
+    if isinstance(video_obj, np.ndarray):
+        if video_obj.ndim == 4:
+            return int(video_obj.shape[0])
+        return None
+    return None
+
+
+def _extract_metadata_from_output(output: Any) -> Optional[dict[str, Any]]:
+    if isinstance(output, tuple):
+        for item in output[1:]:
+            if isinstance(item, dict):
+                return item
+    return None
+
+
+def _extract_metadata_frame_count(metadata: Optional[dict[str, Any]]) -> Optional[int]:
+    if metadata is None:
+        return None
+    candidates = (
+        "num_frames",
+        "nframes",
+        "sampled_frames",
+        "video_frames",
+        "frame_count",
+    )
+    for key in candidates:
+        value = metadata.get(key)
+        if isinstance(value, (int, float)):
+            return int(value)
+    return None
+
+
+def _classify_fixed_frame_exception(exc: Exception) -> str:
+    msg = str(exc).lower()
+    backend_reject_markers = (
+        "nframes",
+        "num_frames",
+        "unexpected keyword",
+        "unsupported",
+        "not support",
+        "unknown",
+        "invalid",
+    )
+    if any(marker in msg for marker in backend_reject_markers):
+        return "backend_rejects_fixed_frame"
+    return "other_error"
+
+
+def _maybe_debug_video_sampling(
+    video_path: str,
+    sampled_video: Any,
+    *,
+    fallback_used: bool,
+    reason: Optional[str] = None,
+    metadata: Optional[dict[str, Any]] = None,
+) -> None:
+    global _VIDEO_DEBUG_COUNTER
+    debug_enabled = os.getenv("SDPO_VIDEO_SAMPLING_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
+    if not debug_enabled:
+        return
+    max_prints = int(os.getenv("SDPO_VIDEO_SAMPLING_DEBUG_MAX", "20"))
+    if _VIDEO_DEBUG_COUNTER >= max_prints:
+        return
+
+    inferred_frames = _infer_frame_count(sampled_video)
+    metadata_frames = _extract_metadata_frame_count(metadata)
+    strongest_evidence = metadata_frames if metadata_frames is not None else inferred_frames
+    evidence_source = "metadata" if metadata_frames is not None else "tensor_or_container"
+    sampled_shape = tuple(sampled_video.shape) if hasattr(sampled_video, "shape") else None
+
+    print(
+        "[video-sampling-debug] "
+        f"video={video_path} target_nframes={_VIDEO_FIXED_FRAMES} "
+        f"strongest_frames={strongest_evidence} evidence_source={evidence_source} "
+        f"inferred_frames={inferred_frames} metadata_frames={metadata_frames} "
+        f"sampled_shape={sampled_shape} fallback_used={fallback_used} reason={reason} "
+        f"stats={_VIDEO_SAMPLING_STATS}"
+    )
+    _VIDEO_DEBUG_COUNTER += 1
+
+
 def collate_fn(features: list[dict[str, Any]]) -> dict[str, Any]:
     tensors = defaultdict(list)
     non_tensors = defaultdict(list)
@@ -86,19 +189,86 @@ def process_video(
     return_fps: bool = False,
     return_metadata: bool = False,
 ) -> Any:
-    # 同时传 fps / video_fps，兼容不同 qwen_vl_utils/backend 分支
-    vision_info = {
+    # Canonical Qwen fixed-frame control: nframes=32.
+    fixed_frame_vision_info = {
+        "video": video,
+        "min_pixels": min_pixels,
+        "max_pixels": max_pixels,
+        "nframes": _VIDEO_FIXED_FRAMES,
+    }
+    try:
+        output = fetch_video(
+            fixed_frame_vision_info,
+            return_video_sample_fps=return_fps,
+            return_video_metadata=return_metadata,
+        )
+        sampled_video = output[0] if isinstance(output, tuple) else output
+        metadata = _extract_metadata_from_output(output)
+
+        inferred_frames = _infer_frame_count(sampled_video)
+        if inferred_frames is not None and inferred_frames < _VIDEO_FIXED_FRAMES:
+            _VIDEO_SAMPLING_STATS["short_video"] += 1
+            print(
+                "[video-sampling-warn] "
+                f"short/limited video frames for {video}: sampled={inferred_frames}, "
+                f"target={_VIDEO_FIXED_FRAMES}. Keeping backend output as safe fallback."
+            )
+            _maybe_debug_video_sampling(
+                video,
+                sampled_video,
+                fallback_used=False,
+                reason="short_video",
+                metadata=metadata,
+            )
+            return output
+
+        if inferred_frames is None or inferred_frames != _VIDEO_FIXED_FRAMES:
+            _VIDEO_SAMPLING_STATS["other_reason"] += 1
+            print(
+                "[video-sampling-warn] "
+                f"fixed-frame request returned non-standard frame evidence for {video}: "
+                f"inferred={inferred_frames}, target={_VIDEO_FIXED_FRAMES}."
+            )
+        else:
+            _VIDEO_SAMPLING_STATS["fixed_ok"] += 1
+
+        _maybe_debug_video_sampling(
+            video,
+            sampled_video,
+            fallback_used=False,
+            reason="fixed_frame_ok_or_nonstandard",
+            metadata=metadata,
+        )
+        return output
+    except Exception as e:
+        reason = _classify_fixed_frame_exception(e)
+        if reason == "backend_rejects_fixed_frame":
+            _VIDEO_SAMPLING_STATS["fallback_backend_reject"] += 1
+        else:
+            _VIDEO_SAMPLING_STATS["fallback_other_error"] += 1
+        print(
+            "[video-sampling-warn] "
+            f"fixed-frame sampling failed for {video} with nframes={_VIDEO_FIXED_FRAMES}; "
+            f"reason={reason}; fallback to fps-based path ({video_fps=}). error={repr(e)}"
+        )
+
+    # Explicit fallback to legacy fps control for backend compatibility.
+    vision_info_fps = {
         "video": video,
         "min_pixels": min_pixels,
         "max_pixels": max_pixels,
         "fps": video_fps,
         "video_fps": video_fps,
     }
-    return fetch_video(
-        vision_info,
+    output = fetch_video(
+        vision_info_fps,
         return_video_sample_fps=return_fps,
         return_video_metadata=return_metadata,
     )
+    sampled_video = output[0] if isinstance(output, tuple) else output
+    metadata = _extract_metadata_from_output(output)
+    _maybe_debug_video_sampling(video, sampled_video, fallback_used=True, reason="fps_fallback", metadata=metadata)
+    return output
 
 
 class RLHFDataset(Dataset):
