@@ -17,6 +17,7 @@ DeepSpeed Ulysses Paper: https://arxiv.org/abs/2309.14509
 Inspired from: https://github.com/deepspeedai/DeepSpeed/blob/master/deepspeed/sequence/layer.py
 """
 
+import os
 from typing import Any, Optional, Tuple
 
 import torch
@@ -140,6 +141,18 @@ def all_to_all_tensor(
 ):
     group = get_ulysses_sequence_parallel_group() if group is None else group
     seq_world_size = dist.get_world_size(group)
+    shape_debug = os.getenv("ULYSSES_SHAPE_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
+    if shape_debug:
+        print(
+            "[ulysses-shape-debug] all_to_all_tensor "
+            f"local_shape={tuple(local_input.shape)} scatter_dim={scatter_dim} gather_dim={gather_dim} "
+            f"seq_world_size={seq_world_size}"
+        )
+        if local_input.size(scatter_dim) % seq_world_size != 0:
+            print(
+                "[ulysses-shape-debug] uneven scatter split sizes="
+                f"{[tuple(t.shape) for t in torch.tensor_split(local_input, seq_world_size, scatter_dim)]}"
+            )
     input_list = [t.contiguous() for t in torch.tensor_split(local_input, seq_world_size, scatter_dim)]
     output_list = [torch.empty_like(input_list[0]) for _ in range(seq_world_size)]
     comm = dist.all_to_all(output_list, input_list, group=group, async_op=async_op)
