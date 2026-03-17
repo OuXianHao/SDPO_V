@@ -84,6 +84,13 @@ class DataParallelPPOActor(BasePPOActor):
                     f"approx_mode={self.config.sdpo_approx_mode}"
                 )
 
+        self._sdpo_backward_shape_debug = os.getenv("SDPO_BACKWARD_SHAPE_DEBUG", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
     def _render_teacher_prompt_text(self, content_text: str) -> str:
         format_prompt = self.config.teacher_format_prompt
         if format_prompt is None or format_prompt == "":
@@ -419,6 +426,24 @@ class DataParallelPPOActor(BasePPOActor):
             model_inputs
         )
 
+        if self._sdpo_backward_shape_debug and self.rank == 0:
+            print(
+                "[sdpo-shape-debug] teacher_input_ids/attention/position/responses shapes: "
+                f"{tuple(teacher_input_ids.shape)} / {tuple(teacher_attention_mask.shape)} / "
+                f"{tuple(teacher_position_ids.shape)} / {tuple(model_inputs['responses'].shape)}"
+            )
+            print(
+                "[sdpo-shape-debug] student_input_ids/attention/position shapes: "
+                f"{tuple(model_inputs['input_ids'].shape)} / {tuple(model_inputs['attention_mask'].shape)} / "
+                f"{tuple(model_inputs['position_ids'].shape)}"
+            )
+            if "multi_modal_inputs" in model_inputs:
+                student_mm_inputs = batch_collate(model_inputs["multi_modal_inputs"])
+                student_mm_shapes = {k: [tuple(t.shape) for t in v] for k, v in student_mm_inputs.items()}
+                print(f"[sdpo-shape-debug] student multimodal tensor shapes: {student_mm_shapes}")
+            teacher_mm_shapes = {k: tuple(v.shape) for k, v in teacher_multi_modal_inputs.items()}
+            print(f"[sdpo-shape-debug] teacher multimodal tensor shapes: {teacher_mm_shapes}")
+
         with torch.no_grad():
             teacher_logits = self._forward_response_logits(
                 model_inputs,
@@ -432,6 +457,16 @@ class DataParallelPPOActor(BasePPOActor):
         student_logits = self._forward_response_logits(model_inputs, temperature=temperature)
         if teacher_logits.shape[:2] != student_logits.shape[:2]:
             raise ValueError("Teacher and student response spans must align for sdpo_logit.")
+
+        if self._sdpo_backward_shape_debug and self.rank == 0:
+            print(
+                "[sdpo-shape-debug] teacher/student logits and response_mask shapes: "
+                f"{tuple(teacher_logits.shape)} / {tuple(student_logits.shape)} / {tuple(response_mask.shape)}"
+            )
+            print(
+                "[sdpo-shape-debug] valid response tokens="
+                f"{int(response_mask.sum().item())}, total response tokens={int(model_inputs['response_mask'].sum().item())}"
+            )
 
         sdpo_loss, sdpo_metrics = compute_sdpo_logit_loss(
             student_logits=student_logits,
@@ -578,7 +613,11 @@ class DataParallelPPOActor(BasePPOActor):
                     elif self.config.loss_mode == "sdpo_logit":
                         loss, sdpo_metrics = self._compute_sdpo_logit_loss(model_inputs, temperature=temperature)
                         loss = loss * torch.sum(response_mask) * self.world_size / total_response_tokens
-                        loss.backward()
+                        if self._sdpo_backward_shape_debug:
+                            with torch.autograd.detect_anomaly(check_nan=True):
+                                loss.backward()
+                        else:
+                            loss.backward()
                         append_to_dict(metrics, sdpo_metrics)
                     else:
                         raise ValueError(f"Unknown actor.loss_mode: {self.config.loss_mode}")
