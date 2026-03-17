@@ -742,6 +742,8 @@ class RayPPOTrainer:
                     if "token_level_scores" not in batch.batch:
                         # get token level scores asynchronously
                         reward_tensor, reward_metrics = ray.get(reward_ref)
+                        if reward_tensor.size(0) != len(batch):
+                            raise ValueError("Reward tensor batch size must align with expanded rollout batch.")
                         batch.batch["token_level_scores"] = reward_tensor
                         if self.config.algorithm.loss_mode == "sdpo_logit":
                             if "accuracy" not in reward_metrics:
