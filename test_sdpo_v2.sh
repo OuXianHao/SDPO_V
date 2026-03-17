@@ -1,19 +1,33 @@
 #!/bin/bash
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES=4,5,6,7
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 
 # W&B
 # 请先在当前 shell 中 export WANDB_API_KEY='your_key_here'
 export WANDB_PROJECT='EasyR1-SDPO'
-export WANDB_NAME='qwen3vl8b_perceptiontest_sdpo_logit_run4'
+export WANDB_NAME='qwen3vl8b_perceptiontest_sdpo_logit_fullvocab_run2'
 export WANDB_MODE=online
 
 # SDPO debug dump
-# 正式训练也保留 debug dump；500 条会比较大，但便于排查 teacher feedback / prompt / samples
+# 正式训练先保留少量，便于检查 teacher feedback / samples / logits path
 export SDPO_DEBUG_DUMP=1
-export SDPO_DEBUG_DUMP_PATH="/ssd5/xhou/outputs/sdpo_debug_run4.jsonl"
-export SDPO_DEBUG_MAX_SAMPLES=500
+export SDPO_DEBUG_DUMP_PATH="/ssd5/xhou/outputs/sdpo_debug_fullvocab_run2.jsonl"
+export SDPO_DEBUG_MAX_SAMPLES=150
+
+# Patch 1: skip-group debug
+# 正式训练第一次跑建议先开少量，确认全对/全错跳过逻辑正常
+export SDPO_SKIP_DEBUG=1
+export SDPO_SKIP_DEBUG_MAX_GROUPS=8
+
+# Patch 2: fixed 32-frame sampling debug
+# 正式训练第一次跑建议先开少量，确认大多数样本确实走 fixed_ok / 32 frames
+export SDPO_VIDEO_SAMPLING_DEBUG=1
+export SDPO_VIDEO_SAMPLING_DEBUG_MAX=32
+
+# 如需开启 top-k 细粒度 debug，可手动打开
+# export SDPO_TOPK_DEBUG=1
+# export SDPO_TOPK_DEBUG_POSITIONS=3
 
 # Ray
 echo "Cleaning up old Ray processes..."
@@ -57,6 +71,7 @@ python -m verl.trainer.main \
   worker.actor.model.model_path="${MODEL_PATH}" \
   worker.actor.model.enable_gradient_checkpointing=true \
   worker.actor.model.lora.rank=0 \
+  worker.actor.fsdp.torch_dtype=bf16 \
   worker.actor.optim.lr=1e-6 \
   worker.actor.global_batch_size=8 \
   worker.actor.micro_batch_size_per_device_for_update=1 \
@@ -66,22 +81,24 @@ python -m verl.trainer.main \
   worker.actor.offload.offload_params=true \
   worker.actor.offload.offload_optimizer=true \
   worker.actor.ppo_epochs=1 \
-  worker.rollout.n=2 \
+  worker.rollout.n=8 \
   worker.rollout.temperature=0.7 \
   worker.rollout.tensor_parallel_size=1 \
   worker.rollout.gpu_memory_utilization=0.50 \
-  worker.rollout.max_model_len=8192 \
-  worker.rollout.max_num_batched_tokens=8192 \
+  worker.rollout.max_model_len=12288 \
+  worker.rollout.max_num_batched_tokens=12288 \
+  worker.ref.fsdp.torch_dtype=bf16 \
   trainer.total_epochs=1 \
-  trainer.max_steps=2000 \
+  trainer.max_steps=120 \
   trainer.val_before_train=false \
-  trainer.val_freq=200 \
-  trainer.save_freq=200 \
+  trainer.val_freq=20 \
+  trainer.save_freq=60 \
   trainer.logger='["console","wandb"]' \
   trainer.project_name=EasyR1_SDPO \
-  trainer.experiment_name=qwen3vl8b_perceptiontest_sdpo_logit_run4 \
+  trainer.experiment_name=qwen3vl8b_perceptiontest_sdpo_logit_fullvocab_run2 \
   trainer.n_gpus_per_node=4 \
   algorithm.loss_mode=sdpo_logit \
+  algorithm.sdpo_approx_mode=full_vocab \
   algorithm.sdpo_topk=100 \
   algorithm.sdpo_divergence=forward_kl \
   algorithm.sdpo_use_tail=true \

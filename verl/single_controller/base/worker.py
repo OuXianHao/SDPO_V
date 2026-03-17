@@ -129,27 +129,85 @@ class Worker(WorkerHelper):
         self._rank = rank
         self._world_size = world_size
 
-        if "AMD" in torch.cuda.get_device_name():
-            os.environ["CUDA_VISIBLE_DEVICES"] = os.getenv("ROCR_VISIBLE_DEVICES")
-            os.environ["LOCAL_RANK"] = os.getenv("RAY_LOCAL_RANK")
-            cuda_visible_devices = os.getenv("LOCAL_RANK", "0")
-            torch.cuda.set_device(int(cuda_visible_devices))
-
-        # Ray exports local rank as RAY_LOCAL_RANK / RAY_LOCAL_WORLD_SIZE.
-        # Normalize to LOCAL_* and bind rank -> device explicitly before any distributed collectives.
-        local_world_size = int(os.getenv("LOCAL_WORLD_SIZE", os.getenv("RAY_LOCAL_WORLD_SIZE", "1")))
-        local_rank = int(os.getenv("LOCAL_RANK", os.getenv("RAY_LOCAL_RANK", "0")))
-        if torch.cuda.is_available():
-            torch.cuda.set_device(local_rank)
-
         master_addr = os.getenv("MASTER_ADDR")
         master_port = os.getenv("MASTER_PORT")
+
+        # Raw local rank info from launcher / Ray
+        raw_local_world_size = int(os.getenv("LOCAL_WORLD_SIZE", os.getenv("RAY_LOCAL_WORLD_SIZE", "1")))
+        raw_local_rank = int(os.getenv("LOCAL_RANK", os.getenv("RAY_LOCAL_RANK", "0")))
+
+        effective_local_world_size = raw_local_world_size
+        effective_local_rank = raw_local_rank
+
+        if torch.cuda.is_available():
+            visible_devices = os.getenv("CUDA_VISIBLE_DEVICES", "not set")
+            visible_device_count = torch.cuda.device_count()
+
+            print(
+                f"[Worker init] rank={rank}, "
+                f"raw_local_rank={raw_local_rank}, "
+                f"RAY_LOCAL_RANK={os.getenv('RAY_LOCAL_RANK')}, "
+                f"LOCAL_RANK={os.getenv('LOCAL_RANK')}, "
+                f"CUDA_VISIBLE_DEVICES={visible_devices}, "
+                f"visible_device_count={visible_device_count}"
+            )
+
+            if visible_device_count <= 0:
+                raise RuntimeError(
+                    "torch.cuda.is_available() is True but torch.cuda.device_count() == 0"
+                )
+
+            # AMD path
+            try:
+                device_name = torch.cuda.get_device_name(0)
+            except Exception:
+                device_name = ""
+
+            if "AMD" in device_name:
+                os.environ["CUDA_VISIBLE_DEVICES"] = os.getenv("ROCR_VISIBLE_DEVICES", "")
+                visible_devices = os.getenv("CUDA_VISIBLE_DEVICES", "not set")
+                visible_device_count = torch.cuda.device_count()
+
+            # In Ray, each worker often sees only its assigned GPU(s) through CUDA_VISIBLE_DEVICES.
+            # If only one GPU is visible, the valid ordinal inside this process is always 0.
+            if visible_device_count == 1:
+                effective_local_rank = 0
+                effective_local_world_size = 1
+                torch.cuda.set_device(0)
+            elif 0 <= raw_local_rank < visible_device_count:
+                effective_local_rank = raw_local_rank
+                effective_local_world_size = visible_device_count
+                torch.cuda.set_device(effective_local_rank)
+            else:
+                raise RuntimeError(
+                    f"Invalid raw_local_rank={raw_local_rank} for visible_device_count={visible_device_count}, "
+                    f"CUDA_VISIBLE_DEVICES={visible_devices}, "
+                    f"RAY_LOCAL_RANK={os.getenv('RAY_LOCAL_RANK', 'not set')}, "
+                    f"LOCAL_RANK={os.getenv('LOCAL_RANK', 'not set')}"
+                )
+
+            # IMPORTANT:
+            # overwrite LOCAL_* with effective values so downstream libs (e.g. vLLM)
+            # do not try to use an invalid ordinal like cuda:2 inside a single-visible-GPU process.
+            os.environ["LOCAL_RANK"] = str(effective_local_rank)
+            os.environ["LOCAL_WORLD_SIZE"] = str(effective_local_world_size)
+
+            print(
+                f"[Worker init bound] rank={rank}, "
+                f"effective_local_rank={effective_local_rank}, "
+                f"effective_local_world_size={effective_local_world_size}, "
+                f"current_device={torch.cuda.current_device()}, "
+                f"CUDA_VISIBLE_DEVICES={os.getenv('CUDA_VISIBLE_DEVICES', 'not set')}"
+            )
+        else:
+            os.environ["LOCAL_RANK"] = str(raw_local_rank)
+            os.environ["LOCAL_WORLD_SIZE"] = str(raw_local_world_size)
 
         store = {
             "_world_size": world_size,
             "_rank": rank,
-            "_local_world_size": local_world_size,
-            "_local_rank": local_rank,
+            "_local_world_size": effective_local_world_size,
+            "_local_rank": effective_local_rank,
             "_master_addr": master_addr,
             "_master_port": master_port,
         }
