@@ -471,19 +471,26 @@ class RayPPOTrainer:
         return {"val/reward_score": self.val_reward_score, **val_reward_metrics, **val_length_metrics}
 
     def _build_feedback_text(self, batch: DataProto) -> np.ndarray:
-        response_ids = batch.batch["responses"]
-        response_lengths = torch.sum(batch.batch["response_mask"], dim=-1)
+        response_texts = self._decode_response_texts(batch)
         feedback_texts = []
-        for i in range(len(batch)):
-            cur_len = int(response_lengths[i].item())
-            response_text = self.tokenizer.decode(response_ids[i][:cur_len], skip_special_tokens=True)
+        for i, response_text in enumerate(response_texts):
             score = float(batch.batch["token_level_scores"][i].sum().item())
             feedback = f"Response quality score: {score:.4f}. Improve correctness and faithfulness.\n[Response]: {response_text}"
             feedback_texts.append(feedback)
 
         return np.array(feedback_texts, dtype=object)
 
-    def _build_teacher_prompt_text(self, batch: DataProto) -> np.ndarray:
+    def _decode_response_texts(self, batch: DataProto) -> np.ndarray:
+        response_ids = batch.batch["responses"]
+        response_lengths = torch.sum(batch.batch["response_mask"], dim=-1)
+        response_texts = []
+        for i in range(len(batch)):
+            cur_len = int(response_lengths[i].item())
+            response_text = self.tokenizer.decode(response_ids[i][:cur_len], skip_special_tokens=True)
+            response_texts.append(response_text)
+        return np.array(response_texts, dtype=object)
+
+    def _build_teacher_prompt_text_scalar(self, batch: DataProto) -> np.ndarray:
         format_prompt = self.config.worker.actor.teacher_format_prompt
         raw_prompt_texts = batch.non_tensor_batch["raw_prompt_text"]
         feedback_texts = batch.non_tensor_batch["feedback_text"]
@@ -499,10 +506,63 @@ class RayPPOTrainer:
 
         return np.array(teacher_prompt_texts, dtype=object)
 
-    def _attach_sdpo_fields(self, batch: DataProto, mode: str = "scalar_text") -> tuple[DataProto, dict[str, float]]:
-        if mode != "scalar_text":
-            raise ValueError(f"Unsupported sdpo feedback mode: {mode}")
+    @staticmethod
+    def _collect_successful_rollout_indices_per_uid(
+        uids: np.ndarray, accuracy_reward: np.ndarray
+    ) -> dict[Any, list[int]]:
+        uid2successful_indices: dict[Any, list[int]] = defaultdict(list)
+        for idx, (uid, reward) in enumerate(zip(uids, accuracy_reward)):
+            if float(reward) == 1.0:
+                uid2successful_indices[uid].append(idx)
+        return uid2successful_indices
 
+    def _sample_successful_sibling_texts(
+        self, uids: np.ndarray, accuracy_reward: np.ndarray, response_texts: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        uid2successful_indices = self._collect_successful_rollout_indices_per_uid(uids=uids, accuracy_reward=accuracy_reward)
+        sampled_successful_texts: list[Optional[str]] = []
+        has_successful_sibling = np.zeros(len(uids), dtype=bool)
+
+        for idx, uid in enumerate(uids):
+            if float(accuracy_reward[idx]) == 1.0:
+                sampled_successful_texts.append(None)
+                continue
+
+            successful_candidates = [candidate_idx for candidate_idx in uid2successful_indices.get(uid, []) if candidate_idx != idx]
+            if len(successful_candidates) == 0:
+                sampled_successful_texts.append(None)
+                continue
+
+            sampled_idx = int(np.random.choice(successful_candidates))
+            sampled_successful_texts.append(str(response_texts[sampled_idx]))
+            has_successful_sibling[idx] = True
+
+        return np.array(sampled_successful_texts, dtype=object), has_successful_sibling
+
+    def _build_teacher_prompt_text_successful_rollout(
+        self, raw_prompt_texts: np.ndarray, successful_sibling_texts: np.ndarray
+    ) -> np.ndarray:
+        format_prompt = self.config.worker.actor.teacher_format_prompt
+        teacher_prompt_texts = []
+        for raw_prompt_text, successful_sibling_text in zip(raw_prompt_texts, successful_sibling_texts):
+            if successful_sibling_text is None:
+                content_text = str(raw_prompt_text)
+            else:
+                content_text = (
+                    f"{raw_prompt_text}\n\n"
+                    "Correct solution:\n\n"
+                    f"{successful_sibling_text}\n\n"
+                    "Correctly solve the original question."
+                )
+            if format_prompt is None or format_prompt == "":
+                teacher_prompt_text = content_text
+            else:
+                teacher_prompt_text = Template(format_prompt.strip()).render(content=content_text)
+            teacher_prompt_texts.append(teacher_prompt_text)
+
+        return np.array(teacher_prompt_texts, dtype=object)
+
+    def _attach_sdpo_fields(self, batch: DataProto, mode: str = "scalar_text") -> tuple[DataProto, dict[str, float]]:
         if "accuracy_reward" not in batch.non_tensor_batch:
             raise KeyError(
                 "Missing `accuracy_reward` in batch.non_tensor_batch. "
@@ -514,42 +574,75 @@ class RayPPOTrainer:
         if len(accuracy_reward) != len(batch):
             raise ValueError("`accuracy_reward` length must match batch size.")
 
-        # token-level mask consumed by sdpo_logit loss
-        sdpo_valid_mask = torch.ones_like(batch.batch["response_mask"], dtype=torch.bool)
-        uid2indices = defaultdict(list)
-        for idx, uid in enumerate(uids):
-            uid2indices[uid].append(idx)
+        response_mask = batch.batch["response_mask"].clone().bool()
+        batch.batch["response_token_mask"] = response_mask
 
-        num_all_correct_skipped = 0
-        num_all_wrong_skipped = 0
-        num_mixed_kept = 0
+        if mode == "scalar_text":
+            # token-level mask consumed by sdpo_logit loss
+            sdpo_valid_mask = torch.ones_like(response_mask, dtype=torch.bool)
+            uid2indices = defaultdict(list)
+            for idx, uid in enumerate(uids):
+                uid2indices[uid].append(idx)
 
-        for indices in uid2indices.values():
-            group_acc = accuracy_reward[indices]
-            all_correct = bool(np.all(np.isclose(group_acc, 1.0)))
-            all_wrong = bool(np.all(np.isclose(group_acc, 0.0)))
+            num_all_correct_skipped = 0
+            num_all_wrong_skipped = 0
+            num_mixed_kept = 0
 
-            if all_correct:
-                sdpo_valid_mask[indices] = False
-                num_all_correct_skipped += 1
-            elif all_wrong:
-                sdpo_valid_mask[indices] = False
-                num_all_wrong_skipped += 1
-            else:
-                num_mixed_kept += 1
+            for indices in uid2indices.values():
+                group_acc = accuracy_reward[indices]
+                all_correct = bool(np.all(np.isclose(group_acc, 1.0)))
+                all_wrong = bool(np.all(np.isclose(group_acc, 0.0)))
 
-        feedback_text = self._build_feedback_text(batch)
-        batch.non_tensor_batch["feedback_text"] = feedback_text
-        batch.non_tensor_batch["teacher_prompt_text"] = self._build_teacher_prompt_text(batch)
-        batch.batch["sdpo_valid_mask"] = sdpo_valid_mask
-        batch.batch["response_token_mask"] = batch.batch["response_mask"].clone().bool()
+                if all_correct:
+                    sdpo_valid_mask[indices] = False
+                    num_all_correct_skipped += 1
+                elif all_wrong:
+                    sdpo_valid_mask[indices] = False
+                    num_all_wrong_skipped += 1
+                else:
+                    num_mixed_kept += 1
 
-        sdpo_skip_metrics = {
-            "sdpo/num_all_correct_skipped": float(num_all_correct_skipped),
-            "sdpo/num_all_wrong_skipped": float(num_all_wrong_skipped),
-            "sdpo/num_mixed_kept": float(num_mixed_kept),
-        }
-        return batch, sdpo_skip_metrics
+            feedback_text = self._build_feedback_text(batch)
+            batch.non_tensor_batch["feedback_text"] = feedback_text
+            batch.non_tensor_batch["teacher_prompt_text"] = self._build_teacher_prompt_text_scalar(batch)
+            batch.batch["sdpo_valid_mask"] = sdpo_valid_mask
+
+            sdpo_skip_metrics = {
+                "sdpo/num_all_correct_skipped": float(num_all_correct_skipped),
+                "sdpo/num_all_wrong_skipped": float(num_all_wrong_skipped),
+                "sdpo/num_mixed_kept": float(num_mixed_kept),
+            }
+            return batch, sdpo_skip_metrics
+
+        if mode == "successful_rollout":
+            response_texts = self._decode_response_texts(batch)
+            successful_sibling_texts, has_successful_sibling = self._sample_successful_sibling_texts(
+                uids=uids,
+                accuracy_reward=accuracy_reward,
+                response_texts=response_texts,
+            )
+            failed_mask = accuracy_reward != 1.0
+            sample_valid_mask = failed_mask & has_successful_sibling
+
+            batch.non_tensor_batch["teacher_prompt_text"] = self._build_teacher_prompt_text_successful_rollout(
+                raw_prompt_texts=batch.non_tensor_batch["raw_prompt_text"],
+                successful_sibling_texts=successful_sibling_texts,
+            )
+            # Keep feedback text key for backward compatibility in downstream logging.
+            batch.non_tensor_batch["feedback_text"] = np.array(["" for _ in range(len(batch))], dtype=object)
+            batch.non_tensor_batch["successful_sibling_text"] = successful_sibling_texts
+            batch.batch["sdpo_valid_mask"] = response_mask & torch.from_numpy(sample_valid_mask).to(response_mask.device).unsqueeze(-1)
+
+            sdpo_skip_metrics = {
+                "sdpo/successful_rollout_failed_samples": float(failed_mask.sum().item()),
+                "sdpo/successful_rollout_kept_samples": float(sample_valid_mask.sum().item()),
+                "sdpo/successful_rollout_skipped_no_success_sibling": float((failed_mask & ~has_successful_sibling).sum().item()),
+                "sdpo/successful_rollout_skipped_self_success": float((~failed_mask).sum().item()),
+            }
+            return batch, sdpo_skip_metrics
+
+        raise ValueError(f"Unsupported sdpo feedback mode: {mode}")
+
 
     def _balance_batch(self, batch: DataProto, metrics: dict[str, Any], logging_prefix: str = "global_seqlen") -> None:
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""

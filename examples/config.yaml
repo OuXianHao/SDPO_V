@@ -34,7 +34,7 @@ algorithm:
   sdpo_topk: 100
   sdpo_divergence: forward_kl
   sdpo_use_tail: true
-  sdpo_feedback_mode: scalar_text
+  sdpo_feedback_mode: scalar_text  # {scalar_text, successful_rollout}
 
 worker:
   actor:

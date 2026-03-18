@@ -261,7 +261,8 @@ class DataParallelPPOActor(BasePPOActor):
         responses = model_inputs["responses"]
         response_mask = model_inputs["response_mask"]
         raw_prompt_texts = model_inputs["raw_prompt_text"]
-        feedback_texts = model_inputs["feedback_text"]
+        feedback_texts = model_inputs.get("feedback_text", None)
+        teacher_prompt_texts = model_inputs.get("teacher_prompt_text", None)
         batch_multi_modal_data = model_inputs.get("multi_modal_data", None)
         pad_token_ids = model_inputs.get("pad_token_id", None)
 
@@ -271,12 +272,14 @@ class DataParallelPPOActor(BasePPOActor):
         teacher_multi_modal_inputs: list[dict[str, torch.Tensor]] = []
 
         for i in range(responses.size(0)):
-            raw_prompt_text = str(raw_prompt_texts[i])
-            feedback_text = str(feedback_texts[i])
             multi_modal_data = None if batch_multi_modal_data is None else batch_multi_modal_data[i]
-
-            teacher_content_text = f"{raw_prompt_text}\n\n[Feedback]: {feedback_text}"
-            teacher_prompt_text = self._render_teacher_prompt_text(teacher_content_text)
+            if teacher_prompt_texts is not None:
+                teacher_prompt_text = str(teacher_prompt_texts[i])
+            else:
+                raw_prompt_text = str(raw_prompt_texts[i])
+                feedback_text = "" if feedback_texts is None else str(feedback_texts[i])
+                teacher_content_text = f"{raw_prompt_text}\n\n[Feedback]: {feedback_text}"
+                teacher_prompt_text = self._render_teacher_prompt_text(teacher_content_text)
 
             teacher_messages = [
                 {
@@ -561,7 +564,7 @@ class DataParallelPPOActor(BasePPOActor):
         elif self.config.loss_mode == "sdpo_logit":
             select_keys.extend(["sdpo_valid_mask", "response_token_mask"])
             non_tensor_select_keys.extend(
-                ["raw_prompt_text", "prompt_text", "feedback_text", "multi_modal_data", "pad_token_id"]
+                ["raw_prompt_text", "prompt_text", "feedback_text", "teacher_prompt_text", "multi_modal_data", "pad_token_id"]
             )
         else:
             raise ValueError(f"Unknown actor.loss_mode: {self.config.loss_mode}")
