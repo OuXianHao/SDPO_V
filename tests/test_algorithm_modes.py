@@ -82,3 +82,13 @@ def test_config_wires_algorithm_modes_into_actor_config():
     assert config.worker.actor.sdpo_divergence == "reverse_kl"
     assert config.worker.actor.sdpo_use_tail is False
     assert config.worker.actor.sdpo_feedback_mode == "scalar_text"
+
+
+def test_config_wires_successful_rollout_feedback_mode():
+    config = PPOConfig()
+    config.algorithm.loss_mode = "sdpo_logit"
+    config.algorithm.sdpo_feedback_mode = "successful_rollout"
+    config.post_init()
+
+    assert config.worker.actor.loss_mode == "sdpo_logit"
+    assert config.worker.actor.sdpo_feedback_mode == "successful_rollout"
