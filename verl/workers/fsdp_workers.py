@@ -45,6 +45,7 @@ from ..single_controller.base import Worker
 from ..single_controller.base.decorator import Dispatch, register
 from ..utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from ..utils.dataset import process_image, process_video
+from ..utils.debug_utils import is_debug_shapes_enabled, summarize_batch_for_debug
 from ..utils.flops_counter import FlopsCounter
 from ..utils.fsdp_utils import (
     get_fsdp_wrap_policy,
@@ -565,6 +566,9 @@ class FSDPWorker(Worker):
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
         assert self._has_actor
+
+        if is_debug_shapes_enabled():
+            print(f"[debug-rank] {summarize_batch_for_debug(data, rank=self.rank)}")
 
         self._process_multi_modal_inputs(data)
         data = data.to(torch.cuda.current_device())
