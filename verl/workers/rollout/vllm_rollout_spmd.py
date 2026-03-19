@@ -73,10 +73,11 @@ def _process_multi_modal_data(
                 video_fps,
                 return_metadata=return_video_metadata,
             )
-            # qwen_vl_utils.fetch_video may return tuples when extra outputs are requested
-            # (e.g. (sampled_video, metadata)). vLLM multi_modal_data["video"] expects video
-            # tensors/arrays directly, so keep only the sampled frames here.
-            if isinstance(processed_video, tuple):
+            # Keep metadata tuples for Qwen3-VL path. vLLM's Qwen3-VL video
+            # processor consumes metadata (e.g. do_sample_frames / fps info)
+            # from the tuple payload. Stripping to only frames makes metadata
+            # become None downstream and crashes in qwen3_vl.py.
+            if isinstance(processed_video, tuple) and not return_video_metadata:
                 videos.append(processed_video[0])
             else:
                 videos.append(processed_video)
@@ -110,9 +111,10 @@ class vLLMRollout(BaseRollout):
         self.rank = int(os.getenv("RANK", "0"))
         self.config = config
         self.pad_token_id = tokenizer.pad_token_id
-        # Keep rollout input format stable for vLLM: pass only sampled video frames.
-        # Metadata tuples from qwen_vl_utils are handled/stripped in _process_multi_modal_data.
-        self.return_video_metadata = False
+        # Qwen3-VL in vLLM expects per-video metadata in multimodal payload.
+        # Keep metadata enabled only for Qwen3VLProcessor to avoid changing
+        # behavior for other processors.
+        self.return_video_metadata = processor is not None and "Qwen3VLProcessor" in processor.__class__.__name__
         self.use_tqdm = (self.rank == 0) and (not config.disable_tqdm)
         if config.tensor_parallel_size > torch.distributed.get_world_size():
             raise ValueError("Tensor parallelism size should be less than world size.")
