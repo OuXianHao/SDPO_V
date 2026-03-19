@@ -98,7 +98,7 @@ class AlgorithmConfig:
     sdpo_divergence: str = "forward_kl"
     sdpo_use_tail: bool = True
     sdpo_approx_mode: str = "topk"
-    sdpo_feedback_mode: str = "scalar_text"
+    sdpo_feedback_mode: str = "successful_rollout"
 
 
 @dataclass

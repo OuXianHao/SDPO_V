@@ -263,6 +263,7 @@ class DataParallelPPOActor(BasePPOActor):
         raw_prompt_texts = model_inputs["raw_prompt_text"]
         feedback_texts = model_inputs.get("feedback_text", None)
         teacher_prompt_texts = model_inputs.get("teacher_prompt_text", None)
+        sdpo_feedback_mode = getattr(self.config, "sdpo_feedback_mode", "scalar_text")
         batch_multi_modal_data = model_inputs.get("multi_modal_data", None)
         pad_token_ids = model_inputs.get("pad_token_id", None)
 
@@ -276,6 +277,11 @@ class DataParallelPPOActor(BasePPOActor):
             if teacher_prompt_texts is not None:
                 teacher_prompt_text = str(teacher_prompt_texts[i])
             else:
+                if sdpo_feedback_mode == "successful_rollout":
+                    raise KeyError(
+                        "Missing `teacher_prompt_text` for sdpo_feedback_mode='successful_rollout'. "
+                        "This mode requires explicit successful-rollout teacher prompts and does not allow scalar fallback."
+                    )
                 raw_prompt_text = str(raw_prompt_texts[i])
                 feedback_text = "" if feedback_texts is None else str(feedback_texts[i])
                 teacher_content_text = f"{raw_prompt_text}\n\n[Feedback]: {feedback_text}"

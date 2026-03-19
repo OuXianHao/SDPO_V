@@ -145,7 +145,7 @@ class ActorConfig:
     sdpo_divergence: str = field(default="forward_kl", init=False)
     sdpo_use_tail: bool = field(default=True, init=False)
     sdpo_approx_mode: str = field(default="topk", init=False)
-    sdpo_feedback_mode: str = field(default="scalar_text", init=False)
+    sdpo_feedback_mode: str = field(default="successful_rollout", init=False)
 
 
 @dataclass
