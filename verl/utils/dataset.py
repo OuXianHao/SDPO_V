@@ -398,39 +398,29 @@ class RLHFDataset(Dataset):
         else:
             return [{"role": "user", "content": prompt_str}], prompt_str
 
+    def _estimate_prompt_length_text_only(self, messages: list[dict[str, Any]], use_processor_template: bool) -> int:
+        """
+        Lightweight prompt length estimate used by overlong filtering.
+
+        Important: this helper must stay text-only and should not trigger
+        image/video decoding or multimodal processor forward passes.
+        """
+        if use_processor_template and self.processor is not None:
+            prompt_text = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+        else:
+            prompt_text = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+
+        prompt_ids = self.tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
+        return len(prompt_ids)
+
     def _filter_overlong_prompts(self, example: dict[str, Any]) -> bool:
         messages, _ = self._build_messages(example)
         if self.image_key in example:
-            prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-            images = example[self.image_key]
-            if self.image_dir is not None and len(images) != 0 and isinstance(images[0], str):  # image paths
-                images = [os.path.join(self.image_dir, image) for image in images]
-
-            processed_images = [] if len(images) != 0 else None  # text-only data
-            for image in images:
-                processed_images.append(process_image(image, self.min_pixels, self.max_pixels))
-
-            model_inputs = self.processor(processed_images, [prompt], add_special_tokens=False, return_tensors="pt")
-            return model_inputs["input_ids"].size(-1) <= self.max_prompt_length
+            prompt_len = self._estimate_prompt_length_text_only(messages, use_processor_template=True)
+            return prompt_len <= self.max_prompt_length
         elif self.video_key in example:
-            prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-            videos = self._normalize_video_paths(example[self.video_key])
-
-            processed_videos = [] if len(videos) != 0 else None  # text-only data
-            if processed_videos is not None:
-                for video in videos:
-                    try:
-                        processed_videos.append(
-                            process_video(video, self.min_pixels, self.max_pixels, self.video_fps)
-                        )
-                    except Exception as e:
-                        print(f"[WARN] Skip bad video sample during filter: {video} | {repr(e)}")
-                        return False
-
-            model_inputs = self.processor(
-                videos=processed_videos, text=[prompt], add_special_tokens=False, return_tensors="pt"
-            )
-            return model_inputs["input_ids"].size(-1) <= self.max_prompt_length
+            prompt_len = self._estimate_prompt_length_text_only(messages, use_processor_template=True)
+            return prompt_len <= self.max_prompt_length
         else:
             input_ids = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True)
             return len(input_ids) <= self.max_prompt_length
