@@ -80,6 +80,15 @@ def _extract_metadata_from_output(output: Any) -> Optional[dict[str, Any]]:
     return None
 
 
+def _extract_fps_from_output(output: Any) -> Optional[float]:
+    if not isinstance(output, tuple):
+        return None
+    for item in output:
+        if isinstance(item, (int, float)):
+            return float(item)
+    return None
+
+
 def _extract_metadata_frame_count(metadata: Optional[dict[str, Any]]) -> Optional[int]:
     if metadata is None:
         return None
@@ -520,17 +529,22 @@ class RLHFDataset(Dataset):
             if processed_videos is not None:
                 for video in videos:
                     try:
-                        processed_video, video_sample_fps = process_video(
+                        output = process_video(
                             video,
                             self.min_pixels,
                             self.max_pixels,
                             self.video_fps,
                             return_fps=True,
+                            return_metadata=True,
                             problem_id=problem_id,
                         )
                     except Exception as e:
                         raise RuntimeError(f"Failed to process video in __getitem__: {video} | {repr(e)}") from e
 
+                    processed_video = output[0] if isinstance(output, tuple) else output
+                    video_sample_fps = _extract_fps_from_output(output)
+                    if video_sample_fps is None:
+                        video_sample_fps = float(self.video_fps)
                     processed_videos.append(processed_video)
                     video_fps_list.append(video_sample_fps)
 
