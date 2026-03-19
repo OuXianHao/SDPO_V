@@ -106,6 +106,24 @@ def _extract_metadata_frame_count(metadata: Optional[dict[str, Any]]) -> Optiona
     return None
 
 
+def _has_valid_first_frame(video_obj: Any) -> bool:
+    """Check whether sampled video object is non-empty and has an addressable first frame."""
+    if video_obj is None:
+        return False
+    if isinstance(video_obj, torch.Tensor):
+        return video_obj.ndim >= 1 and int(video_obj.shape[0]) > 0
+    if isinstance(video_obj, np.ndarray):
+        return video_obj.ndim >= 1 and int(video_obj.shape[0]) > 0
+    if isinstance(video_obj, (list, tuple)):
+        if len(video_obj) == 0:
+            return False
+        first = video_obj[0]
+        if isinstance(first, (list, tuple)):
+            return len(first) > 0
+        return True
+    return True
+
+
 def _classify_fixed_frame_exception(exc: Exception) -> str:
     msg = str(exc).lower()
     backend_reject_markers = (
@@ -226,6 +244,8 @@ def process_video(
             return_video_metadata=return_metadata,
         )
         sampled_video = output[0] if isinstance(output, tuple) else output
+        if not _has_valid_first_frame(sampled_video):
+            raise ValueError(f"Fixed-frame path returned empty/invalid video container for {video}.")
         metadata = _extract_metadata_from_output(output)
         backend = _infer_video_backend(metadata) or requested_reader
         if is_debug_mm_enabled():
@@ -316,6 +336,8 @@ def process_video(
         return_video_metadata=return_metadata,
     )
     sampled_video = output[0] if isinstance(output, tuple) else output
+    if not _has_valid_first_frame(sampled_video):
+        raise RuntimeError(f"fps fallback returned empty/invalid video container for {video}.")
     metadata = _extract_metadata_from_output(output)
     fallback_backend = _infer_video_backend(metadata) or requested_reader
     if is_debug_mm_enabled():
