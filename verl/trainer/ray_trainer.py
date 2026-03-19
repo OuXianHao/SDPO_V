@@ -42,6 +42,7 @@ from ..utils.checkpoint import CHECKPOINT_TRACKER, find_latest_ckpt, remove_obso
 from ..utils.logger import Tracker
 from ..utils.py_functional import convert_dict_to_str, timer, unflatten_dict
 from ..utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
+from ..utils.debug_utils import is_debug_shapes_enabled, summarize_batch_for_debug
 from ..workers.fsdp_workers import FSDPWorker
 from ..workers.reward import AutoRewardManager
 from .config import PPOConfig
@@ -887,6 +888,8 @@ class RayPPOTrainer:
                 # update actor
                 if self.config.trainer.critic_warmup <= self.global_step:
                     batch.meta_info["temperature"] = self.config.worker.rollout.temperature
+                    if is_debug_shapes_enabled():
+                        print(f"[debug-batch] {summarize_batch_for_debug(batch, rank='driver')}")
                     with timer("update_actor", timing_raw):
                         actor_output = self.actor_rollout_ref_wg.update_actor(batch)
 
