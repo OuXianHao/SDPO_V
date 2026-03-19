@@ -512,7 +512,7 @@ class RayPPOTrainer:
     ) -> dict[Any, list[int]]:
         uid2successful_indices: dict[Any, list[int]] = defaultdict(list)
         for idx, (uid, reward) in enumerate(zip(uids, accuracy_reward)):
-            if float(reward) == 1.0:
+            if np.isclose(float(reward), 1.0):
                 uid2successful_indices[uid].append(idx)
         return uid2successful_indices
 
@@ -524,7 +524,7 @@ class RayPPOTrainer:
         has_successful_sibling = np.zeros(len(uids), dtype=bool)
 
         for idx, uid in enumerate(uids):
-            if float(accuracy_reward[idx]) == 1.0:
+            if np.isclose(float(accuracy_reward[idx]), 1.0):
                 sampled_successful_texts.append(None)
                 continue
 
