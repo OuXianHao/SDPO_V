@@ -43,6 +43,16 @@ _VIDEO_SAMPLING_STATS = {
 }
 
 
+def _infer_video_backend(metadata: Optional[dict[str, Any]]) -> Optional[str]:
+    if metadata is None:
+        return None
+    for key in ("backend", "reader", "video_reader", "decoder_backend", "video_backend"):
+        value = metadata.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
 def _infer_frame_count(video_obj: Any) -> Optional[int]:
     """Best-effort frame count inference for debug/fallback logging."""
     if video_obj is None:
@@ -189,6 +199,8 @@ def process_video(
     return_fps: bool = False,
     return_metadata: bool = False,
 ) -> Any:
+    requested_reader = os.getenv("FORCE_QWENVL_VIDEO_READER", "").strip() or None
+
     # Canonical Qwen fixed-frame control: nframes=32.
     fixed_frame_vision_info = {
         "video": video,
@@ -204,6 +216,7 @@ def process_video(
         )
         sampled_video = output[0] if isinstance(output, tuple) else output
         metadata = _extract_metadata_from_output(output)
+        backend = _infer_video_backend(metadata) or requested_reader
 
         inferred_frames = _infer_frame_count(sampled_video)
         if inferred_frames is not None and inferred_frames < _VIDEO_FIXED_FRAMES:
@@ -220,6 +233,12 @@ def process_video(
                 reason="short_video",
                 metadata=metadata,
             )
+            if os.getenv("SDPO_VIDEO_SAMPLING_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}:
+                print(
+                    "[video-sampling-debug] "
+                    f"path={video} backend={backend} fixed32_success=True short_video=True "
+                    f"sampled_frames={inferred_frames} target={_VIDEO_FIXED_FRAMES}"
+                )
             return output
 
         if inferred_frames is None or inferred_frames != _VIDEO_FIXED_FRAMES:
@@ -239,6 +258,12 @@ def process_video(
             reason="fixed_frame_ok_or_nonstandard",
             metadata=metadata,
         )
+        if os.getenv("SDPO_VIDEO_SAMPLING_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}:
+            print(
+                "[video-sampling-debug] "
+                f"path={video} backend={backend} fixed32_success=True "
+                f"sampled_frames={inferred_frames} target={_VIDEO_FIXED_FRAMES}"
+            )
         return output
     except Exception as e:
         reason = _classify_fixed_frame_exception(e)
@@ -249,7 +274,8 @@ def process_video(
         print(
             "[video-sampling-warn] "
             f"fixed-frame sampling failed for {video} with nframes={_VIDEO_FIXED_FRAMES}; "
-            f"reason={reason}; fallback to fps-based path ({video_fps=}). error={repr(e)}"
+            f"reason={reason}; requested_reader={requested_reader}; "
+            f"exc_type={type(e).__name__}; error={repr(e)}; fallback to fps-based path ({video_fps=})"
         )
 
     # Explicit fallback to legacy fps control for backend compatibility.
@@ -267,6 +293,11 @@ def process_video(
     )
     sampled_video = output[0] if isinstance(output, tuple) else output
     metadata = _extract_metadata_from_output(output)
+    fallback_backend = _infer_video_backend(metadata) or requested_reader
+    print(
+        "[video-sampling-debug] "
+        f"path={video} backend={fallback_backend} fixed32_success=False fallback_fps={video_fps}"
+    )
     _maybe_debug_video_sampling(video, sampled_video, fallback_used=True, reason="fps_fallback", metadata=metadata)
     return output
 
