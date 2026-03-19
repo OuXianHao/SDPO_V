@@ -66,15 +66,20 @@ def _process_multi_modal_data(
 
     if "videos" in multi_modal_data:
         for video in multi_modal_data["videos"]:
-            videos.append(
-                process_video(
-                    video,
-                    min_pixels,
-                    max_pixels,
-                    video_fps,
-                    return_metadata=return_video_metadata,
-                )
+            processed_video = process_video(
+                video,
+                min_pixels,
+                max_pixels,
+                video_fps,
+                return_metadata=return_video_metadata,
             )
+            # qwen_vl_utils.fetch_video may return tuples when extra outputs are requested
+            # (e.g. (sampled_video, metadata)). vLLM multi_modal_data["video"] expects video
+            # tensors/arrays directly, so keep only the sampled frames here.
+            if isinstance(processed_video, tuple):
+                videos.append(processed_video[0])
+            else:
+                videos.append(processed_video)
 
     if len(images) != 0:
         return {"image": images}
@@ -105,7 +110,9 @@ class vLLMRollout(BaseRollout):
         self.rank = int(os.getenv("RANK", "0"))
         self.config = config
         self.pad_token_id = tokenizer.pad_token_id
-        self.return_video_metadata = processor is not None and "Qwen3VLProcessor" in processor.__class__.__name__
+        # Keep rollout input format stable for vLLM: pass only sampled video frames.
+        # Metadata tuples from qwen_vl_utils are handled/stripped in _process_multi_modal_data.
+        self.return_video_metadata = False
         self.use_tqdm = (self.rank == 0) and (not config.disable_tqdm)
         if config.tensor_parallel_size > torch.distributed.get_world_size():
             raise ValueError("Tensor parallelism size should be less than world size.")
