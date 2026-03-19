@@ -29,6 +29,7 @@ from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer, ProcessorMixin
 
 from . import torch_functional as VF
+from .debug_utils import detect_rank, is_debug_mm_enabled, summarize_multimodal_input_for_debug
 from .debug_dump import DEBUG_DUMP_WRITER
 
 
@@ -76,6 +77,15 @@ def _extract_metadata_from_output(output: Any) -> Optional[dict[str, Any]]:
         for item in output[1:]:
             if isinstance(item, dict):
                 return item
+    return None
+
+
+def _extract_fps_from_output(output: Any) -> Optional[float]:
+    if not isinstance(output, tuple):
+        return None
+    for item in output:
+        if isinstance(item, (int, float)):
+            return float(item)
     return None
 
 
@@ -198,6 +208,7 @@ def process_video(
     video_fps: float,
     return_fps: bool = False,
     return_metadata: bool = False,
+    problem_id: Optional[Any] = None,
 ) -> Any:
     requested_reader = os.getenv("FORCE_QWENVL_VIDEO_READER", "").strip() or None
 
@@ -217,6 +228,19 @@ def process_video(
         sampled_video = output[0] if isinstance(output, tuple) else output
         metadata = _extract_metadata_from_output(output)
         backend = _infer_video_backend(metadata) or requested_reader
+        if is_debug_mm_enabled():
+            print(
+                "[debug-mm] "
+                + summarize_multimodal_input_for_debug(
+                    rank=detect_rank(),
+                    problem_id=problem_id,
+                    video_paths=[video],
+                    fixed_frames=_VIDEO_FIXED_FRAMES,
+                    metadata=metadata,
+                    mm_input=sampled_video,
+                    input_kind="fixed32",
+                )
+            )
 
         inferred_frames = _infer_frame_count(sampled_video)
         if inferred_frames is not None and inferred_frames < _VIDEO_FIXED_FRAMES:
@@ -294,6 +318,19 @@ def process_video(
     sampled_video = output[0] if isinstance(output, tuple) else output
     metadata = _extract_metadata_from_output(output)
     fallback_backend = _infer_video_backend(metadata) or requested_reader
+    if is_debug_mm_enabled():
+        print(
+            "[debug-mm] "
+            + summarize_multimodal_input_for_debug(
+                rank=detect_rank(),
+                problem_id=problem_id,
+                video_paths=[video],
+                fixed_frames=_VIDEO_FIXED_FRAMES,
+                metadata=metadata,
+                mm_input=sampled_video,
+                input_kind=f"fps_fallback({video_fps})",
+            )
+        )
     print(
         "[video-sampling-debug] "
         f"path={video} backend={fallback_backend} fixed32_success=False fallback_fps={video_fps}"
@@ -483,6 +520,7 @@ class RLHFDataset(Dataset):
             example["multi_modal_data"] = {"images": images}
         elif self.video_key in example:
             prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+            problem_id = example.get("problem_id", example.get("id", None))
             videos = self._normalize_video_paths(example.pop(self.video_key))
 
             processed_videos = [] if len(videos) != 0 else None  # text-only data
@@ -491,16 +529,22 @@ class RLHFDataset(Dataset):
             if processed_videos is not None:
                 for video in videos:
                     try:
-                        processed_video, video_sample_fps = process_video(
+                        output = process_video(
                             video,
                             self.min_pixels,
                             self.max_pixels,
                             self.video_fps,
                             return_fps=True,
+                            return_metadata=True,
+                            problem_id=problem_id,
                         )
                     except Exception as e:
                         raise RuntimeError(f"Failed to process video in __getitem__: {video} | {repr(e)}") from e
 
+                    processed_video = output[0] if isinstance(output, tuple) else output
+                    video_sample_fps = _extract_fps_from_output(output)
+                    if video_sample_fps is None:
+                        video_sample_fps = float(self.video_fps)
                     processed_videos.append(processed_video)
                     video_fps_list.append(video_sample_fps)
 
@@ -515,6 +559,19 @@ class RLHFDataset(Dataset):
             input_ids = model_inputs.pop("input_ids")[0]
             attention_mask = model_inputs.pop("attention_mask")[0]
             example["multi_modal_data"] = {"videos": videos}
+            if is_debug_mm_enabled():
+                print(
+                    "[debug-mm] "
+                    + summarize_multimodal_input_for_debug(
+                        rank=detect_rank(),
+                        problem_id=problem_id,
+                        video_paths=videos,
+                        fixed_frames=_VIDEO_FIXED_FRAMES,
+                        metadata=None,
+                        mm_input=model_inputs.get("pixel_values_videos", None),
+                        input_kind="processor_output.pixel_values_videos",
+                    )
+                )
         else:
             prompt = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
             model_inputs = self.tokenizer([prompt], add_special_tokens=False, return_tensors="pt")
