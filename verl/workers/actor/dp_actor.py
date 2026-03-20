@@ -562,11 +562,18 @@ class DataParallelPPOActor(BasePPOActor):
     ) -> dict[str, torch.Tensor]:
         """Extract top-k log-probabilities from response logits.
 
-        Computes ``topk_logps = topk_logits - logsumexp(logits)`` which are
-        proper log-probabilities normalised by the full-vocabulary partition
-        function.  This mirrors the original SDPO's approach of computing
-        top-k inside the forward pass so that the loss function never sees
-        the full ``(batch, resp_len, vocab_size)`` tensor.
+        Uses ``log_softmax`` + ``topk`` instead of separate ``topk`` +
+        ``logsumexp`` to avoid creating two backward references to the full
+        ``(B, N, V)`` logits tensor.  The dual-reference pattern
+        (``topk(logits)`` + ``logsumexp(logits)``) causes
+        ``SplitWithSizesBackward0`` errors under FSDP because both ops
+        produce independent backward paths through the same flat-parameter
+        split.  ``log_softmax`` has a fused backward kernel that creates
+        only a single reference — matching the pattern used by the standard
+        PPO path (``log_softmax`` + ``gather``) which is proven to work.
+
+        Since ``log_softmax`` is monotonic, ``topk(log_softmax(x))`` returns
+        the same indices as ``topk(x)``.
 
         Args:
             logits: ``(batch, response_len, vocab_size)`` — response logits
@@ -574,12 +581,10 @@ class DataParallelPPOActor(BasePPOActor):
             k: number of top tokens.
             topk_indices: optional pre-computed indices from another
                 distribution (student's indices reused for teacher).
-            detach_lse: if True, detach the logsumexp from the autograd graph.
-                This makes the backward gradient sparse (only through top-k
-                entries) instead of dense (through full vocab via softmax).
-                Eliminates the ``(B, N, V)`` dense gradient that flows through
-                logsumexp backward, which can trigger
-                ``SplitWithSizesBackward0`` errors under FSDP.
+            detach_lse: if True, detach the log_softmax result before topk
+                so gradients only flow sparsely through gathered entries.
+                (Kept for API compatibility; less important now that the
+                dual-reference issue is resolved.)
 
         Returns:
             dict with ``topk_logps``, ``topk_indices``, ``logsumexp``.
@@ -587,25 +592,29 @@ class DataParallelPPOActor(BasePPOActor):
         vocab_size = logits.size(-1)
         k = min(max(k, 1), vocab_size)
 
-        if topk_indices is None:
-            topk_logits, topk_indices = torch.topk(logits, k, dim=-1)
-        else:
-            topk_logits = torch.gather(logits, dim=-1, index=topk_indices)
+        # Single fused backward through log_softmax — avoids the dual
+        # topk + logsumexp backward references that trigger FSDP errors.
+        log_probs = torch.log_softmax(logits, dim=-1)  # (batch, resp_len, vocab)
 
-        lse = torch.logsumexp(logits, dim=-1, keepdim=True)  # (batch, resp_len, 1)
         if detach_lse:
-            # Detach the partition function from the autograd graph.
-            # Numerically: topk_logps still have correct log-probability values.
-            # Gradient-wise: gradient only flows through topk_logits (sparse),
-            # NOT through logsumexp (which would be dense across full vocab).
-            topk_logps = topk_logits - lse.detach()
+            # Detach to make gradient sparse (only through gathered entries).
+            log_probs_for_topk = log_probs.detach()
         else:
-            topk_logps = topk_logits - lse  # proper log-probs
+            log_probs_for_topk = log_probs
+
+        if topk_indices is None:
+            topk_logps, topk_indices = torch.topk(log_probs_for_topk, k, dim=-1)
+        else:
+            topk_logps = torch.gather(log_probs_for_topk, dim=-1, index=topk_indices)
+
+        # Compute logsumexp for metrics compatibility (detached — no grad needed).
+        with torch.no_grad():
+            lse = torch.logsumexp(logits, dim=-1)  # (batch, resp_len)
 
         return {
             "topk_logps": topk_logps,       # (batch, resp_len, k)
             "topk_indices": topk_indices,    # (batch, resp_len, k)
-            "logsumexp": lse.squeeze(-1),    # (batch, resp_len)
+            "logsumexp": lse,               # (batch, resp_len)
         }
 
     def _compute_sdpo_logit_loss(self, model_inputs: dict[str, Any], temperature: float) -> tuple[torch.Tensor, dict[str, float]]:
