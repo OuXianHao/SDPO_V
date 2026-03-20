@@ -141,7 +141,20 @@ def all_to_all_tensor(
 ):
     group = get_ulysses_sequence_parallel_group() if group is None else group
     seq_world_size = dist.get_world_size(group)
+    scatter_size = local_input.size(scatter_dim)
+    if scatter_size % seq_world_size != 0:
+        raise AssertionError(
+            "[RCA_ASSERT_ALL2ALL_SPLIT] "
+            f"scatter_size={scatter_size} not divisible by seq_world_size={seq_world_size}; "
+            f"local_shape={tuple(local_input.shape)} scatter_dim={scatter_dim} gather_dim={gather_dim}"
+        )
     shape_debug = os.getenv("ULYSSES_SHAPE_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
+    if os.getenv("EASYR1_DEBUG_SDPO_UPDATE", "0").strip().lower() in {"1", "true", "yes", "on"}:
+        print(
+            "[RCA_ALL2ALL_SPLIT_PRE] "
+            f"rank={get_ulysses_sequence_parallel_rank(group)}/{seq_world_size} "
+            f"local_shape={tuple(local_input.shape)} scatter_dim={scatter_dim} gather_dim={gather_dim}"
+        )
     if shape_debug:
         print(
             "[ulysses-shape-debug] all_to_all_tensor "
@@ -238,6 +251,12 @@ class Gather(torch.autograd.Function):
     def backward(ctx: Any, grad_output: Tensor) -> Any:
         if ctx.grad_scaler:
             grad_output = grad_output * ctx.sp_world_size
+        if os.getenv("EASYR1_DEBUG_SPLIT_BACKWARD", "0").strip().lower() in {"1", "true", "yes", "on"}:
+            print(
+                "[ulysses-split-backward-debug][RCA_GATHER_SPLIT_BWD] "
+                f"rank={ctx.sp_rank}/{ctx.sp_world_size} gather_dim={ctx.gather_dim} part_size={ctx.part_size} "
+                f"grad_output_shape={tuple(grad_output.shape)} grad_output_numel={grad_output.numel()}"
+            )
         return (
             None,
             grad_output.split(ctx.part_size, dim=ctx.gather_dim)[ctx.sp_rank].contiguous(),
