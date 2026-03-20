@@ -16,6 +16,7 @@ The main entry point to run the PPO algorithm
 """
 
 from contextlib import nullcontext
+import os
 from typing import Literal, Optional, Union, cast
 
 import numpy as np
@@ -53,6 +54,7 @@ from ..utils.fsdp_utils import (
     load_fsdp_optimizer,
     offload_fsdp_model,
     offload_fsdp_optimizer,
+    describe_fsdp_modules_topk,
 )
 from ..utils.model_utils import print_gpu_memory_usage, print_model_size
 from ..utils.tokenizer import get_processor, get_tokenizer
@@ -330,6 +332,9 @@ class FSDPWorker(Worker):
             device_mesh=self.device_mesh,
         )
         print_gpu_memory_usage("After FSDP module init")
+        if os.environ.get("EASYR1_DEBUG_FSDP_HANDLES", "0") == "1":
+            topk_handles = describe_fsdp_modules_topk(fsdp_module, topk=8)
+            self.print_rank0(f"Top FSDP flat-param handles(full_numel): {topk_handles}")
 
         if role in ["actor", "critic"]:
             self.fsdp_module = fsdp_module

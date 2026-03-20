@@ -18,7 +18,9 @@ We can subclass Protocol to define more detailed batch info with specific keys
 
 import copy
 import io
+import os
 import pickle
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Union
@@ -721,13 +723,29 @@ def allgather_dict_tensors(
         tensors_as_dict = tensors
         is_tensor_dict = False
 
+    debug_collective = os.environ.get("EASYR1_DEBUG_COLLECTIVE", "0") == "1"
+    group_size = torch.distributed.get_world_size(group=group)
+    rank = torch.distributed.get_rank(group=group)
     output = {}
     sorted_keys = sorted(tensors_as_dict.keys())
     for key in sorted_keys:
         value = tensors_as_dict[key]
-        output[key] = [torch.empty_like(value) for _ in range(size)]
-        torch.distributed.all_gather(output[key], value, group=group, async_op=False)
-        output[key] = torch.cat(output[key], dim=dim)
+        start = time.perf_counter()
+        if dim == 0 and value.is_contiguous():
+            gathered = torch.empty((size,) + value.shape, device=value.device, dtype=value.dtype)
+            torch.distributed.all_gather_into_tensor(gathered, value, group=group, async_op=False)
+            output[key] = gathered.reshape(size * value.shape[0], *value.shape[1:])
+        else:
+            output[key] = [torch.empty_like(value) for _ in range(size)]
+            torch.distributed.all_gather(output[key], value, group=group, async_op=False)
+            output[key] = torch.cat(output[key], dim=dim)
+        if debug_collective:
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            print(
+                "[allgather_dict_tensors] "
+                f"rank={rank}/{group_size} key={key} shape={tuple(value.shape)} numel={value.numel()} "
+                f"dtype={value.dtype} contiguous={value.is_contiguous()} dim={dim} elapsed_ms={elapsed_ms:.2f}"
+            )
 
     if is_tensor_dict:
         output = TensorDict(source=output, batch_size=tensors.batch_size[0] * size)
@@ -737,11 +755,24 @@ def allgather_dict_tensors(
 
 def all_gather_data_proto(data: DataProto, size: int, group: ProcessGroup) -> None:
     # Note that this is an inplace operator just like torch.distributed.all_gather
+    debug_collective = os.environ.get("EASYR1_DEBUG_COLLECTIVE", "0") == "1"
+    group_size = torch.distributed.get_world_size(group=group)
+    rank = torch.distributed.get_rank(group=group)
     prev_device = data.batch.device
+    start = time.perf_counter()
     data.batch = data.batch.cuda(device=torch.cuda.current_device())
     data.batch = allgather_dict_tensors(data.batch.contiguous(), size=size, group=group, dim=0)
     data.batch = data.batch.to(prev_device)
+    tensor_elapsed_ms = (time.perf_counter() - start) * 1000.0
     # all gather non_tensor_batch
     all_non_tensor_batch = [None for _ in range(size)]
+    start = time.perf_counter()
     torch.distributed.all_gather_object(all_non_tensor_batch, data.non_tensor_batch, group=group)
     data.non_tensor_batch = {k: np.concatenate([d[k] for d in all_non_tensor_batch]) for k in data.non_tensor_batch}
+    object_elapsed_ms = (time.perf_counter() - start) * 1000.0
+    if debug_collective:
+        print(
+            "[all_gather_data_proto] "
+            f"rank={rank}/{group_size} tensor_elapsed_ms={tensor_elapsed_ms:.2f} "
+            f"object_elapsed_ms={object_elapsed_ms:.2f} non_tensor_keys={list(data.non_tensor_batch.keys())}"
+        )
