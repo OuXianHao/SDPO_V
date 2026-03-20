@@ -606,7 +606,7 @@ def compute_sdpo_logit_loss(
             else:
                 token_loss = token_loss + student_tail * (torch.log(student_tail) - torch.log(teacher_tail))
     else:
-        if debug_sdpo:
+        if os.getenv("EASYR1_DEBUG_SDPO_UPDATE", "0").strip().lower() in {"1", "true", "yes", "on"}:
             rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
             world = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
             print(
@@ -614,43 +614,6 @@ def compute_sdpo_logit_loss(
                 f"rank={rank}/{world} student_logits_shape={tuple(student_logits.shape)} "
                 f"teacher_logits_shape={tuple(teacher_logits.shape)} response_mask_shape={tuple(response_mask.shape)}"
             )
-            print(
-                "[RCA_FULLVOCAB_PRE_FLATTEN_X] "
-                f"student_logits_numel={student_logits.numel()} teacher_logits_numel={teacher_logits.numel()} "
-                f"dtype={student_logits.dtype} requires_grad={student_logits.requires_grad}"
-            )
-        student_logits_2d = student_logits.reshape(-1, vocab_size)
-        teacher_logits_2d = teacher_logits.reshape(-1, vocab_size)
-        valid_flat = response_mask.reshape(-1)
-        assert student_logits_2d.size(0) == valid_flat.size(0), (
-            "[RCA_FULLVOCAB_ASSERT_FLATTEN] "
-            f"logits_tokens={student_logits_2d.size(0)} mask_tokens={valid_flat.size(0)}"
-        )
-        if debug_sdpo:
-            print(
-                "[RCA_FULLVOCAB_POST_FLATTEN_X] "
-                f"student_logits_2d_shape={tuple(student_logits_2d.shape)} "
-                f"teacher_logits_2d_shape={tuple(teacher_logits_2d.shape)} "
-                f"valid_tokens={int(valid_flat.sum().item())}"
-            )
-        student_valid = student_logits_2d[valid_flat]
-        teacher_valid = teacher_logits_2d[valid_flat]
-        if debug_sdpo:
-            print(
-                "[RCA_FULLVOCAB_PRE_KL_X] "
-                f"student_valid_shape={tuple(student_valid.shape)} teacher_valid_shape={tuple(teacher_valid.shape)} "
-                f"student_valid_numel={student_valid.numel()} teacher_valid_numel={teacher_valid.numel()} "
-                f"requires_grad={student_valid.requires_grad}"
-            )
-        assert student_valid.shape == teacher_valid.shape, (
-            "[RCA_FULLVOCAB_ASSERT_VALID_SHAPE] "
-            f"student_valid={tuple(student_valid.shape)} teacher_valid={tuple(teacher_valid.shape)}"
-        )
-
-        student_valid_log_probs = F.log_softmax(student_valid, dim=-1)
-        teacher_valid_log_probs = F.log_softmax(teacher_valid, dim=-1)
-        student_valid_probs = student_valid_log_probs.exp()
-        teacher_valid_probs = teacher_valid_log_probs.exp()
         topk_indices = torch.empty(0, device=student_logits.device, dtype=torch.long)
         if divergence == "forward_kl":
             token_loss_valid = (teacher_valid_probs * (teacher_valid_log_probs - student_valid_log_probs)).sum(dim=-1)
