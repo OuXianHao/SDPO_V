@@ -270,14 +270,51 @@ class DataParallelPPOActor(BasePPOActor):
             full_logits = pad_input(hidden_states=logits_rmpad, indices=indices, batch=batch_size, seqlen=seqlen)
             logits = full_logits[:, -response_length - 1 : -1, :]
         else:
-            output = self.actor_module(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                **mm_inputs,
-                use_cache=False,
+            sdpo_topk_mode = (
+                getattr(self.config, "loss_mode", None) == "sdpo_logit"
+                and getattr(self.config, "sdpo_approx_mode", "topk") in ("topk", "student_topk_tail")
             )
-            logits = output.logits[:, -response_length - 1 : -1, :] / temperature
+            force_full_logits = os.getenv("SDPO_FORCE_FULL_LOGITS", "0").strip().lower() in {"1", "true", "yes", "on"}
+            use_compact_response_lm_head = sdpo_topk_mode and (not force_full_logits)
+
+            if use_compact_response_lm_head and hasattr(self.actor_module, "model") and hasattr(self.actor_module, "lm_head"):
+                # Avoid constructing full-sequence logits in SDPO top-k mode.
+                # Compute hidden states first, then apply lm_head only on response positions.
+                backbone_out = self.actor_module.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    **mm_inputs,
+                    use_cache=False,
+                )
+                hidden_states = (
+                    backbone_out.last_hidden_state if hasattr(backbone_out, "last_hidden_state") else backbone_out[0]
+                )
+                response_hidden_states = hidden_states[:, -response_length - 1 : -1, :].contiguous()
+                logits = self.actor_module.lm_head(response_hidden_states) / temperature
+                if self._sdpo_backward_shape_debug and self.rank == 0:
+                    print(
+                        "[sdpo-shape-debug] compact_response_lm_head=True "
+                        f"hidden_states_shape={tuple(hidden_states.shape)} "
+                        f"response_hidden_states_shape={tuple(response_hidden_states.shape)} "
+                        f"logits_shape={tuple(logits.shape)}"
+                    )
+            else:
+                output = self.actor_module(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    **mm_inputs,
+                    use_cache=False,
+                )
+                full_logits = output.logits
+                logits = full_logits[:, -response_length - 1 : -1, :] / temperature
+                if self._sdpo_backward_shape_debug and self.rank == 0:
+                    print(
+                        "[sdpo-shape-debug] compact_response_lm_head=False "
+                        f"full_logits_shape={tuple(full_logits.shape)} "
+                        f"response_logits_shape={tuple(logits.shape)}"
+                    )
         return logits
 
     def _build_teacher_message_content(self, prompt_text: str, multi_modal_data: Optional[dict[str, Any]]) -> Any:
