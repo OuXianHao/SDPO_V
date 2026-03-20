@@ -253,7 +253,7 @@ class Gather(torch.autograd.Function):
             grad_output = grad_output * ctx.sp_world_size
         if os.getenv("EASYR1_DEBUG_SPLIT_BACKWARD", "0").strip().lower() in {"1", "true", "yes", "on"}:
             print(
-                "[ulysses-split-backward-debug][RCA_GATHER_SPLIT_BWD] "
+                "[ulysses-split-backward-debug] "
                 f"rank={ctx.sp_rank}/{ctx.sp_world_size} gather_dim={ctx.gather_dim} part_size={ctx.part_size} "
                 f"grad_output_shape={tuple(grad_output.shape)} grad_output_numel={grad_output.numel()}"
             )
