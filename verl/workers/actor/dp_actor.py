@@ -16,6 +16,7 @@ Implement Actor
 """
 
 import os
+import time
 from collections import defaultdict
 from typing import Any, Optional
 
@@ -85,6 +86,12 @@ class DataParallelPPOActor(BasePPOActor):
                 )
 
         self._sdpo_backward_shape_debug = os.getenv("SDPO_BACKWARD_SHAPE_DEBUG", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self._sdpo_update_debug = os.getenv("EASYR1_DEBUG_SDPO_UPDATE", "0").strip().lower() in {
             "1",
             "true",
             "yes",
@@ -206,6 +213,7 @@ class DataParallelPPOActor(BasePPOActor):
             attention_mask = micro_batch["attention_mask"]
         if position_ids is None:
             position_ids = micro_batch["position_ids"]
+        batch_size, seqlen = input_ids.shape
         if position_ids.dim() == 3:  # qwen2vl/qwen3vl mrope
             position_ids = position_ids.transpose(0, 1)
 
@@ -219,15 +227,51 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             mm_inputs = multi_modal_inputs
 
-        output = self.actor_module(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            **mm_inputs,
-            use_cache=False,
-        )
-        logits: torch.Tensor = output.logits
-        logits = logits[:, -response_length - 1 : -1, :] / temperature
+        if self.config.padding_free:
+            input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask)  # (total_nnz, 1)
+            input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
+
+            if position_ids.dim() == 3:
+                position_ids_rmpad = (
+                    index_first_axis(rearrange(position_ids, "c b s ... -> (b s) c ..."), indices)
+                    .transpose(0, 1)
+                    .unsqueeze(1)
+                )
+            else:
+                position_ids_rmpad = index_first_axis(
+                    rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices
+                ).transpose(0, 1)
+
+            pad_size = 0
+            if self.config.ulysses_size > 1:
+                input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad_and_slice_inputs(
+                    input_ids_rmpad, position_ids_rmpad, sp_size=self.config.ulysses_size
+                )
+
+            output = self.actor_module(
+                input_ids=input_ids_rmpad,
+                attention_mask=None,
+                position_ids=position_ids_rmpad,
+                **mm_inputs,
+                use_cache=False,
+            )
+            logits_rmpad: torch.Tensor = output.logits.squeeze(0) / temperature
+            if self.config.ulysses_size > 1:
+                # Keep gradient local scale to avoid expanding grads by sp_world_size for full-vocab logits.
+                logits_rmpad = gather_outputs_and_unpad(
+                    logits_rmpad, gather_dim=0, unpad_dim=0, padding_size=pad_size, grad_scaler=False
+                )
+            full_logits = pad_input(hidden_states=logits_rmpad, indices=indices, batch=batch_size, seqlen=seqlen)
+            logits = full_logits[:, -response_length - 1 : -1, :]
+        else:
+            output = self.actor_module(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                **mm_inputs,
+                use_cache=False,
+            )
+            logits = output.logits[:, -response_length - 1 : -1, :] / temperature
         return logits
 
     def _build_teacher_message_content(self, prompt_text: str, multi_modal_data: Optional[dict[str, Any]]) -> Any:
@@ -420,6 +464,9 @@ class DataParallelPPOActor(BasePPOActor):
             & model_inputs["response_token_mask"].bool()
             & model_inputs["sdpo_valid_mask"].bool()
         )
+        valid_sample_mask = response_mask.any(dim=-1)
+        num_valid_samples = int(valid_sample_mask.sum().item())
+        num_total_samples = int(response_mask.shape[0])
         if response_mask.shape != model_inputs["responses"].shape:
             raise ValueError("response_token_mask must align with sampled responses shape.")
 
@@ -431,9 +478,11 @@ class DataParallelPPOActor(BasePPOActor):
             zero_loss = trainable_param.sum() * 0.0
             return zero_loss, {"sdpo_all_masked_batch": 1.0, "sdpo_valid_token_count": 0.0}
 
+        build_start = time.perf_counter()
         teacher_input_ids, teacher_attention_mask, teacher_position_ids, teacher_multi_modal_inputs = self._build_teacher_inputs(
             model_inputs
         )
+        build_elapsed_ms = (time.perf_counter() - build_start) * 1000.0
 
         if self._sdpo_backward_shape_debug and self.rank == 0:
             print(
@@ -453,6 +502,7 @@ class DataParallelPPOActor(BasePPOActor):
             teacher_mm_shapes = {k: tuple(v.shape) for k, v in teacher_multi_modal_inputs.items()}
             print(f"[sdpo-shape-debug] teacher multimodal tensor shapes: {teacher_mm_shapes}")
 
+        teacher_forward_start = time.perf_counter()
         with torch.no_grad():
             teacher_logits = self._forward_response_logits(
                 model_inputs,
@@ -462,8 +512,11 @@ class DataParallelPPOActor(BasePPOActor):
                 position_ids=teacher_position_ids,
                 multi_modal_inputs=teacher_multi_modal_inputs,
             )
+        teacher_forward_elapsed_ms = (time.perf_counter() - teacher_forward_start) * 1000.0
 
+        student_forward_start = time.perf_counter()
         student_logits = self._forward_response_logits(model_inputs, temperature=temperature)
+        student_forward_elapsed_ms = (time.perf_counter() - student_forward_start) * 1000.0
         if teacher_logits.shape[:2] != student_logits.shape[:2]:
             raise ValueError("Teacher and student response spans must align for sdpo_logit.")
 
@@ -487,6 +540,19 @@ class DataParallelPPOActor(BasePPOActor):
             approx_mode=self.config.sdpo_approx_mode,
         )
         metrics = {f"sdpo/{k}": v for k, v in sdpo_metrics.items()}
+        if self._sdpo_update_debug:
+            print(
+                "[sdpo-update-debug] "
+                f"rank={self.rank}/{self.world_size} total_samples={num_total_samples} valid_samples={num_valid_samples} "
+                f"response_mask_shape={tuple(response_mask.shape)} response_mask_numel={response_mask.numel()} "
+                f"sdpo_valid_mask_shape={tuple(model_inputs['sdpo_valid_mask'].shape)} "
+                f"response_token_mask_shape={tuple(model_inputs['response_token_mask'].shape)} "
+                f"teacher_input_shape={tuple(teacher_input_ids.shape)} teacher_input_numel={teacher_input_ids.numel()} "
+                f"teacher_logits_shape={tuple(teacher_logits.shape)} teacher_logits_numel={teacher_logits.numel()} "
+                f"student_logits_shape={tuple(student_logits.shape)} student_logits_numel={student_logits.numel()} "
+                f"build_teacher_ms={build_elapsed_ms:.2f} teacher_forward_ms={teacher_forward_elapsed_ms:.2f} "
+                f"student_forward_ms={student_forward_elapsed_ms:.2f}"
+            )
         return sdpo_loss, metrics
 
     def _optimizer_step(self) -> torch.Tensor:
@@ -620,6 +686,17 @@ class DataParallelPPOActor(BasePPOActor):
                         loss.backward()
                         append_to_dict(metrics, {f"grpo/{k}": v for k, v in grpo_metrics.items()})
                     elif self.config.loss_mode == "sdpo_logit":
+                        if self._sdpo_update_debug:
+                            valid_samples = int(model_inputs["sdpo_valid_mask"].bool().any(dim=-1).sum().item())
+                            total_samples = int(model_inputs["sdpo_valid_mask"].shape[0])
+                            print(
+                                "[sdpo-update-debug] "
+                                f"rank={self.rank}/{self.world_size} micro_batch_samples={total_samples} "
+                                f"valid_samples={valid_samples} invalid_samples={total_samples - valid_samples} "
+                                f"input_ids_shape={tuple(model_inputs['input_ids'].shape)} "
+                                f"attention_mask_shape={tuple(model_inputs['attention_mask'].shape)} "
+                                f"position_ids_shape={tuple(model_inputs['position_ids'].shape)}"
+                            )
                         loss, sdpo_metrics = self._compute_sdpo_logit_loss(model_inputs, temperature=temperature)
                         loss = loss * torch.sum(response_mask) * self.world_size / total_response_tokens
                         if self._sdpo_backward_shape_debug:
