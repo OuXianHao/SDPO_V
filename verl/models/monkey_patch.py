@@ -37,15 +37,16 @@ QWEN2_VL_MODELS = ("qwen2_vl", "qwen2_5_vl")
 QWEN3_VL_MODELS = ("qwen3_vl", "qwen3_vl_moe")
 
 
-def apply_ulysses_patch(model_type: str) -> None:
-    if not is_transformers_version_greater_than("4.54.0"):
-        raise RuntimeError("Only support transformers >= 4.54.0.")
+def apply_vl_forward_patch(model_type: str) -> None:
+    """Patch VL model forward methods to support ``response_only_logits``.
 
-    if model_type in SUPPORTED_MODEL_TYPE:
-        ALL_ATTENTION_FUNCTIONS["flash_attention_2"] = flash_attention_forward
-    else:
-        raise NotImplementedError(f"Model architecture {model_type} is not supported yet.")
+    Unlike :func:`apply_ulysses_patch`, this does **not** touch the global
+    attention function registry.  It only replaces the model-level ``forward``
+    so that custom kwargs (``response_only_logits``, ``skip_logits``) are
+    honoured.  Safe to call in both padding-free and non-padding-free modes.
 
+    This is idempotent – calling it multiple times is harmless.
+    """
     if model_type in QWEN2_VL_MODELS:
         from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
             Qwen2_5_VLForConditionalGeneration,
@@ -55,10 +56,8 @@ def apply_ulysses_patch(model_type: str) -> None:
 
         from .transformers.qwen2_vl import qwen2_vl_base_forward, qwen2_vl_model_forward
 
-        # fix text-image mixed data
         Qwen2VLModel.forward = qwen2_vl_base_forward
         Qwen2_5_VLModel.forward = qwen2_vl_base_forward
-        # TODO: add linear cross entropy kernels
         Qwen2VLForConditionalGeneration.forward = qwen2_vl_model_forward
         Qwen2_5_VLForConditionalGeneration.forward = qwen2_vl_model_forward
     elif model_type in QWEN3_VL_MODELS:
@@ -70,9 +69,20 @@ def apply_ulysses_patch(model_type: str) -> None:
 
         from .transformers.qwen3_vl import qwen3_vl_base_forward, qwen3_vl_model_forward
 
-        # fix text-image mixed data
         Qwen3VLModel.forward = qwen3_vl_base_forward
         Qwen3VLMoeModel.forward = qwen3_vl_base_forward
-        # TODO: add linear cross entropy kernels
         Qwen3VLForConditionalGeneration.forward = qwen3_vl_model_forward
         Qwen3VLMoeForConditionalGeneration.forward = qwen3_vl_model_forward
+
+
+def apply_ulysses_patch(model_type: str) -> None:
+    if not is_transformers_version_greater_than("4.54.0"):
+        raise RuntimeError("Only support transformers >= 4.54.0.")
+
+    if model_type in SUPPORTED_MODEL_TYPE:
+        ALL_ATTENTION_FUNCTIONS["flash_attention_2"] = flash_attention_forward
+    else:
+        raise NotImplementedError(f"Model architecture {model_type} is not supported yet.")
+
+    # Also apply model forward patches (idempotent).
+    apply_vl_forward_patch(model_type)

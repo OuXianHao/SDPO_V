@@ -40,7 +40,7 @@ from transformers import (
 )
 from transformers.modeling_utils import no_init_weights
 
-from ..models.monkey_patch import apply_ulysses_patch
+from ..models.monkey_patch import QWEN2_VL_MODELS, QWEN3_VL_MODELS, apply_ulysses_patch, apply_vl_forward_patch
 from ..protocol import DataProto
 from ..single_controller.base import Worker
 from ..single_controller.base.decorator import Dispatch, register
@@ -202,6 +202,11 @@ class FSDPWorker(Worker):
         if padding_free:
             apply_ulysses_patch(self.model_config.model_type)
             self.print_rank0("Ulysses patch applied!")
+        elif self.model_config.model_type in (*QWEN2_VL_MODELS, *QWEN3_VL_MODELS):
+            # Even without padding_free / Ulysses, VL models need the patched
+            # forward to support response_only_logits (SDPO compact top-k path).
+            apply_vl_forward_patch(self.model_config.model_type)
+            self.print_rank0("VL model forward patch applied (non-padding-free).")
 
         if fsdp_config.torch_dtype is None:
             torch_dtype = torch.float32 if role != "ref" else torch.bfloat16

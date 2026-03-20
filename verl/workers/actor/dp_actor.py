@@ -300,6 +300,24 @@ class DataParallelPPOActor(BasePPOActor):
                 # This keeps everything inside the FSDP forward context
                 # (parameters properly gathered/sharded) and avoids the massive
                 # (batch, full_seq, vocab_size) logits tensor.
+
+                # --- Live-path diagnostic: verify patched forward is active ---
+                if self.rank == 0:
+                    # Unwrap FSDP to get the actual model class
+                    unwrapped = self.actor_module
+                    while hasattr(unwrapped, "module"):
+                        unwrapped = unwrapped.module
+                    model_cls = type(unwrapped)
+                    fwd_fn = getattr(model_cls, "forward", None)
+                    fwd_qualname = getattr(fwd_fn, "__qualname__", "UNKNOWN") if fwd_fn else "NONE"
+                    fwd_module = getattr(fwd_fn, "__module__", "UNKNOWN") if fwd_fn else "NONE"
+                    print(
+                        f"[sdpo-patch-check] model_class={model_cls.__name__} "
+                        f"forward.__qualname__={fwd_qualname} "
+                        f"forward.__module__={fwd_module} "
+                        f"response_only_logits={response_length}"
+                    )
+
                 output = self.actor_module(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -308,28 +326,30 @@ class DataParallelPPOActor(BasePPOActor):
                     use_cache=False,
                     response_only_logits=response_length,
                 )
-                raw_logits = output.logits
-                # Robustness: if the model did NOT honor response_only_logits
-                # (e.g. monkey patch not applied), it returns full-sequence
-                # logits (batch, full_seq, vocab).  Detect and fall back to
-                # slicing so that teacher/student shapes always match.
-                if raw_logits.size(1) != response_length:
-                    if self.rank == 0:
-                        print(
-                            "[sdpo-fallback] Model returned full-sequence logits "
-                            f"(seq_dim={raw_logits.size(1)}) instead of "
-                            f"response_length={response_length}. "
-                            "Falling back to slicing. Ensure apply_ulysses_patch() "
-                            "is called for optimal memory usage."
-                        )
-                    logits = raw_logits[:, -response_length - 1 : -1, :] / temperature
-                else:
-                    logits = raw_logits / temperature
-                if self._sdpo_backward_shape_debug and self.rank == 0:
+                logits = output.logits
+
+                # Verify the model actually honored response_only_logits.
+                # If it didn't (patch not applied), the logits will be
+                # (batch, full_seq_len, vocab) instead of (batch, response_length, vocab).
+                # Do NOT silently fall back — that re-enters the dangerous
+                # full-sequence backward path that causes SplitWithSizesBackward0.
+                if logits.size(1) != response_length:
+                    raise RuntimeError(
+                        f"[SDPO FATAL] response_only_logits={response_length} was NOT "
+                        f"honored by the live model forward. Returned logits shape "
+                        f"{tuple(logits.shape)} (expected seq_dim={response_length}). "
+                        f"The VL model forward patch is NOT active. "
+                        f"Ensure apply_vl_forward_patch() is called in "
+                        f"_build_model_optimizer() BEFORE model construction. "
+                        f"Do NOT fall back to full-sequence logits — that path "
+                        f"causes SplitWithSizesBackward0 gradient failures."
+                    )
+                logits = logits / temperature
+                if self.rank == 0:
                     print(
-                        "[sdpo-shape-debug] response_only_logits=True "
-                        f"raw_logits_shape={tuple(raw_logits.shape)} "
-                        f"logits_shape={tuple(logits.shape)}"
+                        f"[sdpo-path-ok] response_only_logits HONORED. "
+                        f"logits_shape={tuple(logits.shape)} "
+                        f"(expected response_length={response_length})"
                     )
             else:
                 output = self.actor_module(
