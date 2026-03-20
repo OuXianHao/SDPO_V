@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 from ..utils import torch_functional as VF
@@ -604,6 +605,14 @@ def compute_sdpo_logit_loss(
             else:
                 token_loss = token_loss + student_tail * (torch.log(student_tail) - torch.log(teacher_tail))
     else:
+        if os.getenv("EASYR1_DEBUG_SDPO_UPDATE", "0").strip().lower() in {"1", "true", "yes", "on"}:
+            rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+            world = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+            print(
+                "[RCA_SDPO_FULL_VOCAB_BRANCH] "
+                f"rank={rank}/{world} student_logits_shape={tuple(student_logits.shape)} "
+                f"teacher_logits_shape={tuple(teacher_logits.shape)} response_mask_shape={tuple(response_mask.shape)}"
+            )
         topk_indices = torch.empty(0, device=student_logits.device, dtype=torch.long)
         if divergence == "forward_kl":
             token_loss = (teacher_probs * (teacher_log_probs - student_log_probs)).sum(dim=-1)

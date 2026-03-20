@@ -205,6 +205,12 @@ class DataParallelPPOActor(BasePPOActor):
         position_ids: Optional[torch.Tensor] = None,
         multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
+        if self._sdpo_update_debug:
+            print(
+                "[RCA_FORWARD_RESP_LOGITS_ENTRY] "
+                f"rank={self.rank}/{self.world_size} "
+                f"padding_free={self.config.padding_free} ulysses_size={self.config.ulysses_size}"
+            )
         responses = micro_batch["responses"]
         response_length = responses.size(-1)
         if input_ids is None:
@@ -459,6 +465,15 @@ class DataParallelPPOActor(BasePPOActor):
         return teacher_input_ids, teacher_attention_mask, teacher_position_ids, teacher_multi_modal_inputs_batch
 
     def _compute_sdpo_logit_loss(self, model_inputs: dict[str, Any], temperature: float) -> tuple[torch.Tensor, dict[str, float]]:
+        if self._sdpo_update_debug:
+            print(
+                "[RCA_SDPO_LOSS_ENTRY] "
+                f"rank={self.rank}/{self.world_size} "
+                f"responses_shape={tuple(model_inputs['responses'].shape)} "
+                f"input_ids_shape={tuple(model_inputs['input_ids'].shape)} "
+                f"attention_mask_shape={tuple(model_inputs['attention_mask'].shape)} "
+                f"position_ids_shape={tuple(model_inputs['position_ids'].shape)}"
+            )
         response_mask = (
             model_inputs["response_mask"].bool()
             & model_inputs["response_token_mask"].bool()
