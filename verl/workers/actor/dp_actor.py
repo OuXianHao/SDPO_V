@@ -213,6 +213,7 @@ class DataParallelPPOActor(BasePPOActor):
             attention_mask = micro_batch["attention_mask"]
         if position_ids is None:
             position_ids = micro_batch["position_ids"]
+        batch_size, seqlen = input_ids.shape
         if position_ids.dim() == 3:  # qwen2vl/qwen3vl mrope
             position_ids = position_ids.transpose(0, 1)
 
@@ -226,15 +227,51 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             mm_inputs = multi_modal_inputs
 
-        output = self.actor_module(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            **mm_inputs,
-            use_cache=False,
-        )
-        logits: torch.Tensor = output.logits
-        logits = logits[:, -response_length - 1 : -1, :] / temperature
+        if self.config.padding_free:
+            input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask)  # (total_nnz, 1)
+            input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
+
+            if position_ids.dim() == 3:
+                position_ids_rmpad = (
+                    index_first_axis(rearrange(position_ids, "c b s ... -> (b s) c ..."), indices)
+                    .transpose(0, 1)
+                    .unsqueeze(1)
+                )
+            else:
+                position_ids_rmpad = index_first_axis(
+                    rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices
+                ).transpose(0, 1)
+
+            pad_size = 0
+            if self.config.ulysses_size > 1:
+                input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad_and_slice_inputs(
+                    input_ids_rmpad, position_ids_rmpad, sp_size=self.config.ulysses_size
+                )
+
+            output = self.actor_module(
+                input_ids=input_ids_rmpad,
+                attention_mask=None,
+                position_ids=position_ids_rmpad,
+                **mm_inputs,
+                use_cache=False,
+            )
+            logits_rmpad: torch.Tensor = output.logits.squeeze(0) / temperature
+            if self.config.ulysses_size > 1:
+                # Keep gradient local scale to avoid expanding grads by sp_world_size for full-vocab logits.
+                logits_rmpad = gather_outputs_and_unpad(
+                    logits_rmpad, gather_dim=0, unpad_dim=0, padding_size=pad_size, grad_scaler=False
+                )
+            full_logits = pad_input(hidden_states=logits_rmpad, indices=indices, batch=batch_size, seqlen=seqlen)
+            logits = full_logits[:, -response_length - 1 : -1, :]
+        else:
+            output = self.actor_module(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                **mm_inputs,
+                use_cache=False,
+            )
+            logits = output.logits[:, -response_length - 1 : -1, :] / temperature
         return logits
 
     def _build_teacher_message_content(self, prompt_text: str, multi_modal_data: Optional[dict[str, Any]]) -> Any:
