@@ -308,10 +308,27 @@ class DataParallelPPOActor(BasePPOActor):
                     use_cache=False,
                     response_only_logits=response_length,
                 )
-                logits = output.logits / temperature
+                raw_logits = output.logits
+                # Robustness: if the model did NOT honor response_only_logits
+                # (e.g. monkey patch not applied), it returns full-sequence
+                # logits (batch, full_seq, vocab).  Detect and fall back to
+                # slicing so that teacher/student shapes always match.
+                if raw_logits.size(1) != response_length:
+                    if self.rank == 0:
+                        print(
+                            "[sdpo-fallback] Model returned full-sequence logits "
+                            f"(seq_dim={raw_logits.size(1)}) instead of "
+                            f"response_length={response_length}. "
+                            "Falling back to slicing. Ensure apply_ulysses_patch() "
+                            "is called for optimal memory usage."
+                        )
+                    logits = raw_logits[:, -response_length - 1 : -1, :] / temperature
+                else:
+                    logits = raw_logits / temperature
                 if self._sdpo_backward_shape_debug and self.rank == 0:
                     print(
                         "[sdpo-shape-debug] response_only_logits=True "
+                        f"raw_logits_shape={tuple(raw_logits.shape)} "
                         f"logits_shape={tuple(logits.shape)}"
                     )
             else:
@@ -639,8 +656,35 @@ class DataParallelPPOActor(BasePPOActor):
             )
         teacher_forward_elapsed_ms = (time.perf_counter() - teacher_forward_start) * 1000.0
 
+        # --- Debug: teacher/student response span alignment ---
+        responses = model_inputs["responses"]
+        expected_resp_len = responses.size(-1)
+        if self.rank == 0:
+            student_seq = model_inputs["input_ids"].size(1)
+            teacher_seq = teacher_input_ids.size(1)
+            print(
+                f"[sdpo-align-debug] student_seq_len={student_seq} teacher_seq_len={teacher_seq} "
+                f"response_length={expected_resp_len} "
+                f"student_logits_shape={tuple(student_logits.shape)} "
+                f"teacher_logits_shape={tuple(teacher_logits.shape)} "
+                f"responses_shape={tuple(responses.shape)}"
+            )
+            # Show first sample's response token IDs for verification
+            student_resp_ids = responses[0].tolist()
+            print(
+                f"[sdpo-align-debug] response_token_ids[0] (first 20): "
+                f"{student_resp_ids[:20]}"
+            )
+
         if teacher_logits.shape[:2] != student_logits.shape[:2]:
-            raise ValueError("Teacher and student response spans must align for sdpo_logit.")
+            raise ValueError(
+                f"Teacher and student response spans must align for sdpo_logit. "
+                f"teacher_logits={tuple(teacher_logits.shape)}, "
+                f"student_logits={tuple(student_logits.shape)}, "
+                f"expected response_length={expected_resp_len}. "
+                f"This usually means the model did not honor response_only_logits. "
+                f"Check that apply_ulysses_patch() was called."
+            )
 
         if self._sdpo_backward_shape_debug and self.rank == 0:
             print(
