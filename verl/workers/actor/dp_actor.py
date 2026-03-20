@@ -474,6 +474,13 @@ class DataParallelPPOActor(BasePPOActor):
                 f"attention_mask_shape={tuple(model_inputs['attention_mask'].shape)} "
                 f"position_ids_shape={tuple(model_inputs['position_ids'].shape)}"
             )
+            print(
+                "[RCA_SDPO_LOSS_CONFIG_PATH] "
+                f"rank={self.rank}/{self.world_size} "
+                f"loss_mode={self.config.loss_mode} approx_mode={self.config.sdpo_approx_mode} "
+                f"divergence={self.config.sdpo_divergence} use_tail={self.config.sdpo_use_tail} "
+                f"feedback_mode={getattr(self.config, 'sdpo_feedback_mode', 'N/A')}"
+            )
         response_mask = (
             model_inputs["response_mask"].bool()
             & model_inputs["response_token_mask"].bool()

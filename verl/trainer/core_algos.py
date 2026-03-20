@@ -614,6 +614,22 @@ def compute_sdpo_logit_loss(
                 f"rank={rank}/{world} student_logits_shape={tuple(student_logits.shape)} "
                 f"teacher_logits_shape={tuple(teacher_logits.shape)} response_mask_shape={tuple(response_mask.shape)}"
             )
+        valid_flat = response_mask.reshape(-1)
+        flat_student_log_probs = student_log_probs.reshape(-1, vocab_size)
+        flat_teacher_log_probs = teacher_log_probs.reshape(-1, vocab_size)
+        student_valid_log_probs = flat_student_log_probs[valid_flat]
+        teacher_valid_log_probs = flat_teacher_log_probs[valid_flat]
+        student_valid_probs = student_valid_log_probs.exp()
+        teacher_valid_probs = teacher_valid_log_probs.exp()
+        if debug_sdpo:
+            print(
+                "[RCA_FULLVOCAB_DEF_CHAIN] "
+                f"valid_tokens={int(valid_flat.sum().item())} "
+                f"student_valid_log_probs_shape={tuple(student_valid_log_probs.shape)} "
+                f"teacher_valid_log_probs_shape={tuple(teacher_valid_log_probs.shape)} "
+                f"student_valid_probs_req_grad={student_valid_probs.requires_grad} "
+                f"teacher_valid_probs_req_grad={teacher_valid_probs.requires_grad}"
+            )
         topk_indices = torch.empty(0, device=student_logits.device, dtype=torch.long)
         if divergence == "forward_kl":
             token_loss_valid = (teacher_valid_probs * (teacher_valid_log_probs - student_valid_log_probs)).sum(dim=-1)
@@ -633,7 +649,9 @@ def compute_sdpo_logit_loss(
             print(
                 "[RCA_FULLVOCAB_POST_KL_X] "
                 f"token_loss_valid_shape={tuple(token_loss_valid.shape)} token_loss_shape={tuple(token_loss.shape)} "
-                f"token_loss_numel={token_loss.numel()}"
+                f"token_loss_numel={token_loss.numel()} "
+                f"student_entropy_valid_shape={tuple(student_entropy_valid.shape)} "
+                f"teacher_entropy_valid_shape={tuple(teacher_entropy_valid.shape)}"
             )
 
     loss = (token_loss * mask_f).sum() / valid_count
