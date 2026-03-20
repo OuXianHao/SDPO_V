@@ -22,7 +22,11 @@ import torch.distributed.fsdp._traversal_utils as _traversal_utils
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp._runtime_utils import _lazy_init
-from torch.distributed.fsdp.wrap import _or_policy, lambda_auto_wrap_policy, transformer_auto_wrap_policy
+from torch.distributed.fsdp.wrap import (
+    _or_policy,
+    lambda_auto_wrap_policy,
+    transformer_auto_wrap_policy,
+)
 from torch.optim import Optimizer
 from transformers import PreTrainedModel
 from transformers.trainer_pt_utils import get_module_class_from_name
@@ -90,6 +94,20 @@ def get_fsdp_wrap_policy(model: PreTrainedModel, is_lora_model=False):
         auto_wrap_policy = partial(_or_policy, policies=policies)
 
     return auto_wrap_policy
+
+
+def describe_fsdp_modules_topk(model: FSDP, topk: int = 5) -> list[tuple[str, str, int]]:
+    """Return top-k FSDP module flat-param full_numel as (module_name, module_type, full_numel)."""
+    _lazy_init(model, model)
+    items: list[tuple[str, str, int]] = []
+    for module_name, module in model.named_modules():
+        if not isinstance(module, FSDP):
+            continue
+        handles = _traversal_utils._get_fsdp_handles(module)
+        for handle in handles:
+            full_numel = handle.flat_param.numel() * torch.distributed.get_world_size(handle.process_group)
+            items.append((module_name or "<root>", module.__class__.__name__, full_numel))
+    return sorted(items, key=lambda x: x[2], reverse=True)[:topk]
 
 
 @torch.no_grad()
