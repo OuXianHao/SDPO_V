@@ -717,6 +717,90 @@ def compute_sdpo_logit_loss(
     return loss, metrics
 
 
+def compute_sdpo_topk_loss_preextracted(
+    student_topk_log_probs: torch.Tensor,
+    student_topk_indices: torch.Tensor,
+    student_tail_log_prob: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    response_mask: torch.Tensor,
+    divergence: Literal["forward_kl", "reverse_kl"] = "forward_kl",
+    use_tail: bool = True,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """
+    SDPO logit-level loss from pre-extracted student top-k log-probs.
+
+    This function is designed for the Ulysses sequence-parallel path where the
+    student's top-k log-probs are computed locally on each SP rank BEFORE the
+    Ulysses gather, avoiding the need to gather full-vocab logits.  The teacher
+    logits are gathered under ``torch.no_grad()`` (safe — no backward) and
+    passed here at full vocab size so we can index them at the student's top-k
+    positions.
+
+    Args:
+        student_topk_log_probs: (batch, response_len, k) — student's top-k
+            log-probabilities (after log_softmax).  **Requires grad.**
+        student_topk_indices: (batch, response_len, k) — token indices
+            corresponding to ``student_topk_log_probs``.  **No grad.**
+        student_tail_log_prob: (batch, response_len) — log(1 − Σ topk_probs)
+            for the student.  **Requires grad.**
+        teacher_logits: (batch, response_len, vocab_size) — teacher's raw
+            temperature-scaled logits.  **No grad.**
+        response_mask: (batch, response_len) — boolean mask.
+        divergence: ``"forward_kl"`` or ``"reverse_kl"``.
+        use_tail: whether to add the aggregated tail-bucket correction.
+
+    Returns:
+        loss: scalar.
+        metrics: dict of diagnostic scalars.
+    """
+    if divergence not in ("forward_kl", "reverse_kl"):
+        raise ValueError(f"Unsupported divergence: {divergence}")
+
+    k = student_topk_log_probs.size(-1)
+    mask_f = response_mask.float()
+    valid_count = mask_f.sum().clamp_min(1.0)
+
+    # --- teacher distributions (no grad) --------------------------------
+    teacher_log_probs = F.log_softmax(teacher_logits.detach(), dim=-1)
+    teacher_topk_logp = torch.gather(teacher_log_probs, dim=-1, index=student_topk_indices)
+    teacher_topk_prob = teacher_topk_logp.exp()
+    teacher_topk_mass = teacher_topk_prob.sum(dim=-1)
+    teacher_tail = (1.0 - teacher_topk_mass).clamp_min(1e-12)
+    teacher_tail_log = teacher_tail.log()
+
+    # --- student distributions (with grad) --------------------------------
+    student_topk_prob = student_topk_log_probs.exp()
+    student_topk_mass = student_topk_prob.sum(dim=-1)
+    student_tail = student_tail_log_prob.exp().clamp_min(1e-12)  # = 1 - sum(student topk probs)
+    student_tail_log = student_tail_log_prob  # already in log space
+
+    # --- KL over top-k bucket -------------------------------------------
+    if divergence == "forward_kl":
+        token_loss = (teacher_topk_prob * (teacher_topk_logp - student_topk_log_probs)).sum(dim=-1)
+    else:
+        token_loss = (student_topk_prob * (student_topk_log_probs - teacher_topk_logp)).sum(dim=-1)
+
+    # --- tail bucket correction -----------------------------------------
+    if use_tail:
+        if divergence == "forward_kl":
+            token_loss = token_loss + teacher_tail * (teacher_tail_log - student_tail_log)
+        else:
+            token_loss = token_loss + student_tail * (student_tail_log - teacher_tail_log)
+
+    loss = (token_loss * mask_f).sum() / valid_count
+
+    # --- metrics (all detached) -----------------------------------------
+    metrics = {
+        "logit_loss": loss.detach().item(),
+        "topk": float(k),
+        "approx_mode": 0.0,  # always top-k in this path
+        "topk_mass_mean": (student_topk_mass.detach() * mask_f).sum().item() / valid_count.item(),
+        "tail_mass_mean": (student_tail.detach() * mask_f).sum().item() / valid_count.item(),
+        "ulysses_local_topk": 1.0,  # flag: pre-extracted path was used
+    }
+    return loss, metrics
+
+
 def compute_value_loss(
     vpreds: torch.Tensor,
     returns: torch.Tensor,

@@ -28,7 +28,7 @@ from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from ...protocol import DataProto, batch_collate
-from ...trainer.core_algos import compute_grpo_loss, compute_sdpo_logit_loss
+from ...trainer.core_algos import compute_grpo_loss, compute_sdpo_logit_loss, compute_sdpo_topk_loss_preextracted
 from ...utils.dataset import process_image, process_video
 from ...utils import torch_functional as VF
 from ...utils.py_functional import append_to_dict
@@ -78,12 +78,38 @@ class DataParallelPPOActor(BasePPOActor):
 
         if self.is_trainable_actor and self.rank == 0:
             print(f"[actor] selected loss_mode={self.config.loss_mode}")
+            # --- diagnostic: model class and forward implementation --------
+            print(f"[actor-diag] actor_module class: {type(actor_module).__name__}")
+            _inner = getattr(actor_module, "module", actor_module)  # unwrap FSDP if needed
+            print(f"[actor-diag] inner model class: {type(_inner).__name__}")
+            if hasattr(_inner, "model"):
+                print(f"[actor-diag] base model class: {type(_inner.model).__name__}")
+            if hasattr(_inner, "lm_head"):
+                print(f"[actor-diag] lm_head class: {type(_inner.lm_head).__name__}")
+            print(
+                f"[actor-diag] padding_free={self.config.padding_free} "
+                f"ulysses_size={self.config.ulysses_size}"
+            )
             if self.config.loss_mode == "sdpo_logit":
+                _will_use_local_topk = (
+                    self.config.padding_free
+                    and self.config.ulysses_size > 1
+                    and self.config.sdpo_approx_mode != "full_vocab"
+                )
                 print(
                     f"[actor] sdpo settings: topk={self.config.sdpo_topk}, "
                     f"divergence={self.config.sdpo_divergence}, use_tail={self.config.sdpo_use_tail}, "
                     f"approx_mode={self.config.sdpo_approx_mode}"
                 )
+                print(
+                    f"[actor-diag] SDPO student forward path: "
+                    f"{'ULYSSES_LOCAL_TOPK (top-k before gather)' if _will_use_local_topk else 'FULL_VOCAB (standard logits gather)'}"
+                )
+                if _will_use_local_topk:
+                    print(
+                        f"[actor-diag] Ulysses gather size: (total_nnz/sp, {self.config.sdpo_topk}) "
+                        f"instead of (total_nnz/sp, vocab_size)"
+                    )
 
         self._sdpo_backward_shape_debug = os.getenv("SDPO_BACKWARD_SHAPE_DEBUG", "0").strip().lower() in {
             "1",
@@ -280,6 +306,128 @@ class DataParallelPPOActor(BasePPOActor):
             logits = output.logits[:, -response_length - 1 : -1, :] / temperature
         return logits
 
+    def _forward_student_topk_ulysses(
+        self,
+        micro_batch: dict[str, torch.Tensor],
+        temperature: float,
+        topk: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Student forward for SDPO in padding-free + Ulysses mode.
+
+        Computes log_softmax and top-k **locally** on each SP rank BEFORE the
+        Ulysses all-gather, then gathers only the compact top-k results
+        (size k, e.g. 100) instead of full-vocab logits (size V ≈ 151936).
+        This avoids the backward crash caused by gathering full-vocab tensors.
+
+        Returns:
+            student_topk_log_probs: (batch, response_len, k) — with gradient
+            student_topk_indices:   (batch, response_len, k) — int64, no grad
+            student_tail_log_prob:  (batch, response_len)    — with gradient
+        """
+        assert self.config.padding_free, "This method requires padding_free=True"
+        assert self.config.ulysses_size > 1, "This method requires ulysses_size > 1"
+
+        responses = micro_batch["responses"]
+        response_length = responses.size(-1)
+        input_ids = micro_batch["input_ids"]
+        attention_mask = micro_batch["attention_mask"]
+        position_ids = micro_batch["position_ids"]
+        batch_size, seqlen = input_ids.shape
+
+        if position_ids.dim() == 3:  # qwen2vl/qwen3vl mrope
+            position_ids = position_ids.transpose(0, 1)
+
+        mm_inputs: dict[str, torch.Tensor] = {}
+        if "multi_modal_inputs" in micro_batch:
+            mm_inputs = batch_collate(micro_batch["multi_modal_inputs"])
+            mm_inputs = {key: torch.cat(value, dim=0) for key, value in mm_inputs.items()}
+
+        # --- unpad --------------------------------------------------------
+        input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask)
+        input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
+
+        if position_ids.dim() == 3:
+            position_ids_rmpad = (
+                index_first_axis(rearrange(position_ids, "c b s ... -> (b s) c ..."), indices)
+                .transpose(0, 1)
+                .unsqueeze(1)
+            )
+        else:
+            position_ids_rmpad = index_first_axis(
+                rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices
+            ).transpose(0, 1)
+
+        # --- ulysses pad + slice ------------------------------------------
+        pad_size = 0
+        if self.config.ulysses_size > 1:
+            input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad_and_slice_inputs(
+                input_ids_rmpad, position_ids_rmpad, sp_size=self.config.ulysses_size
+            )
+
+        # --- model forward (local shard) ---------------------------------
+        output = self.actor_module(
+            input_ids=input_ids_rmpad,
+            attention_mask=None,
+            position_ids=position_ids_rmpad,
+            **mm_inputs,
+            use_cache=False,
+        )
+        logits_local = output.logits.squeeze(0)  # (L, V)  — L = total_nnz/sp + pad
+        logits_local = logits_local / temperature
+
+        # --- local log_softmax + top-k (BEFORE gather) --------------------
+        log_probs_local = torch.nn.functional.log_softmax(logits_local, dim=-1)  # (L, V)
+        topk_log_probs_local, topk_indices_local = torch.topk(
+            log_probs_local, k=min(topk, log_probs_local.size(-1)), dim=-1
+        )  # both (L, k)
+
+        # tail = log(1 - sum(exp(topk_log_probs)))
+        topk_sum = topk_log_probs_local.exp().sum(dim=-1)  # (L,)
+        tail_log_prob_local = torch.log((1.0 - topk_sum).clamp_min(1e-12))  # (L,)
+
+        if self._sdpo_update_debug and self.rank == 0:
+            print(
+                f"[sdpo-ulysses-local-topk] rank={self.rank}/{self.world_size} "
+                f"logits_local={tuple(logits_local.shape)} topk_local={tuple(topk_log_probs_local.shape)} "
+                f"tail_local={tuple(tail_log_prob_local.shape)} pad_size={pad_size}"
+            )
+
+        # --- gather only top-k across SP ranks ---------------------------
+        # topk_log_probs: (L, k) → (total_nnz, k)  — WITH gradient
+        topk_log_probs_gathered = gather_outputs_and_unpad(
+            topk_log_probs_local, gather_dim=0, unpad_dim=0, padding_size=pad_size, grad_scaler=False,
+        )
+        # topk_indices: (L, k) → (total_nnz, k)  — NO gradient needed
+        with torch.no_grad():
+            topk_indices_gathered = gather_outputs_and_unpad(
+                topk_indices_local, gather_dim=0, unpad_dim=0, padding_size=pad_size, grad_scaler=False,
+            )
+        # tail: (L,) → (total_nnz,)  — WITH gradient
+        tail_log_prob_gathered = gather_outputs_and_unpad(
+            tail_log_prob_local, gather_dim=0, unpad_dim=0, padding_size=pad_size, grad_scaler=False,
+        )
+
+        # --- pad back to (batch, seqlen, ...) and slice to response ------
+        topk_log_probs_full = pad_input(topk_log_probs_gathered, indices, batch_size, seqlen)
+        topk_log_probs_response = topk_log_probs_full[:, -response_length - 1 : -1, :]  # (B, R, k)
+
+        topk_indices_full = pad_input(topk_indices_gathered, indices, batch_size, seqlen)
+        topk_indices_response = topk_indices_full[:, -response_length - 1 : -1, :].long()  # (B, R, k)
+
+        tail_log_prob_full = pad_input(tail_log_prob_gathered.unsqueeze(-1), indices, batch_size, seqlen)
+        tail_log_prob_response = tail_log_prob_full.squeeze(-1)[:, -response_length - 1 : -1]  # (B, R)
+
+        if self._sdpo_update_debug and self.rank == 0:
+            print(
+                f"[sdpo-ulysses-local-topk] gathered shapes: "
+                f"topk_log_probs={tuple(topk_log_probs_response.shape)} "
+                f"topk_indices={tuple(topk_indices_response.shape)} "
+                f"tail={tuple(tail_log_prob_response.shape)}"
+            )
+
+        return topk_log_probs_response, topk_indices_response, tail_log_prob_response
+
     def _build_teacher_message_content(self, prompt_text: str, multi_modal_data: Optional[dict[str, Any]]) -> Any:
         if multi_modal_data is None:
             return prompt_text
@@ -465,6 +613,12 @@ class DataParallelPPOActor(BasePPOActor):
         return teacher_input_ids, teacher_attention_mask, teacher_position_ids, teacher_multi_modal_inputs_batch
 
     def _compute_sdpo_logit_loss(self, model_inputs: dict[str, Any], temperature: float) -> tuple[torch.Tensor, dict[str, float]]:
+        _use_ulysses_local_topk = (
+            self.config.padding_free
+            and self.config.ulysses_size > 1
+            and self.config.sdpo_approx_mode != "full_vocab"
+        )
+
         if self._sdpo_update_debug:
             print(
                 "[RCA_SDPO_LOSS_ENTRY] "
@@ -472,15 +626,30 @@ class DataParallelPPOActor(BasePPOActor):
                 f"responses_shape={tuple(model_inputs['responses'].shape)} "
                 f"input_ids_shape={tuple(model_inputs['input_ids'].shape)} "
                 f"attention_mask_shape={tuple(model_inputs['attention_mask'].shape)} "
-                f"position_ids_shape={tuple(model_inputs['position_ids'].shape)}"
+                f"position_ids_shape={tuple(model_inputs['position_ids'].shape)} "
+                f"ulysses_local_topk={_use_ulysses_local_topk}"
             )
             print(
                 "[RCA_SDPO_LOSS_CONFIG_PATH] "
                 f"rank={self.rank}/{self.world_size} "
                 f"loss_mode={self.config.loss_mode} approx_mode={self.config.sdpo_approx_mode} "
                 f"divergence={self.config.sdpo_divergence} use_tail={self.config.sdpo_use_tail} "
+                f"padding_free={self.config.padding_free} ulysses_size={self.config.ulysses_size} "
                 f"feedback_mode={getattr(self.config, 'sdpo_feedback_mode', 'N/A')}"
             )
+
+        # --- fail loudly if full_vocab + Ulysses --------------------------
+        if (
+            self.config.padding_free
+            and self.config.ulysses_size > 1
+            and self.config.sdpo_approx_mode == "full_vocab"
+        ):
+            raise ValueError(
+                "sdpo_approx_mode='full_vocab' is incompatible with padding_free + ulysses_size > 1. "
+                "Gathering full-vocab logits (V≈151936) across Ulysses SP ranks causes backward "
+                "crashes (SplitWithSizesBackward0). Use approx_mode='topk' instead."
+            )
+
         response_mask = (
             model_inputs["response_mask"].bool()
             & model_inputs["response_token_mask"].bool()
@@ -500,6 +669,9 @@ class DataParallelPPOActor(BasePPOActor):
             zero_loss = trainable_param.sum() * 0.0
             return zero_loss, {"sdpo_all_masked_batch": 1.0, "sdpo_valid_token_count": 0.0}
 
+        # ------------------------------------------------------------------
+        # Build teacher inputs (same for both paths)
+        # ------------------------------------------------------------------
         build_start = time.perf_counter()
         teacher_input_ids, teacher_attention_mask, teacher_position_ids, teacher_multi_modal_inputs = self._build_teacher_inputs(
             model_inputs
@@ -524,6 +696,9 @@ class DataParallelPPOActor(BasePPOActor):
             teacher_mm_shapes = {k: tuple(v.shape) for k, v in teacher_multi_modal_inputs.items()}
             print(f"[sdpo-shape-debug] teacher multimodal tensor shapes: {teacher_mm_shapes}")
 
+        # ------------------------------------------------------------------
+        # Teacher forward — always full-vocab gather (no_grad ⇒ safe)
+        # ------------------------------------------------------------------
         teacher_forward_start = time.perf_counter()
         with torch.no_grad():
             teacher_logits = self._forward_response_logits(
@@ -536,42 +711,96 @@ class DataParallelPPOActor(BasePPOActor):
             )
         teacher_forward_elapsed_ms = (time.perf_counter() - teacher_forward_start) * 1000.0
 
+        # ------------------------------------------------------------------
+        # Student forward — path depends on Ulysses
+        # ------------------------------------------------------------------
         student_forward_start = time.perf_counter()
-        student_logits = self._forward_response_logits(model_inputs, temperature=temperature)
-        student_forward_elapsed_ms = (time.perf_counter() - student_forward_start) * 1000.0
-        if teacher_logits.shape[:2] != student_logits.shape[:2]:
-            raise ValueError("Teacher and student response spans must align for sdpo_logit.")
 
-        if self._sdpo_backward_shape_debug and self.rank == 0:
-            print(
-                "[sdpo-shape-debug] teacher/student logits and response_mask shapes: "
-                f"{tuple(teacher_logits.shape)} / {tuple(student_logits.shape)} / {tuple(response_mask.shape)}"
+        if _use_ulysses_local_topk:
+            # ============================================================
+            # NEW PATH: top-k computed locally BEFORE Ulysses gather
+            # Gathers only (total_nnz, k) instead of (total_nnz, vocab_size)
+            # ============================================================
+            if self.rank == 0:
+                print(
+                    f"[sdpo-path] ULYSSES_LOCAL_TOPK active — "
+                    f"gathering top-{self.config.sdpo_topk} per rank instead of full vocab "
+                    f"(padding_free={self.config.padding_free}, ulysses_size={self.config.ulysses_size})"
+                )
+            student_topk_log_probs, student_topk_indices, student_tail_log_prob = (
+                self._forward_student_topk_ulysses(model_inputs, temperature=temperature, topk=self.config.sdpo_topk)
             )
-            print(
-                "[sdpo-shape-debug] valid response tokens="
-                f"{int(response_mask.sum().item())}, total response tokens={int(model_inputs['response_mask'].sum().item())}"
+            student_forward_elapsed_ms = (time.perf_counter() - student_forward_start) * 1000.0
+
+            if teacher_logits.shape[:2] != student_topk_log_probs.shape[:2]:
+                raise ValueError(
+                    f"Teacher and student response spans must align for sdpo_logit. "
+                    f"teacher={tuple(teacher_logits.shape[:2])}, student_topk={tuple(student_topk_log_probs.shape[:2])}"
+                )
+
+            sdpo_loss, sdpo_metrics = compute_sdpo_topk_loss_preextracted(
+                student_topk_log_probs=student_topk_log_probs,
+                student_topk_indices=student_topk_indices,
+                student_tail_log_prob=student_tail_log_prob,
+                teacher_logits=teacher_logits,
+                response_mask=response_mask,
+                divergence=self.config.sdpo_divergence,
+                use_tail=self.config.sdpo_use_tail,
             )
 
-        sdpo_loss, sdpo_metrics = compute_sdpo_logit_loss(
-            student_logits=student_logits,
-            teacher_logits=teacher_logits,
-            response_mask=response_mask,
-            topk=self.config.sdpo_topk,
-            divergence=self.config.sdpo_divergence,
-            use_tail=self.config.sdpo_use_tail,
-            approx_mode=self.config.sdpo_approx_mode,
-        )
+            if self._sdpo_backward_shape_debug and self.rank == 0:
+                print(
+                    "[sdpo-shape-debug] ULYSSES_LOCAL_TOPK — "
+                    f"teacher_logits={tuple(teacher_logits.shape)} "
+                    f"student_topk={tuple(student_topk_log_probs.shape)} "
+                    f"student_tail={tuple(student_tail_log_prob.shape)} "
+                    f"response_mask={tuple(response_mask.shape)}"
+                )
+        else:
+            # ============================================================
+            # EXISTING PATH: full-vocab logits (no Ulysses or ulysses_size=1)
+            # ============================================================
+            student_logits = self._forward_response_logits(model_inputs, temperature=temperature)
+            student_forward_elapsed_ms = (time.perf_counter() - student_forward_start) * 1000.0
+
+            if teacher_logits.shape[:2] != student_logits.shape[:2]:
+                raise ValueError("Teacher and student response spans must align for sdpo_logit.")
+
+            if self._sdpo_backward_shape_debug and self.rank == 0:
+                print(
+                    "[sdpo-shape-debug] FULL_VOCAB_PATH — "
+                    f"teacher_logits={tuple(teacher_logits.shape)} "
+                    f"student_logits={tuple(student_logits.shape)} "
+                    f"response_mask={tuple(response_mask.shape)}"
+                )
+
+            sdpo_loss, sdpo_metrics = compute_sdpo_logit_loss(
+                student_logits=student_logits,
+                teacher_logits=teacher_logits,
+                response_mask=response_mask,
+                topk=self.config.sdpo_topk,
+                divergence=self.config.sdpo_divergence,
+                use_tail=self.config.sdpo_use_tail,
+                approx_mode=self.config.sdpo_approx_mode,
+            )
+
         metrics = {f"sdpo/{k}": v for k, v in sdpo_metrics.items()}
         if self._sdpo_update_debug:
+            student_desc = (
+                f"student_topk_shape={tuple(student_topk_log_probs.shape)}"
+                if _use_ulysses_local_topk
+                else f"student_logits_shape={tuple(student_logits.shape)} student_logits_numel={student_logits.numel()}"
+            )
             print(
                 "[sdpo-update-debug] "
                 f"rank={self.rank}/{self.world_size} total_samples={num_total_samples} valid_samples={num_valid_samples} "
+                f"ulysses_local_topk={_use_ulysses_local_topk} "
                 f"response_mask_shape={tuple(response_mask.shape)} response_mask_numel={response_mask.numel()} "
                 f"sdpo_valid_mask_shape={tuple(model_inputs['sdpo_valid_mask'].shape)} "
                 f"response_token_mask_shape={tuple(model_inputs['response_token_mask'].shape)} "
                 f"teacher_input_shape={tuple(teacher_input_ids.shape)} teacher_input_numel={teacher_input_ids.numel()} "
                 f"teacher_logits_shape={tuple(teacher_logits.shape)} teacher_logits_numel={teacher_logits.numel()} "
-                f"student_logits_shape={tuple(student_logits.shape)} student_logits_numel={student_logits.numel()} "
+                f"{student_desc} "
                 f"build_teacher_ms={build_elapsed_ms:.2f} teacher_forward_ms={teacher_forward_elapsed_ms:.2f} "
                 f"student_forward_ms={student_forward_elapsed_ms:.2f}"
             )
