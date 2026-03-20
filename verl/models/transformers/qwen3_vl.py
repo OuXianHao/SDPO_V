@@ -216,6 +216,17 @@ def _get_input_embeds(
     if attention_mask is not None:
         attention_mask = attention_mask.to(inputs_embeds.device)
 
+    # Detach deepstack visual embeddings from the autograd graph.
+    # These come from the (typically frozen) visual encoder and should not
+    # carry gradients into the language model's backward pass.  Leaving
+    # them attached can cause SplitWithSizesBackward0 errors when the
+    # language model's deep-stack injection splits/concatenates them
+    # across layers, because the backward expects matching gradient shapes
+    # for every split piece — but some pieces receive no gradient from
+    # the frozen encoder.
+    if deepstack_visual_embeds is not None:
+        deepstack_visual_embeds = [e.detach() for e in deepstack_visual_embeds]
+
     return {
         "inputs_embeds": inputs_embeds,
         "attention_mask": attention_mask,
