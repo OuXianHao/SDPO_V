@@ -229,9 +229,25 @@ def qwen2_vl_model_forward(
     **kwargs,
 ) -> "Qwen2VLCausalLMOutputWithPast":
     skip_logits = bool(kwargs.pop("skip_logits", False))
+    # response_only_logits: when set to an int N, apply lm_head only on
+    # the last N+1 positions (response span) of hidden_states, then slice
+    # to the standard [-N-1:-1] window.  This avoids materializing a
+    # (batch, full_seq, vocab_size) tensor and keeps the entire operation
+    # inside the FSDP-managed forward context so parameters are properly
+    # gathered/sharded.
+    response_only_logits: Optional[int] = kwargs.pop("response_only_logits", None)
     outputs = self.model(input_ids=input_ids, **kwargs)
     hidden_states = outputs[0]
-    logits = None if skip_logits else self.lm_head(hidden_states)
+
+    if response_only_logits is not None:
+        resp_len = int(response_only_logits)
+        # Slice to response span *before* lm_head → (batch, resp_len, hidden)
+        response_hidden = hidden_states[:, -resp_len - 1 : -1, :].contiguous()
+        logits = self.lm_head(response_hidden)
+    elif skip_logits:
+        logits = None
+    else:
+        logits = self.lm_head(hidden_states)
 
     return Qwen2VLCausalLMOutputWithPast(
         logits=logits,

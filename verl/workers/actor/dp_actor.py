@@ -205,6 +205,20 @@ class DataParallelPPOActor(BasePPOActor):
         position_ids: Optional[torch.Tensor] = None,
         multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
+        """Compute response-position logits.
+
+        In SDPO top-k mode (when NOT using padding_free), this uses the
+        ``response_only_logits`` parameter supported by the Qwen2-VL / Qwen3-VL
+        monkey-patched forward.  That flag tells the model to apply ``lm_head``
+        only on the response-span hidden states **inside** the FSDP-managed
+        forward context, avoiding both:
+          * a full ``(batch, full_seq, vocab_size)`` logits tensor, and
+          * the FSDP-unsafe ``self.actor_module.model(...)`` bypass that the
+            old compact path used.
+
+        Returns:
+            logits: ``(batch, response_length, vocab_size)``
+        """
         if self._sdpo_update_debug:
             print(
                 "[RCA_FORWARD_RESP_LOGITS_ENTRY] "
@@ -263,40 +277,41 @@ class DataParallelPPOActor(BasePPOActor):
             )
             logits_rmpad: torch.Tensor = output.logits.squeeze(0) / temperature
             if self.config.ulysses_size > 1:
-                # Keep gradient local scale to avoid expanding grads by sp_world_size for full-vocab logits.
                 logits_rmpad = gather_outputs_and_unpad(
                     logits_rmpad, gather_dim=0, unpad_dim=0, padding_size=pad_size, grad_scaler=False
                 )
             full_logits = pad_input(hidden_states=logits_rmpad, indices=indices, batch=batch_size, seqlen=seqlen)
             logits = full_logits[:, -response_length - 1 : -1, :]
         else:
+            # Decide whether to use the FSDP-safe response-only lm_head path.
             sdpo_topk_mode = (
                 getattr(self.config, "loss_mode", None) == "sdpo_logit"
                 and getattr(self.config, "sdpo_approx_mode", "topk") in ("topk", "student_topk_tail")
             )
             force_full_logits = os.getenv("SDPO_FORCE_FULL_LOGITS", "0").strip().lower() in {"1", "true", "yes", "on"}
-            use_compact_response_lm_head = sdpo_topk_mode and (not force_full_logits)
+            use_response_only = sdpo_topk_mode and (not force_full_logits)
 
-            if use_compact_response_lm_head and hasattr(self.actor_module, "model") and hasattr(self.actor_module, "lm_head"):
-                # Avoid constructing full-sequence logits in SDPO top-k mode.
-                # Compute hidden states first, then apply lm_head only on response positions.
-                backbone_out = self.actor_module.model(
+            if use_response_only:
+                # Pass response_only_logits=response_length through the top-level
+                # FSDP-wrapped module.  The monkey-patched Qwen forward will:
+                #   1. Run the full backbone (embeddings + transformer blocks).
+                #   2. Slice hidden_states to the response span.
+                #   3. Apply lm_head only on that span.
+                # This keeps everything inside the FSDP forward context
+                # (parameters properly gathered/sharded) and avoids the massive
+                # (batch, full_seq, vocab_size) logits tensor.
+                output = self.actor_module(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                     **mm_inputs,
                     use_cache=False,
+                    response_only_logits=response_length,
                 )
-                hidden_states = (
-                    backbone_out.last_hidden_state if hasattr(backbone_out, "last_hidden_state") else backbone_out[0]
-                )
-                response_hidden_states = hidden_states[:, -response_length - 1 : -1, :].contiguous()
-                logits = self.actor_module.lm_head(response_hidden_states) / temperature
+                logits = output.logits / temperature
                 if self._sdpo_backward_shape_debug and self.rank == 0:
                     print(
-                        "[sdpo-shape-debug] compact_response_lm_head=True "
-                        f"hidden_states_shape={tuple(hidden_states.shape)} "
-                        f"response_hidden_states_shape={tuple(response_hidden_states.shape)} "
+                        "[sdpo-shape-debug] response_only_logits=True "
                         f"logits_shape={tuple(logits.shape)}"
                     )
             else:
@@ -311,7 +326,7 @@ class DataParallelPPOActor(BasePPOActor):
                 logits = full_logits[:, -response_length - 1 : -1, :] / temperature
                 if self._sdpo_backward_shape_debug and self.rank == 0:
                     print(
-                        "[sdpo-shape-debug] compact_response_lm_head=False "
+                        "[sdpo-shape-debug] response_only_logits=False "
                         f"full_logits_shape={tuple(full_logits.shape)} "
                         f"response_logits_shape={tuple(logits.shape)}"
                     )
@@ -501,6 +516,47 @@ class DataParallelPPOActor(BasePPOActor):
         }
         return teacher_input_ids, teacher_attention_mask, teacher_position_ids, teacher_multi_modal_inputs_batch
 
+    def _extract_topk_logps(
+        self,
+        logits: torch.Tensor,
+        k: int,
+        topk_indices: Optional[torch.Tensor] = None,
+    ) -> dict[str, torch.Tensor]:
+        """Extract top-k log-probabilities from response logits.
+
+        Computes ``topk_logps = topk_logits - logsumexp(logits)`` which are
+        proper log-probabilities normalised by the full-vocabulary partition
+        function.  This mirrors the original SDPO's approach of computing
+        top-k inside the forward pass so that the loss function never sees
+        the full ``(batch, resp_len, vocab_size)`` tensor.
+
+        Args:
+            logits: ``(batch, response_len, vocab_size)`` — response logits
+                (already temperature-scaled).
+            k: number of top tokens.
+            topk_indices: optional pre-computed indices from another
+                distribution (student's indices reused for teacher).
+
+        Returns:
+            dict with ``topk_logps``, ``topk_indices``, ``logsumexp``.
+        """
+        vocab_size = logits.size(-1)
+        k = min(max(k, 1), vocab_size)
+
+        if topk_indices is None:
+            topk_logits, topk_indices = torch.topk(logits, k, dim=-1)
+        else:
+            topk_logits = torch.gather(logits, dim=-1, index=topk_indices)
+
+        lse = torch.logsumexp(logits, dim=-1, keepdim=True)  # (batch, resp_len, 1)
+        topk_logps = topk_logits - lse  # proper log-probs
+
+        return {
+            "topk_logps": topk_logps,       # (batch, resp_len, k)
+            "topk_indices": topk_indices,    # (batch, resp_len, k)
+            "logsumexp": lse.squeeze(-1),    # (batch, resp_len)
+        }
+
     def _compute_sdpo_logit_loss(self, model_inputs: dict[str, Any], temperature: float) -> tuple[torch.Tensor, dict[str, float]]:
         if self._sdpo_update_debug:
             print(
@@ -561,6 +617,16 @@ class DataParallelPPOActor(BasePPOActor):
             teacher_mm_shapes = {k: tuple(v.shape) for k, v in teacher_multi_modal_inputs.items()}
             print(f"[sdpo-shape-debug] teacher multimodal tensor shapes: {teacher_mm_shapes}")
 
+        approx_mode = self.config.sdpo_approx_mode
+        topk_mode = approx_mode in ("topk", "student_topk_tail")
+        topk_k = self.config.sdpo_topk
+
+        # ---- Student forward (with grad) ----
+        student_forward_start = time.perf_counter()
+        student_logits = self._forward_response_logits(model_inputs, temperature=temperature)
+        student_forward_elapsed_ms = (time.perf_counter() - student_forward_start) * 1000.0
+
+        # ---- Teacher forward (no grad) ----
         teacher_forward_start = time.perf_counter()
         with torch.no_grad():
             teacher_logits = self._forward_response_logits(
@@ -573,9 +639,6 @@ class DataParallelPPOActor(BasePPOActor):
             )
         teacher_forward_elapsed_ms = (time.perf_counter() - teacher_forward_start) * 1000.0
 
-        student_forward_start = time.perf_counter()
-        student_logits = self._forward_response_logits(model_inputs, temperature=temperature)
-        student_forward_elapsed_ms = (time.perf_counter() - student_forward_start) * 1000.0
         if teacher_logits.shape[:2] != student_logits.shape[:2]:
             raise ValueError("Teacher and student response spans must align for sdpo_logit.")
 
@@ -589,15 +652,40 @@ class DataParallelPPOActor(BasePPOActor):
                 f"{int(response_mask.sum().item())}, total response tokens={int(model_inputs['response_mask'].sum().item())}"
             )
 
-        sdpo_loss, sdpo_metrics = compute_sdpo_logit_loss(
-            student_logits=student_logits,
-            teacher_logits=teacher_logits,
-            response_mask=response_mask,
-            topk=self.config.sdpo_topk,
-            divergence=self.config.sdpo_divergence,
-            use_tail=self.config.sdpo_use_tail,
-            approx_mode=self.config.sdpo_approx_mode,
-        )
+        if topk_mode:
+            # Pre-compute top-k in the actor, aligned with original SDPO design.
+            # Student selects top-k indices; teacher is gathered at the SAME indices.
+            student_topk = self._extract_topk_logps(student_logits, k=topk_k)
+            with torch.no_grad():
+                teacher_topk = self._extract_topk_logps(
+                    teacher_logits, k=topk_k, topk_indices=student_topk["topk_indices"]
+                )
+
+            sdpo_loss, sdpo_metrics = compute_sdpo_logit_loss(
+                student_topk_logps=student_topk["topk_logps"],
+                teacher_topk_logps=teacher_topk["topk_logps"],
+                response_mask=response_mask,
+                topk=topk_k,
+                divergence=self.config.sdpo_divergence,
+                use_tail=self.config.sdpo_use_tail,
+                approx_mode=approx_mode,
+                # Pass full logits detached for metrics only (no grad).
+                student_logits_for_metrics=student_logits.detach(),
+                teacher_logits_for_metrics=teacher_logits.detach(),
+            )
+        else:
+            # full_vocab mode — pass raw logits to the loss (gradient flows
+            # through the full vocab dimension; use only for debugging).
+            sdpo_loss, sdpo_metrics = compute_sdpo_logit_loss(
+                student_logits=student_logits,
+                teacher_logits=teacher_logits,
+                response_mask=response_mask,
+                topk=topk_k,
+                divergence=self.config.sdpo_divergence,
+                use_tail=self.config.sdpo_use_tail,
+                approx_mode=approx_mode,
+            )
+
         metrics = {f"sdpo/{k}": v for k, v in sdpo_metrics.items()}
         if self._sdpo_update_debug:
             print(
