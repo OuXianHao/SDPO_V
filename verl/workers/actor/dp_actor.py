@@ -558,6 +558,7 @@ class DataParallelPPOActor(BasePPOActor):
         logits: torch.Tensor,
         k: int,
         topk_indices: Optional[torch.Tensor] = None,
+        detach_lse: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Extract top-k log-probabilities from response logits.
 
@@ -573,6 +574,12 @@ class DataParallelPPOActor(BasePPOActor):
             k: number of top tokens.
             topk_indices: optional pre-computed indices from another
                 distribution (student's indices reused for teacher).
+            detach_lse: if True, detach the logsumexp from the autograd graph.
+                This makes the backward gradient sparse (only through top-k
+                entries) instead of dense (through full vocab via softmax).
+                Eliminates the ``(B, N, V)`` dense gradient that flows through
+                logsumexp backward, which can trigger
+                ``SplitWithSizesBackward0`` errors under FSDP.
 
         Returns:
             dict with ``topk_logps``, ``topk_indices``, ``logsumexp``.
@@ -586,7 +593,14 @@ class DataParallelPPOActor(BasePPOActor):
             topk_logits = torch.gather(logits, dim=-1, index=topk_indices)
 
         lse = torch.logsumexp(logits, dim=-1, keepdim=True)  # (batch, resp_len, 1)
-        topk_logps = topk_logits - lse  # proper log-probs
+        if detach_lse:
+            # Detach the partition function from the autograd graph.
+            # Numerically: topk_logps still have correct log-probability values.
+            # Gradient-wise: gradient only flows through topk_logits (sparse),
+            # NOT through logsumexp (which would be dense across full vocab).
+            topk_logps = topk_logits - lse.detach()
+        else:
+            topk_logps = topk_logits - lse  # proper log-probs
 
         return {
             "topk_logps": topk_logps,       # (batch, resp_len, k)
@@ -657,13 +671,14 @@ class DataParallelPPOActor(BasePPOActor):
         approx_mode = self.config.sdpo_approx_mode
         topk_mode = approx_mode in ("topk", "student_topk_tail")
         topk_k = self.config.sdpo_topk
+        detach_lse = os.getenv("SDPO_DETACH_LSE", "0").strip().lower() in {"1", "true", "yes", "on"}
+        detect_anomaly = os.getenv("SDPO_DETECT_ANOMALY", "0").strip().lower() in {"1", "true", "yes", "on"}
 
-        # ---- Student forward (with grad) ----
-        student_forward_start = time.perf_counter()
-        student_logits = self._forward_response_logits(model_inputs, temperature=temperature)
-        student_forward_elapsed_ms = (time.perf_counter() - student_forward_start) * 1000.0
-
-        # ---- Teacher forward (no grad) ----
+        # ---- Teacher forward FIRST (no grad) ----
+        # Run teacher before student so that FSDP's internal execution-order
+        # tracking state reflects the student forward (which is the one that
+        # backward will follow).  Running student last ensures FSDP's
+        # pre/post-forward bookkeeping is consistent with the backward pass.
         teacher_forward_start = time.perf_counter()
         with torch.no_grad():
             teacher_logits = self._forward_response_logits(
@@ -675,6 +690,11 @@ class DataParallelPPOActor(BasePPOActor):
                 multi_modal_inputs=teacher_multi_modal_inputs,
             )
         teacher_forward_elapsed_ms = (time.perf_counter() - teacher_forward_start) * 1000.0
+
+        # ---- Student forward LAST (with grad) ----
+        student_forward_start = time.perf_counter()
+        student_logits = self._forward_response_logits(model_inputs, temperature=temperature)
+        student_forward_elapsed_ms = (time.perf_counter() - student_forward_start) * 1000.0
 
         # --- Debug: teacher/student response span alignment ---
         responses = model_inputs["responses"]
@@ -689,12 +709,6 @@ class DataParallelPPOActor(BasePPOActor):
                 f"teacher_logits_shape={tuple(teacher_logits.shape)} "
                 f"responses_shape={tuple(responses.shape)}"
             )
-            # Show first sample's response token IDs for verification
-            student_resp_ids = responses[0].tolist()
-            print(
-                f"[sdpo-align-debug] response_token_ids[0] (first 20): "
-                f"{student_resp_ids[:20]}"
-            )
 
         if teacher_logits.shape[:2] != student_logits.shape[:2]:
             raise ValueError(
@@ -703,52 +717,60 @@ class DataParallelPPOActor(BasePPOActor):
                 f"student_logits={tuple(student_logits.shape)}, "
                 f"expected response_length={expected_resp_len}. "
                 f"This usually means the model did not honor response_only_logits. "
-                f"Check that apply_ulysses_patch() was called."
-            )
-
-        if self._sdpo_backward_shape_debug and self.rank == 0:
-            print(
-                "[sdpo-shape-debug] teacher/student logits and response_mask shapes: "
-                f"{tuple(teacher_logits.shape)} / {tuple(student_logits.shape)} / {tuple(response_mask.shape)}"
-            )
-            print(
-                "[sdpo-shape-debug] valid response tokens="
-                f"{int(response_mask.sum().item())}, total response tokens={int(model_inputs['response_mask'].sum().item())}"
+                f"Check that apply_vl_forward_patch() was called."
             )
 
         if topk_mode:
             # Pre-compute top-k in the actor, aligned with original SDPO design.
             # Student selects top-k indices; teacher is gathered at the SAME indices.
-            student_topk = self._extract_topk_logps(student_logits, k=topk_k)
+            student_topk = self._extract_topk_logps(student_logits, k=topk_k, detach_lse=detach_lse)
+
+            # Register backward hook for diagnostics: log gradient shape
+            # before it flows back into the model.
+            if self.rank == 0:
+                def _grad_hook(grad, name="student_topk_logps"):
+                    print(
+                        f"[sdpo-grad-hook] {name} grad shape={tuple(grad.shape)} "
+                        f"dtype={grad.dtype} has_nan={bool(grad.isnan().any())} "
+                        f"has_inf={bool(grad.isinf().any())} "
+                        f"detach_lse={detach_lse}"
+                    )
+                    return grad
+                student_topk["topk_logps"].register_hook(_grad_hook)
+
             with torch.no_grad():
                 teacher_topk = self._extract_topk_logps(
                     teacher_logits, k=topk_k, topk_indices=student_topk["topk_indices"]
                 )
 
-            sdpo_loss, sdpo_metrics = compute_sdpo_logit_loss(
-                student_topk_logps=student_topk["topk_logps"],
-                teacher_topk_logps=teacher_topk["topk_logps"],
-                response_mask=response_mask,
-                topk=topk_k,
-                divergence=self.config.sdpo_divergence,
-                use_tail=self.config.sdpo_use_tail,
-                approx_mode=approx_mode,
-                # Pass full logits detached for metrics only (no grad).
-                student_logits_for_metrics=student_logits.detach(),
-                teacher_logits_for_metrics=teacher_logits.detach(),
-            )
+            # Enable anomaly detection if requested — this prints the forward
+            # op that created the failing backward node.
+            with torch.autograd.set_detect_anomaly(detect_anomaly):
+                sdpo_loss, sdpo_metrics = compute_sdpo_logit_loss(
+                    student_topk_logps=student_topk["topk_logps"],
+                    teacher_topk_logps=teacher_topk["topk_logps"],
+                    response_mask=response_mask,
+                    topk=topk_k,
+                    divergence=self.config.sdpo_divergence,
+                    use_tail=self.config.sdpo_use_tail,
+                    approx_mode=approx_mode,
+                    # Pass full logits detached for metrics only (no grad).
+                    student_logits_for_metrics=student_logits.detach(),
+                    teacher_logits_for_metrics=teacher_logits.detach(),
+                )
         else:
             # full_vocab mode — pass raw logits to the loss (gradient flows
             # through the full vocab dimension; use only for debugging).
-            sdpo_loss, sdpo_metrics = compute_sdpo_logit_loss(
-                student_logits=student_logits,
-                teacher_logits=teacher_logits,
-                response_mask=response_mask,
-                topk=topk_k,
-                divergence=self.config.sdpo_divergence,
-                use_tail=self.config.sdpo_use_tail,
-                approx_mode=approx_mode,
-            )
+            with torch.autograd.set_detect_anomaly(detect_anomaly):
+                sdpo_loss, sdpo_metrics = compute_sdpo_logit_loss(
+                    student_logits=student_logits,
+                    teacher_logits=teacher_logits,
+                    response_mask=response_mask,
+                    topk=topk_k,
+                    divergence=self.config.sdpo_divergence,
+                    use_tail=self.config.sdpo_use_tail,
+                    approx_mode=approx_mode,
+                )
 
         metrics = {f"sdpo/{k}": v for k, v in sdpo_metrics.items()}
         if self._sdpo_update_debug:
