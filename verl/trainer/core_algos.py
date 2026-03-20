@@ -575,6 +575,7 @@ def compute_sdpo_logit_loss(
     mask_f = response_mask.float()
     valid_count = mask_f.sum().clamp_min(1.0)
 
+    debug_sdpo = os.getenv("EASYR1_DEBUG_SDPO_UPDATE", "0").strip().lower() in {"1", "true", "yes", "on"}
     student_log_probs = F.log_softmax(student_logits, dim=-1)
     teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
     student_probs = student_log_probs.exp()
@@ -615,20 +616,41 @@ def compute_sdpo_logit_loss(
             )
         topk_indices = torch.empty(0, device=student_logits.device, dtype=torch.long)
         if divergence == "forward_kl":
-            token_loss = (teacher_probs * (teacher_log_probs - student_log_probs)).sum(dim=-1)
-            full_token_loss = token_loss
+            token_loss_valid = (teacher_valid_probs * (teacher_valid_log_probs - student_valid_log_probs)).sum(dim=-1)
         else:
-            token_loss = (student_probs * (student_log_probs - teacher_log_probs)).sum(dim=-1)
-            full_token_loss = token_loss
-        student_topk_mass = torch.ones_like(token_loss)
-        student_tail = torch.zeros_like(token_loss)
+            token_loss_valid = (student_valid_probs * (student_valid_log_probs - teacher_valid_log_probs)).sum(dim=-1)
+        token_loss = torch.zeros_like(mask_f)
+        token_loss = token_loss.reshape(-1)
+        token_loss[valid_flat] = token_loss_valid
+        token_loss = token_loss.reshape_as(mask_f)
+        full_token_loss = token_loss
+        student_topk_mass = torch.ones_like(mask_f)
+        student_tail = torch.zeros_like(mask_f)
+
+        student_entropy_valid = -(student_valid_probs * student_valid_log_probs).sum(dim=-1)
+        teacher_entropy_valid = -(teacher_valid_probs * teacher_valid_log_probs).sum(dim=-1)
+        if debug_sdpo:
+            print(
+                "[RCA_FULLVOCAB_POST_KL_X] "
+                f"token_loss_valid_shape={tuple(token_loss_valid.shape)} token_loss_shape={tuple(token_loss.shape)} "
+                f"token_loss_numel={token_loss.numel()}"
+            )
 
     loss = (token_loss * mask_f).sum() / valid_count
-    student_entropy = -(student_probs * student_log_probs).sum(dim=-1)
-    teacher_entropy = -(teacher_probs * teacher_log_probs).sum(dim=-1)
+    if approx_mode == "full_vocab":
+        student_entropy = torch.zeros_like(mask_f)
+        teacher_entropy = torch.zeros_like(mask_f)
+        flat_student_entropy = student_entropy.reshape(-1)
+        flat_teacher_entropy = teacher_entropy.reshape(-1)
+        flat_student_entropy[valid_flat] = student_entropy_valid
+        flat_teacher_entropy[valid_flat] = teacher_entropy_valid
+    else:
+        student_entropy = -(student_probs * student_log_probs).sum(dim=-1)
+        teacher_entropy = -(teacher_probs * teacher_log_probs).sum(dim=-1)
 
     mass_ks = [1, 5, 10, 20, 50, 100]
-    student_sorted_probs = torch.sort(student_probs, dim=-1, descending=True).values
+    student_probs_for_metrics = student_probs.detach()
+    student_sorted_probs = torch.sort(student_probs_for_metrics, dim=-1, descending=True).values
     student_mass_metrics: dict[str, float] = {}
     for mass_k in mass_ks:
         cur_k = min(mass_k, vocab_size)
