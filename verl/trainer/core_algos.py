@@ -552,13 +552,13 @@ def compute_sdpo_logit_loss(
     topk: int = 100,
     divergence: Literal["forward_kl", "reverse_kl"] = "forward_kl",
     use_tail: bool = True,
-    approx_mode: Literal["topk", "full_vocab"] = "topk",
+    approx_mode: Literal["topk", "student_topk_tail", "full_vocab"] = "topk",
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """
     Standalone SDPO logit-level loss.
 
     This implementation supports two computation modes:
-    - "topk": student top-K + optional aggregated-tail approximation (default)
+    - "topk"/"student_topk_tail": student top-K + optional aggregated-tail approximation (default)
     - "full_vocab": exact KL over the full vocabulary
     """
     if student_logits.shape != teacher_logits.shape:
@@ -567,7 +567,7 @@ def compute_sdpo_logit_loss(
         raise ValueError("response_mask shape must match first two dims of logits.")
     if divergence not in ("forward_kl", "reverse_kl"):
         raise ValueError(f"Unsupported divergence: {divergence}")
-    if approx_mode not in ("topk", "full_vocab"):
+    if approx_mode not in ("topk", "student_topk_tail", "full_vocab"):
         raise ValueError(f"Unsupported approx_mode: {approx_mode}")
 
     vocab_size = student_logits.size(-1)
@@ -576,29 +576,32 @@ def compute_sdpo_logit_loss(
     valid_count = mask_f.sum().clamp_min(1.0)
 
     debug_sdpo = os.getenv("EASYR1_DEBUG_SDPO_UPDATE", "0").strip().lower() in {"1", "true", "yes", "on"}
-    student_log_probs = F.log_softmax(student_logits, dim=-1)
-    teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
-    student_probs = student_log_probs.exp()
-    teacher_probs = teacher_log_probs.exp()
+    topk_mode = approx_mode in ("topk", "student_topk_tail")
 
-    if approx_mode == "topk":
-        topk_values, topk_indices = torch.topk(student_log_probs, k=k, dim=-1)
-        student_topk_logp = topk_values
+    if topk_mode:
+        # SDPO Appendix A.3 style approximation:
+        # 1) student top-K support, 2) teacher queried on student's top-K indices,
+        # 3) explicit tail bucket mass.
+        student_topk_logits, topk_indices = torch.topk(student_logits, k=k, dim=-1)
+        teacher_topk_logits = torch.gather(teacher_logits, dim=-1, index=topk_indices)
+
+        student_lse = torch.logsumexp(student_logits, dim=-1, keepdim=True)
+        teacher_lse = torch.logsumexp(teacher_logits, dim=-1, keepdim=True)
+
+        student_topk_logp = student_topk_logits - student_lse
+        teacher_topk_logp = teacher_topk_logits - teacher_lse
         student_topk_prob = student_topk_logp.exp()
-        teacher_topk_logp = torch.gather(teacher_log_probs, dim=-1, index=topk_indices)
         teacher_topk_prob = teacher_topk_logp.exp()
 
         if divergence == "forward_kl":
             token_loss = (teacher_topk_prob * (teacher_topk_logp - student_topk_logp)).sum(dim=-1)
-            full_token_loss = (teacher_probs * (teacher_log_probs - student_log_probs)).sum(dim=-1)
         else:
             token_loss = (student_topk_prob * (student_topk_logp - teacher_topk_logp)).sum(dim=-1)
-            full_token_loss = (student_probs * (student_log_probs - teacher_log_probs)).sum(dim=-1)
 
         student_topk_mass = student_topk_prob.sum(dim=-1)
         teacher_topk_mass = teacher_topk_prob.sum(dim=-1)
-        student_tail = (1.0 - student_topk_mass).clamp_min(1e-12)
-        teacher_tail = (1.0 - teacher_topk_mass).clamp_min(1e-12)
+        student_tail = (1.0 - student_topk_mass).clamp(1e-12, 1.0)
+        teacher_tail = (1.0 - teacher_topk_mass).clamp(1e-12, 1.0)
 
         if use_tail:
             if divergence == "forward_kl":
@@ -616,6 +619,11 @@ def compute_sdpo_logit_loss(
             )
 
         topk_indices = torch.empty(0, device=student_logits.device, dtype=torch.long)
+        student_log_probs = F.log_softmax(student_logits, dim=-1)
+        teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
+        student_probs = student_log_probs.exp()
+        teacher_probs = teacher_log_probs.exp()
+
         if divergence == "forward_kl":
             token_kl = F.kl_div(student_log_probs, teacher_log_probs, reduction="none", log_target=True)
         else:
@@ -638,12 +646,27 @@ def compute_sdpo_logit_loss(
             )
 
     loss = (token_loss * mask_f).sum() / valid_count
-    if approx_mode != "full_vocab":
-        student_entropy = -(student_probs * student_log_probs).sum(dim=-1)
-        teacher_entropy = -(teacher_probs * teacher_log_probs).sum(dim=-1)
+    if topk_mode:
+        with torch.no_grad():
+            student_log_probs_detached = F.log_softmax(student_logits.detach(), dim=-1)
+            teacher_log_probs_detached = F.log_softmax(teacher_logits.detach(), dim=-1)
+            student_probs_detached = student_log_probs_detached.exp()
+            teacher_probs_detached = teacher_log_probs_detached.exp()
+            student_entropy = -(student_probs_detached * student_log_probs_detached).sum(dim=-1)
+            teacher_entropy = -(teacher_probs_detached * teacher_log_probs_detached).sum(dim=-1)
+            student_probs_for_metrics = student_probs_detached
+            student_log_probs_for_debug = student_log_probs_detached
+            teacher_log_probs_for_debug = teacher_log_probs_detached
+            student_probs_for_debug = student_probs_detached
+            teacher_probs_for_debug = teacher_probs_detached
+    else:
+        student_probs_for_metrics = student_probs.detach()
+        student_log_probs_for_debug = student_log_probs
+        teacher_log_probs_for_debug = teacher_log_probs
+        student_probs_for_debug = student_probs
+        teacher_probs_for_debug = teacher_probs
 
     mass_ks = [1, 5, 10, 20, 50, 100]
-    student_probs_for_metrics = student_probs.detach()
     student_sorted_probs = torch.sort(student_probs_for_metrics, dim=-1, descending=True).values
     student_mass_metrics: dict[str, float] = {}
     for mass_k in mass_ks:
@@ -662,10 +685,10 @@ def compute_sdpo_logit_loss(
         for row_idx, col_idx in debug_positions:
             b = int(row_idx.item())
             t = int(col_idx.item())
-            teacher_pos_probs = teacher_probs[b, t]
-            student_pos_probs = student_probs[b, t]
-            teacher_pos_log_probs = teacher_log_probs[b, t]
-            student_pos_log_probs = student_log_probs[b, t]
+            teacher_pos_probs = teacher_probs_for_debug[b, t]
+            student_pos_probs = student_probs_for_debug[b, t]
+            teacher_pos_log_probs = teacher_log_probs_for_debug[b, t]
+            student_pos_log_probs = student_log_probs_for_debug[b, t]
             teacher_top10_probs, teacher_top10_ids = torch.topk(teacher_pos_probs, k=min(10, vocab_size), dim=-1)
             student_top10_probs, student_top10_ids = torch.topk(student_pos_probs, k=min(10, vocab_size), dim=-1)
 
@@ -687,9 +710,7 @@ def compute_sdpo_logit_loss(
                 "batch_index": b,
                 "token_index": t,
                 "topk": int(k),
-                "selected_topk_token_ids": (
-                    topk_indices[b, t].detach().cpu().tolist() if approx_mode == "topk" else []
-                ),
+                "selected_topk_token_ids": (topk_indices[b, t].detach().cpu().tolist() if topk_mode else []),
                 "teacher_top10_ids": teacher_top10_ids.detach().cpu().tolist(),
                 "teacher_top10_probs": teacher_top10_probs.detach().cpu().tolist(),
                 "student_top10_ids": student_top10_ids.detach().cpu().tolist(),
@@ -704,8 +725,8 @@ def compute_sdpo_logit_loss(
 
     metrics = {
         "logit_loss": loss.detach().item(),
-        "topk": float(k if approx_mode == "topk" else vocab_size),
-        "approx_mode": 0.0 if approx_mode == "topk" else 1.0,
+        "topk": float(k if topk_mode else vocab_size),
+        "approx_mode": 0.0 if topk_mode else 1.0,
         "topk_mass_mean": (student_topk_mass * mask_f).sum().detach().item() / valid_count.detach().item(),
         "tail_mass_mean": (student_tail * mask_f).sum().detach().item() / valid_count.detach().item(),
         "student_entropy": (student_entropy * mask_f).sum().detach().item() / valid_count.detach().item(),

@@ -270,14 +270,64 @@ class DataParallelPPOActor(BasePPOActor):
             full_logits = pad_input(hidden_states=logits_rmpad, indices=indices, batch=batch_size, seqlen=seqlen)
             logits = full_logits[:, -response_length - 1 : -1, :]
         else:
-            output = self.actor_module(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                **mm_inputs,
-                use_cache=False,
+            sdpo_topk_mode = (
+                getattr(self.config, "loss_mode", None) == "sdpo_logit"
+                and getattr(self.config, "sdpo_approx_mode", "topk") in ("topk", "student_topk_tail")
             )
-            logits = output.logits[:, -response_length - 1 : -1, :] / temperature
+            force_full_logits = os.getenv("SDPO_FORCE_FULL_LOGITS", "0").strip().lower() in {"1", "true", "yes", "on"}
+            use_compact_response_lm_head = sdpo_topk_mode and (not force_full_logits)
+
+            if use_compact_response_lm_head and hasattr(self.actor_module, "lm_head"):
+                # Keep FSDP/offload compatibility by using the top-level wrapped module forward.
+                # Some wrapped states can fail if we directly call submodules like `.model(...)`.
+                try:
+                    output = self.actor_module(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        **mm_inputs,
+                        use_cache=False,
+                        output_hidden_states=True,
+                        return_dict=True,
+                        skip_logits=True,
+                    )
+                except TypeError as exc:
+                    raise RuntimeError(
+                        "Compact SDPO logits path requires actor forward to accept `skip_logits=True` "
+                        "and return hidden states with `output_hidden_states=True`."
+                    ) from exc
+                hidden_states_seq = getattr(output, "hidden_states", None)
+                hidden_states = hidden_states_seq[-1] if hidden_states_seq is not None else None
+                if hidden_states is None:
+                    raise RuntimeError(
+                        "Compact SDPO logits path requires output.hidden_states from actor forward. "
+                        "Please ensure model forward supports output_hidden_states=True."
+                    )
+                response_hidden_states = hidden_states[:, -response_length - 1 : -1, :].contiguous()
+                logits = self.actor_module.lm_head(response_hidden_states) / temperature
+                if self._sdpo_backward_shape_debug and self.rank == 0:
+                    print(
+                        "[sdpo-shape-debug] compact_response_lm_head=True "
+                        f"hidden_states_shape={tuple(hidden_states.shape)} "
+                        f"response_hidden_states_shape={tuple(response_hidden_states.shape)} "
+                        f"logits_shape={tuple(logits.shape)}"
+                    )
+            else:
+                output = self.actor_module(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    **mm_inputs,
+                    use_cache=False,
+                )
+                full_logits = output.logits
+                logits = full_logits[:, -response_length - 1 : -1, :] / temperature
+                if self._sdpo_backward_shape_debug and self.rank == 0:
+                    print(
+                        "[sdpo-shape-debug] compact_response_lm_head=False "
+                        f"full_logits_shape={tuple(full_logits.shape)} "
+                        f"response_logits_shape={tuple(logits.shape)}"
+                    )
         return logits
 
     def _build_teacher_message_content(self, prompt_text: str, multi_modal_data: Optional[dict[str, Any]]) -> Any:
