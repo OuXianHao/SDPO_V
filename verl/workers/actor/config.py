@@ -147,6 +147,7 @@ class ActorConfig:
     sdpo_approx_mode: str = field(default="topk", init=False)
     sdpo_feedback_mode: str = field(default="successful_rollout", init=False)
     sdpo_alpha: Optional[float] = field(default=None, init=False)
+    sdpo_teacher_update_rate: float = field(default=0.0, init=False)
 
 
 @dataclass
