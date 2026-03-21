@@ -99,6 +99,8 @@ class AlgorithmConfig:
     sdpo_use_tail: bool = True
     sdpo_approx_mode: str = "topk"
     sdpo_feedback_mode: str = "successful_rollout"
+    sdpo_alpha: Optional[float] = None
+    """Alpha for divergence interpolation: 0.0=forward KL, 1.0=reverse KL, in-between=GJS. None=derive from sdpo_divergence."""
 
 
 @dataclass
@@ -173,6 +175,7 @@ class PPOConfig:
         self.worker.actor.sdpo_use_tail = self.algorithm.sdpo_use_tail
         self.worker.actor.sdpo_approx_mode = self.algorithm.sdpo_approx_mode
         self.worker.actor.sdpo_feedback_mode = self.algorithm.sdpo_feedback_mode
+        self.worker.actor.sdpo_alpha = self.algorithm.sdpo_alpha
 
     def deep_post_init(self):
         recursive_post_init(self)
