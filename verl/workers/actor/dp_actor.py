@@ -107,6 +107,32 @@ class DataParallelPPOActor(BasePPOActor):
             "on",
         }
 
+    def _update_teacher(self) -> None:
+        """EMA update of teacher model weights from actor weights.
+
+        Matches original SDPO's _update_teacher (dp_actor.py:132-151):
+            teacher_param = (1 - rate) * teacher_param + rate * student_param
+
+        Only runs when:
+          - loss_mode is sdpo_logit
+          - teacher_module is a separate model (not None, not actor_module)
+          - sdpo_teacher_update_rate > 0
+        """
+        if self.config.loss_mode != "sdpo_logit":
+            return
+        update_rate = self.config.sdpo_teacher_update_rate
+        if update_rate == 0.0:
+            return
+        if self.teacher_module is None or self.teacher_module is self.actor_module:
+            return
+        with torch.no_grad():
+            for teacher_param, student_param in zip(
+                self.teacher_module.parameters(),
+                self.actor_module.parameters(),
+            ):
+                student_data = student_param.data.to(device=teacher_param.device)
+                teacher_param.data.mul_(1.0 - update_rate).add_(student_data, alpha=update_rate)
+
     def _render_teacher_prompt_text(self, content_text: str) -> str:
         format_prompt = self.config.teacher_format_prompt
         if format_prompt is None or format_prompt == "":
@@ -213,6 +239,7 @@ class DataParallelPPOActor(BasePPOActor):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None,
+        module: Optional[nn.Module] = None,
     ) -> torch.Tensor:
         """Compute response-position logits.
 
@@ -228,11 +255,17 @@ class DataParallelPPOActor(BasePPOActor):
         Returns:
             logits: ``(batch, response_length, vocab_size)``
         """
+        # Resolve which model to use: teacher_module (separate FSDP ref model)
+        # or actor_module (default).  This allows the same method to serve both
+        # student and teacher forwards, matching original SDPO's module= pattern.
+        model = module or self.actor_module
+
         if self._sdpo_update_debug:
             print(
                 "[RCA_FORWARD_RESP_LOGITS_ENTRY] "
                 f"rank={self.rank}/{self.world_size} "
-                f"padding_free={self.config.padding_free} ulysses_size={self.config.ulysses_size}"
+                f"padding_free={self.config.padding_free} ulysses_size={self.config.ulysses_size} "
+                f"using_teacher_module={module is not None}"
             )
         responses = micro_batch["responses"]
         response_length = responses.size(-1)
@@ -277,7 +310,7 @@ class DataParallelPPOActor(BasePPOActor):
                     input_ids_rmpad, position_ids_rmpad, sp_size=self.config.ulysses_size
                 )
 
-            output = self.actor_module(
+            output = model(
                 input_ids=input_ids_rmpad,
                 attention_mask=None,
                 position_ids=position_ids_rmpad,
@@ -326,7 +359,7 @@ class DataParallelPPOActor(BasePPOActor):
                 # --- Live-path diagnostic: verify patched forward is active ---
                 if self.rank == 0:
                     # Unwrap FSDP to get the actual model class
-                    unwrapped = self.actor_module
+                    unwrapped = model
                     while hasattr(unwrapped, "module"):
                         unwrapped = unwrapped.module
                     model_cls = type(unwrapped)
@@ -340,7 +373,7 @@ class DataParallelPPOActor(BasePPOActor):
                         f"response_only_logits={response_length}"
                     )
 
-                output = self.actor_module(
+                output = model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
@@ -366,7 +399,7 @@ class DataParallelPPOActor(BasePPOActor):
                         f"(expected response_length={response_length})"
                     )
             else:
-                output = self.actor_module(
+                output = model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
@@ -848,6 +881,7 @@ class DataParallelPPOActor(BasePPOActor):
                     attention_mask=teacher_attention_mask,
                     position_ids=teacher_position_ids,
                     multi_modal_inputs=teacher_multi_modal_inputs,
+                    module=self.teacher_module,
                 )
             teacher_forward_elapsed_ms = (time.perf_counter() - teacher_forward_start) * 1000.0
             if self.rank == 0:
@@ -855,16 +889,20 @@ class DataParallelPPOActor(BasePPOActor):
 
         else:
             # ---- Default (exp 0) or exp 3: teacher FIRST, student LAST ----
-            # NOTE: Currently uses self.actor_module (same model, different prompt).
-            # To match original SDPO's EMA teacher, set self.teacher_module to a
-            # ref_module_fsdp and pass it to _forward_response_logits via a
-            # `module` kwarg (requires extending that method — future work).
+            # When self.teacher_module is set (e.g. ref_fsdp_module from FSDP
+            # worker), teacher forward goes through a SEPARATE FSDP model —
+            # matching original SDPO's EMA teacher architecture.  This also
+            # eliminates the double-forward-through-same-FSDP issue.
+            # When teacher_module is None, falls back to self.actor_module
+            # (same-model/different-prompt, legacy behavior).
+            teacher_model = self.teacher_module  # None → falls back in _forward_response_logits
             teacher_forward_start = time.perf_counter()
             with torch.no_grad():
                 if _debug_shapes and self.rank == 0:
                     print(
                         f"[SDPO_T_BRANCH] step=T00 teacher forward ENTRY "
-                        f"fsdp_wrapped={isinstance(self.actor_module, FSDP)}"
+                        f"fsdp_wrapped={isinstance(self.actor_module, FSDP)} "
+                        f"separate_teacher={teacher_model is not None and teacher_model is not self.actor_module}"
                     )
                 teacher_logits = self._forward_response_logits(
                     model_inputs,
@@ -873,6 +911,7 @@ class DataParallelPPOActor(BasePPOActor):
                     attention_mask=teacher_attention_mask,
                     position_ids=teacher_position_ids,
                     multi_modal_inputs=teacher_multi_modal_inputs,
+                    module=teacher_model,
                 )
                 if _debug_shapes and self.rank == 0:
                     print(
@@ -1234,6 +1273,8 @@ class DataParallelPPOActor(BasePPOActor):
                         raise ValueError(f"Unknown actor.loss_mode: {self.config.loss_mode}")
 
                 grad_norm = self._optimizer_step()
+                if torch.isfinite(grad_norm):
+                    self._update_teacher()
                 append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})
 
         return metrics

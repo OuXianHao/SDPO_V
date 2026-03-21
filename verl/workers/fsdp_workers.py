@@ -469,6 +469,20 @@ class FSDPWorker(Worker):
                 video_fps=self.config.video_fps,
             )
 
+        # Wire separate EMA teacher for SDPO: use the ref model (separately
+        # FSDP-wrapped) as the teacher module, matching original SDPO's
+        # pattern of `self.actor.teacher_module = self.ref_module_fsdp`.
+        if self._has_actor and self._has_ref:
+            loss_mode = getattr(self.config.actor, "loss_mode", "")
+            if loss_mode == "sdpo_logit" and hasattr(self, "ref_fsdp_module"):
+                self.actor.teacher_module = self.ref_fsdp_module
+                if dist.get_rank() == 0:
+                    print(
+                        f"[fsdp_workers] Set actor.teacher_module = ref_fsdp_module "
+                        f"(separate EMA teacher for SDPO, "
+                        f"update_rate={getattr(self.config.actor, 'sdpo_teacher_update_rate', 0.0)})"
+                    )
+
         if self._has_critic:
             from .critic.dp_critic import DataParallelPPOCritic  # lazy import
 

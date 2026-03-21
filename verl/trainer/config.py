@@ -101,6 +101,8 @@ class AlgorithmConfig:
     sdpo_feedback_mode: str = "successful_rollout"
     sdpo_alpha: Optional[float] = None
     """Alpha for divergence interpolation: 0.0=forward KL, 1.0=reverse KL, in-between=GJS. None=derive from sdpo_divergence."""
+    sdpo_teacher_update_rate: float = 0.0
+    """EMA update rate for teacher weights (0.0=frozen ref teacher, 0.05=original SDPO default)."""
 
 
 @dataclass
@@ -176,6 +178,7 @@ class PPOConfig:
         self.worker.actor.sdpo_approx_mode = self.algorithm.sdpo_approx_mode
         self.worker.actor.sdpo_feedback_mode = self.algorithm.sdpo_feedback_mode
         self.worker.actor.sdpo_alpha = self.algorithm.sdpo_alpha
+        self.worker.actor.sdpo_teacher_update_rate = self.algorithm.sdpo_teacher_update_rate
 
     def deep_post_init(self):
         recursive_post_init(self)
