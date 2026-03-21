@@ -791,50 +791,32 @@ class DataParallelPPOActor(BasePPOActor):
             else:
                 print(f"[SDPO_T_SHAPE] actor_module is NOT FSDP-wrapped: {type(self.actor_module).__name__}")
 
-        # ---- Teacher forward (no grad, FSDP-isolated) ----
-        #
-        # The teacher and student both need to run through self.actor_module,
-        # which is FSDP-wrapped.  Running TWO forward passes through an FSDP
-        # module causes SplitWithSizesBackward0 gradient-shape errors: even
-        # under no_grad, FSDP hooks fire and mutate internal bookkeeping
-        # (execution-order counters, prefetch state, handle training_state).
-        # When the student forward then runs, FSDP's autograd graph records
-        # split_with_sizes against a flat-param buffer that was already
-        # touched by the teacher, producing a 2× gradient during backward.
-        #
-        # Fix: run the teacher forward inside FSDP.summon_full_params().
-        # This gathers all parameters up-front and makes the FSDP per-unit
-        # allgather/reshard hooks no-ops, so the teacher forward does NOT
-        # mutate FSDP's execution-order state.  The student forward then
-        # sees a clean FSDP state and produces a correct autograd graph.
+        # ---- Teacher forward FIRST (no grad) ----
+        # Run teacher before student so that FSDP's internal execution-order
+        # tracking state reflects the student forward (which is the one that
+        # backward will follow).  Running student last ensures FSDP's
+        # pre/post-forward bookkeeping is consistent with the backward pass.
         teacher_forward_start = time.perf_counter()
         with torch.no_grad():
-            if isinstance(self.actor_module, FSDP):
-                ctx = FSDP.summon_full_params(self.actor_module, writeback=False)
-            else:
-                from contextlib import nullcontext
-                ctx = nullcontext()
-            with ctx:
-                if _debug_shapes and self.rank == 0:
-                    print(
-                        f"[SDPO_T_BRANCH] step=T00 teacher forward ENTRY "
-                        f"fsdp_wrapped={isinstance(self.actor_module, FSDP)} "
-                        f"using_summon_full_params={isinstance(self.actor_module, FSDP)}"
-                    )
-                teacher_logits = self._forward_response_logits(
-                    model_inputs,
-                    temperature=temperature,
-                    input_ids=teacher_input_ids,
-                    attention_mask=teacher_attention_mask,
-                    position_ids=teacher_position_ids,
-                    multi_modal_inputs=teacher_multi_modal_inputs,
+            if _debug_shapes and self.rank == 0:
+                print(
+                    f"[SDPO_T_BRANCH] step=T00 teacher forward ENTRY "
+                    f"fsdp_wrapped={isinstance(self.actor_module, FSDP)}"
                 )
-                if _debug_shapes and self.rank == 0:
-                    print(
-                        f"[SDPO_T_BRANCH] step=T01 teacher forward EXIT "
-                        f"teacher_logits shape={tuple(teacher_logits.shape)} "
-                        f"requires_grad={teacher_logits.requires_grad}"
-                    )
+            teacher_logits = self._forward_response_logits(
+                model_inputs,
+                temperature=temperature,
+                input_ids=teacher_input_ids,
+                attention_mask=teacher_attention_mask,
+                position_ids=teacher_position_ids,
+                multi_modal_inputs=teacher_multi_modal_inputs,
+            )
+            if _debug_shapes and self.rank == 0:
+                print(
+                    f"[SDPO_T_BRANCH] step=T01 teacher forward EXIT "
+                    f"teacher_logits shape={tuple(teacher_logits.shape)} "
+                    f"requires_grad={teacher_logits.requires_grad}"
+                )
         teacher_forward_elapsed_ms = (time.perf_counter() - teacher_forward_start) * 1000.0
 
         # ---- Student forward LAST (with grad) ----
