@@ -365,7 +365,33 @@ class DataParallelPPOActor(BasePPOActor):
                     use_cache=False,
                 )
                 full_logits = output.logits
-                logits = full_logits[:, -response_length - 1 : -1, :] / temperature
+
+                # ---- Experiment gate: SDPO_FWD_EXP ----
+                #   0 = default SDPO path (out-of-place div, 3D logits)
+                #   1 = GRPO-style: in-place div_ + slice + .contiguous()
+                #   2 = SDPO slice but add .contiguous() before returning
+                #   3 = GRPO-style in-place div_ but NO .contiguous()
+                _fwd_exp = int(os.getenv("SDPO_FWD_EXP", "0"))
+                if _fwd_exp == 1:
+                    # Match GRPO exactly: in-place div, then slice, then contiguous
+                    full_logits.div_(temperature)
+                    logits = full_logits[:, -response_length - 1 : -1, :].contiguous()
+                    if self.rank == 0:
+                        print(f"[SDPO_FWD_EXP1] in-place div + slice + contiguous, logits shape={tuple(logits.shape)}")
+                elif _fwd_exp == 2:
+                    # Out-of-place div (like default) but add .contiguous()
+                    logits = (full_logits[:, -response_length - 1 : -1, :] / temperature).contiguous()
+                    if self.rank == 0:
+                        print(f"[SDPO_FWD_EXP2] out-of-place div + contiguous, logits shape={tuple(logits.shape)}")
+                elif _fwd_exp == 3:
+                    # In-place div but NO contiguous (isolates in-place effect)
+                    full_logits.div_(temperature)
+                    logits = full_logits[:, -response_length - 1 : -1, :]
+                    if self.rank == 0:
+                        print(f"[SDPO_FWD_EXP3] in-place div + slice (no contiguous), logits shape={tuple(logits.shape)}")
+                else:
+                    logits = full_logits[:, -response_length - 1 : -1, :] / temperature
+
                 if self._sdpo_backward_shape_debug and self.rank == 0:
                     print(
                         "[sdpo-shape-debug] response_only_logits=False "
