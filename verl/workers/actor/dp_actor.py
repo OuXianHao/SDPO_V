@@ -657,10 +657,15 @@ class DataParallelPPOActor(BasePPOActor):
             lse = torch.logsumexp(logits, dim=-1, keepdim=True)  # (batch, resp_len, 1)
 
         if topk_indices is None:
-            topk_logits, topk_indices = torch.topk(logits, k, dim=-1)
+            # Select indices without gradient (removes TopkBackward0 from the
+            # backward graph).  Values are gathered from live logits so the
+            # gradient still flows through GatherBackward0 → logits → model.
+            with torch.no_grad():
+                _, topk_indices = torch.topk(logits, k, dim=-1)
+            topk_logits = torch.gather(logits, dim=-1, index=topk_indices)
             if _debug and self.rank == 0:
                 print(
-                    f"[SDPO_T_SHAPE] step=E05 topk (fresh) caller={_caller} "
+                    f"[SDPO_T_SHAPE] step=E05 gather (detached-idx) caller={_caller} "
                     f"topk_logits shape={tuple(topk_logits.shape)} stride={topk_logits.stride()} "
                     f"is_contiguous={topk_logits.is_contiguous()} "
                     f"requires_grad={topk_logits.requires_grad} grad_fn={topk_logits.grad_fn} "
