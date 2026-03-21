@@ -589,12 +589,33 @@ class DataParallelPPOActor(BasePPOActor):
         Returns:
             dict with ``topk_logps``, ``topk_indices``, ``logsumexp``.
         """
+        _debug = os.getenv("SDPO_T_DEBUG_SHAPES", "0").strip().lower() in {"1", "true", "yes", "on"}
+        _caller = "teacher" if topk_indices is not None else "student"
+
         vocab_size = logits.size(-1)
         k = min(max(k, 1), vocab_size)
+
+        if _debug and self.rank == 0:
+            print(
+                f"[SDPO_T_SHAPE] _extract_topk_logps ENTRY caller={_caller} "
+                f"logits shape={tuple(logits.shape)} dtype={logits.dtype} "
+                f"device={logits.device} requires_grad={logits.requires_grad} "
+                f"is_contiguous={logits.is_contiguous()} stride={logits.stride()} "
+                f"data_ptr={logits.data_ptr()} numel={logits.numel()} k={k}"
+            )
 
         # Single fused backward through log_softmax — avoids the dual
         # topk + logsumexp backward references that trigger FSDP errors.
         log_probs = torch.log_softmax(logits, dim=-1)  # (batch, resp_len, vocab)
+
+        if _debug and self.rank == 0:
+            print(
+                f"[SDPO_T_SHAPE] log_probs caller={_caller} "
+                f"shape={tuple(log_probs.shape)} dtype={log_probs.dtype} "
+                f"requires_grad={log_probs.requires_grad} "
+                f"is_contiguous={log_probs.is_contiguous()} stride={log_probs.stride()} "
+                f"grad_fn={log_probs.grad_fn}"
+            )
 
         if detach_lse:
             # Detach to make gradient sparse (only through gathered entries).
@@ -604,12 +625,36 @@ class DataParallelPPOActor(BasePPOActor):
 
         if topk_indices is None:
             topk_logps, topk_indices = torch.topk(log_probs_for_topk, k, dim=-1)
+            if _debug and self.rank == 0:
+                print(
+                    f"[SDPO_T_SHAPE] topk (fresh) caller={_caller} "
+                    f"topk_logps shape={tuple(topk_logps.shape)} stride={topk_logps.stride()} "
+                    f"is_contiguous={topk_logps.is_contiguous()} "
+                    f"requires_grad={topk_logps.requires_grad} grad_fn={topk_logps.grad_fn} "
+                    f"topk_indices shape={tuple(topk_indices.shape)} dtype={topk_indices.dtype}"
+                )
         else:
             topk_logps = torch.gather(log_probs_for_topk, dim=-1, index=topk_indices)
+            if _debug and self.rank == 0:
+                print(
+                    f"[SDPO_T_SHAPE] gather caller={_caller} "
+                    f"topk_logps shape={tuple(topk_logps.shape)} stride={topk_logps.stride()} "
+                    f"is_contiguous={topk_logps.is_contiguous()} "
+                    f"requires_grad={topk_logps.requires_grad} grad_fn={topk_logps.grad_fn} "
+                    f"topk_indices shape={tuple(topk_indices.shape)}"
+                )
 
         # Compute logsumexp for metrics compatibility (detached — no grad needed).
         with torch.no_grad():
             lse = torch.logsumexp(logits, dim=-1)  # (batch, resp_len)
+
+        if _debug and self.rank == 0:
+            print(
+                f"[SDPO_T_SHAPE] _extract_topk_logps EXIT caller={_caller} "
+                f"topk_logps shape={tuple(topk_logps.shape)} numel={topk_logps.numel()} "
+                f"topk_indices shape={tuple(topk_indices.shape)} "
+                f"lse shape={tuple(lse.shape)}"
+            )
 
         return {
             "topk_logps": topk_logps,       # (batch, resp_len, k)
@@ -682,6 +727,31 @@ class DataParallelPPOActor(BasePPOActor):
         topk_k = self.config.sdpo_topk
         detach_lse = os.getenv("SDPO_DETACH_LSE", "0").strip().lower() in {"1", "true", "yes", "on"}
         detect_anomaly = os.getenv("SDPO_DETECT_ANOMALY", "0").strip().lower() in {"1", "true", "yes", "on"}
+        _debug_shapes = os.getenv("SDPO_T_DEBUG_SHAPES", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+        if _debug_shapes and self.rank == 0:
+            print(
+                f"[SDPO_T_BRANCH] _compute_sdpo_logit_loss ENTRY "
+                f"approx_mode={approx_mode} topk_mode={topk_mode} "
+                f"use_tail={self.config.sdpo_use_tail} divergence={self.config.sdpo_divergence} "
+                f"topk_k={topk_k} detach_lse={detach_lse} "
+                f"response_mask shape={tuple(response_mask.shape)} "
+                f"valid_tokens={int(response_mask.sum().item())} "
+                f"num_valid_samples={num_valid_samples}/{num_total_samples}"
+            )
+            # FSDP flat parameter diagnostics
+            if isinstance(self.actor_module, FSDP):
+                for i, (name, param) in enumerate(self.actor_module.named_parameters()):
+                    if i < 3 or "lm_head" in name or "embed" in name:
+                        print(
+                            f"[SDPO_T_SHAPE] FSDP_param name={name} "
+                            f"shape={tuple(param.shape)} numel={param.numel()} "
+                            f"dtype={param.dtype} requires_grad={param.requires_grad}"
+                        )
+                    if i == 3:
+                        print(f"[SDPO_T_SHAPE] FSDP_param ... (skipping middle params)")
+            else:
+                print(f"[SDPO_T_SHAPE] actor_module is NOT FSDP-wrapped: {type(self.actor_module).__name__}")
 
         # ---- Teacher forward FIRST (no grad) ----
         # Run teacher before student so that FSDP's internal execution-order
@@ -729,27 +799,70 @@ class DataParallelPPOActor(BasePPOActor):
                 f"Check that apply_vl_forward_patch() was called."
             )
 
+        if _debug_shapes and self.rank == 0:
+            print(
+                f"[SDPO_T_SHAPE] student_logits shape={tuple(student_logits.shape)} "
+                f"dtype={student_logits.dtype} requires_grad={student_logits.requires_grad} "
+                f"is_contiguous={student_logits.is_contiguous()} stride={student_logits.stride()} "
+                f"numel={student_logits.numel()} grad_fn={student_logits.grad_fn}"
+            )
+            print(
+                f"[SDPO_T_SHAPE] teacher_logits shape={tuple(teacher_logits.shape)} "
+                f"dtype={teacher_logits.dtype} requires_grad={teacher_logits.requires_grad} "
+                f"is_contiguous={teacher_logits.is_contiguous()} stride={teacher_logits.stride()} "
+                f"numel={teacher_logits.numel()}"
+            )
+
         if topk_mode:
+            if _debug_shapes and self.rank == 0:
+                print(
+                    f"[SDPO_T_BRANCH] entering topk_mode path "
+                    f"approx_mode={approx_mode} use_tail={self.config.sdpo_use_tail}"
+                )
+
             # Pre-compute top-k in the actor, aligned with original SDPO design.
             # Student selects top-k indices; teacher is gathered at the SAME indices.
             student_topk = self._extract_topk_logps(student_logits, k=topk_k, detach_lse=detach_lse)
 
-            # Register backward hook for diagnostics: log gradient shape
-            # before it flows back into the model.
+            # Register backward hooks for diagnostics: log gradient shapes
+            # at multiple points in the backward chain.
             if self.rank == 0:
                 def _grad_hook(grad, name="student_topk_logps"):
                     print(
-                        f"[sdpo-grad-hook] {name} grad shape={tuple(grad.shape)} "
-                        f"dtype={grad.dtype} has_nan={bool(grad.isnan().any())} "
+                        f"[SDPO_T_HOOK] {name} grad shape={tuple(grad.shape)} "
+                        f"dtype={grad.dtype} numel={grad.numel()} "
+                        f"has_nan={bool(grad.isnan().any())} "
                         f"has_inf={bool(grad.isinf().any())} "
                         f"detach_lse={detach_lse}"
                     )
                     return grad
                 student_topk["topk_logps"].register_hook(_grad_hook)
 
+            # Also hook student_logits to catch the gradient just before it
+            # flows into the model (where SplitWithSizesBackward0 lives).
+            if _debug_shapes and self.rank == 0 and student_logits.requires_grad:
+                def _student_logits_grad_hook(grad):
+                    print(
+                        f"[SDPO_T_BACKWARD] student_logits grad shape={tuple(grad.shape)} "
+                        f"dtype={grad.dtype} numel={grad.numel()} "
+                        f"is_contiguous={grad.is_contiguous()} stride={grad.stride()} "
+                        f"has_nan={bool(grad.isnan().any())} "
+                        f"has_inf={bool(grad.isinf().any())}"
+                    )
+                    return grad
+                student_logits.register_hook(_student_logits_grad_hook)
+
             with torch.no_grad():
                 teacher_topk = self._extract_topk_logps(
                     teacher_logits, k=topk_k, topk_indices=student_topk["topk_indices"]
+                )
+
+            if _debug_shapes and self.rank == 0:
+                print(
+                    f"[SDPO_T_SHAPE] PRE_LOSS student_topk_logps shape={tuple(student_topk['topk_logps'].shape)} "
+                    f"teacher_topk_logps shape={tuple(teacher_topk['topk_logps'].shape)} "
+                    f"student requires_grad={student_topk['topk_logps'].requires_grad} "
+                    f"teacher requires_grad={teacher_topk['topk_logps'].requires_grad}"
                 )
 
             # Enable anomaly detection if requested — this prints the forward
@@ -766,6 +879,13 @@ class DataParallelPPOActor(BasePPOActor):
                     # Pass full logits detached for metrics only (no grad).
                     student_logits_for_metrics=student_logits.detach(),
                     teacher_logits_for_metrics=teacher_logits.detach(),
+                )
+
+            if _debug_shapes and self.rank == 0:
+                print(
+                    f"[SDPO_T_SHAPE] POST_LOSS sdpo_loss shape={tuple(sdpo_loss.shape)} "
+                    f"dtype={sdpo_loss.dtype} requires_grad={sdpo_loss.requires_grad} "
+                    f"grad_fn={sdpo_loss.grad_fn} value={sdpo_loss.item():.6f}"
                 )
         else:
             # full_vocab mode — pass raw logits to the loss (gradient flows
