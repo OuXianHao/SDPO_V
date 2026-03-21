@@ -549,6 +549,7 @@ def compute_sdpo_logit_loss(
     divergence: Literal["forward_kl", "reverse_kl"] = "forward_kl",
     use_tail: bool = True,
     approx_mode: Literal["topk", "student_topk_tail", "full_vocab"] = "topk",
+    alpha: Optional[float] = None,
     # --- top-k mode inputs (pre-computed in actor) ---
     student_topk_logps: Optional[torch.Tensor] = None,
     teacher_topk_logps: Optional[torch.Tensor] = None,
@@ -580,6 +581,17 @@ def compute_sdpo_logit_loss(
         raise ValueError(f"Unsupported divergence: {divergence}")
     if approx_mode not in ("topk", "student_topk_tail", "full_vocab"):
         raise ValueError(f"Unsupported approx_mode: {approx_mode}")
+
+    # Resolve effective alpha: if alpha is explicitly provided, use it;
+    # otherwise derive from the legacy divergence string for backward compat.
+    # alpha=0.0 → forward KL, alpha=1.0 → reverse KL, 0<alpha<1 → GJS
+    # (matches original SDPO: SelfDistillationConfig.alpha semantics)
+    if alpha is None:
+        effective_alpha = 0.0 if divergence == "forward_kl" else 1.0
+    else:
+        if not 0.0 <= alpha <= 1.0:
+            raise ValueError(f"alpha must be in [0,1], got {alpha}")
+        effective_alpha = alpha
 
     mask_f = response_mask.float()
     valid_count = mask_f.sum().clamp_min(1.0)
@@ -651,132 +663,73 @@ def compute_sdpo_logit_loss(
                 gf = nf[0][0] if nf else None
             print(f"[SDPO_T_SHAPE] step=L01b student_topk_logps grad_fn_chain={chain}")
 
-        student_topk_prob = student_topk_logps.exp()
-        teacher_topk_prob = teacher_topk_logps.exp()
+        # ---- Alpha-parameterized divergence (matches original SDPO core_algos.py:1138-1160) ----
+        # Build proper distributions for divergence computation.
+        # Original SDPO uses add_tail (appending tail log-prob bucket) to form
+        # a proper (k+1)-category distribution, then applies the alpha formula.
+        def _add_tail(logps: torch.Tensor) -> torch.Tensor:
+            """Append tail log-probability: log(1 - sum(exp(logps))).
 
-        if _debug_shapes and _rank == 0:
-            print(
-                f"[SDPO_T_SHAPE] step=L02 after exp() "
-                f"student_topk_prob shape={tuple(student_topk_prob.shape)} "
-                f"requires_grad={student_topk_prob.requires_grad} "
-                f"grad_fn={student_topk_prob.grad_fn} "
-                f"teacher_topk_prob requires_grad={teacher_topk_prob.requires_grad}"
-            )
-            # Hook on student_topk_prob
-            if student_topk_prob.requires_grad:
-                student_topk_prob.register_hook(_make_bwd_hook("B02", "student_topk_prob"))
+            Matches original SDPO's add_tail() using expm1 for numerical stability.
+            """
+            log_s = torch.logsumexp(logps, dim=-1, keepdim=True)
+            log_s = torch.clamp(log_s, max=-1e-7)
+            tail_logp = torch.log(-torch.expm1(log_s))
+            return torch.cat([logps, tail_logp], dim=-1)
 
-        if divergence == "forward_kl":
-            # forward_kl: teacher_p * (teacher_logp - student_logp)
-            logp_diff = teacher_topk_logps - student_topk_logps
-            weighted = teacher_topk_prob * logp_diff
-            token_loss = weighted.sum(dim=-1)
-            if _debug_shapes and _rank == 0:
-                print(
-                    f"[SDPO_T_SHAPE] step=L03 forward_kl intermediates "
-                    f"logp_diff shape={tuple(logp_diff.shape)} requires_grad={logp_diff.requires_grad} grad_fn={logp_diff.grad_fn} "
-                    f"weighted shape={tuple(weighted.shape)} requires_grad={weighted.requires_grad} grad_fn={weighted.grad_fn}"
-                )
-                if logp_diff.requires_grad:
-                    logp_diff.register_hook(_make_bwd_hook("B03a", "logp_diff"))
-                if weighted.requires_grad:
-                    weighted.register_hook(_make_bwd_hook("B03b", "weighted"))
+        def _renorm(logps: torch.Tensor) -> torch.Tensor:
+            """Renormalize top-k log-probs to proper distribution over k categories."""
+            return logps - torch.logsumexp(logps, dim=-1, keepdim=True)
+
+        if use_tail:
+            student_dist_logps = _add_tail(student_topk_logps)
+            teacher_dist_logps = _add_tail(teacher_topk_logps)
         else:
-            logp_diff = student_topk_logps - teacher_topk_logps
-            weighted = student_topk_prob * logp_diff
-            token_loss = weighted.sum(dim=-1)
-            if _debug_shapes and _rank == 0:
-                print(
-                    f"[SDPO_T_SHAPE] step=L03 reverse_kl intermediates "
-                    f"logp_diff shape={tuple(logp_diff.shape)} requires_grad={logp_diff.requires_grad} grad_fn={logp_diff.grad_fn} "
-                    f"weighted shape={tuple(weighted.shape)} requires_grad={weighted.requires_grad} grad_fn={weighted.grad_fn}"
-                )
-                if logp_diff.requires_grad:
-                    logp_diff.register_hook(_make_bwd_hook("B03a", "logp_diff"))
-                if weighted.requires_grad:
-                    weighted.register_hook(_make_bwd_hook("B03b", "weighted"))
+            student_dist_logps = _renorm(student_topk_logps)
+            teacher_dist_logps = _renorm(teacher_topk_logps)
 
         if _debug_shapes and _rank == 0:
             print(
-                f"[SDPO_T_SHAPE] step=L04 token_loss (topk KL) shape={tuple(token_loss.shape)} "
+                f"[SDPO_T_SHAPE] step=L02 dist_logps "
+                f"student shape={tuple(student_dist_logps.shape)} "
+                f"requires_grad={student_dist_logps.requires_grad} "
+                f"teacher shape={tuple(teacher_dist_logps.shape)} "
+                f"effective_alpha={effective_alpha}"
+            )
+
+        if effective_alpha == 0.0:
+            # Forward KL: KL(teacher || student) — matches original SDPO alpha=0
+            kl_loss = F.kl_div(student_dist_logps, teacher_dist_logps, reduction="none", log_target=True)
+            token_loss = kl_loss.sum(dim=-1)
+        elif effective_alpha == 1.0:
+            # Reverse KL: KL(student || teacher) — matches original SDPO alpha=1
+            kl_loss = F.kl_div(teacher_dist_logps, student_dist_logps, reduction="none", log_target=True)
+            token_loss = kl_loss.sum(dim=-1)
+        else:
+            # Generalized Jensen-Shannon Divergence — matches original SDPO alpha in (0,1)
+            alpha_t = torch.tensor(effective_alpha, dtype=student_dist_logps.dtype, device=student_dist_logps.device)
+            mixture_logps = torch.logsumexp(
+                torch.stack([student_dist_logps + torch.log(1 - alpha_t), teacher_dist_logps + torch.log(alpha_t)]),
+                dim=0,
+            )
+            kl_teacher = F.kl_div(mixture_logps, teacher_dist_logps, reduction="none", log_target=True)
+            kl_student = F.kl_div(mixture_logps, student_dist_logps, reduction="none", log_target=True)
+            kl_loss = torch.lerp(kl_student, kl_teacher, alpha_t)
+            token_loss = kl_loss.sum(dim=-1)
+
+        if _debug_shapes and _rank == 0:
+            print(
+                f"[SDPO_T_SHAPE] step=L04 token_loss shape={tuple(token_loss.shape)} "
                 f"requires_grad={token_loss.requires_grad} grad_fn={token_loss.grad_fn} "
                 f"dtype={token_loss.dtype}"
             )
             if token_loss.requires_grad:
-                token_loss.register_hook(_make_bwd_hook("B04", "token_loss_topk_kl"))
+                token_loss.register_hook(_make_bwd_hook("B04", "token_loss"))
 
+        # Compute mass/tail metrics (for logging only, not used in loss)
+        student_topk_prob = student_topk_logps.detach().exp()
         student_topk_mass = student_topk_prob.sum(dim=-1)
-        teacher_topk_mass = teacher_topk_prob.sum(dim=-1)
-
-        if _debug_shapes and _rank == 0:
-            print(
-                f"[SDPO_T_SHAPE] step=L05 mass tensors "
-                f"student_topk_mass shape={tuple(student_topk_mass.shape)} "
-                f"requires_grad={student_topk_mass.requires_grad} "
-                f"grad_fn={student_topk_mass.grad_fn}"
-            )
-            if student_topk_mass.requires_grad:
-                student_topk_mass.register_hook(_make_bwd_hook("B05", "student_topk_mass"))
-
         student_tail = (1.0 - student_topk_mass).clamp(1e-12, 1.0)
-        teacher_tail = (1.0 - teacher_topk_mass).clamp(1e-12, 1.0)
-
-        if _debug_shapes and _rank == 0:
-            print(
-                f"[SDPO_T_SHAPE] step=L06 tail tensors "
-                f"student_tail shape={tuple(student_tail.shape)} "
-                f"requires_grad={student_tail.requires_grad} "
-                f"grad_fn={student_tail.grad_fn} "
-                f"teacher_tail shape={tuple(teacher_tail.shape)} "
-                f"requires_grad={teacher_tail.requires_grad}"
-            )
-            if student_tail.requires_grad:
-                student_tail.register_hook(_make_bwd_hook("B06", "student_tail"))
-
-        if use_tail:
-            if _debug_shapes and _rank == 0:
-                print(f"[SDPO_T_BRANCH] step=L07 use_tail=True active, divergence={divergence}")
-            if divergence == "forward_kl":
-                log_teacher_tail = torch.log(teacher_tail)
-                log_student_tail = torch.log(student_tail)
-                tail_kl = teacher_tail * (log_teacher_tail - log_student_tail)
-                if _debug_shapes and _rank == 0:
-                    print(
-                        f"[SDPO_T_SHAPE] step=L08 tail_kl (forward_kl) "
-                        f"shape={tuple(tail_kl.shape)} "
-                        f"requires_grad={tail_kl.requires_grad} grad_fn={tail_kl.grad_fn} "
-                        f"log_student_tail requires_grad={log_student_tail.requires_grad} grad_fn={log_student_tail.grad_fn} "
-                        f"log_teacher_tail requires_grad={log_teacher_tail.requires_grad}"
-                    )
-                    if log_student_tail.requires_grad:
-                        log_student_tail.register_hook(_make_bwd_hook("B08a", "log_student_tail"))
-                    if tail_kl.requires_grad:
-                        tail_kl.register_hook(_make_bwd_hook("B08b", "tail_kl"))
-                token_loss = token_loss + tail_kl
-            else:
-                log_student_tail = torch.log(student_tail)
-                log_teacher_tail = torch.log(teacher_tail)
-                tail_kl = student_tail * (log_student_tail - log_teacher_tail)
-                if _debug_shapes and _rank == 0:
-                    print(
-                        f"[SDPO_T_SHAPE] step=L08 tail_kl (reverse_kl) "
-                        f"shape={tuple(tail_kl.shape)} "
-                        f"requires_grad={tail_kl.requires_grad} grad_fn={tail_kl.grad_fn} "
-                        f"log_student_tail requires_grad={log_student_tail.requires_grad} grad_fn={log_student_tail.grad_fn}"
-                    )
-                    if log_student_tail.requires_grad:
-                        log_student_tail.register_hook(_make_bwd_hook("B08a", "log_student_tail"))
-                    if tail_kl.requires_grad:
-                        tail_kl.register_hook(_make_bwd_hook("B08b", "tail_kl"))
-                token_loss = token_loss + tail_kl
-
-            if _debug_shapes and _rank == 0:
-                print(
-                    f"[SDPO_T_SHAPE] step=L09 token_loss (after tail) shape={tuple(token_loss.shape)} "
-                    f"requires_grad={token_loss.requires_grad} grad_fn={token_loss.grad_fn}"
-                )
-                if token_loss.requires_grad:
-                    token_loss.register_hook(_make_bwd_hook("B09", "token_loss_after_tail"))
 
         vocab_size = k  # for metrics; real vocab_size comes from *_for_metrics if provided
 
@@ -804,10 +757,20 @@ def compute_sdpo_logit_loss(
         student_log_probs = F.log_softmax(student_logits, dim=-1)
         teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
 
-        if divergence == "forward_kl":
+        if effective_alpha == 0.0:
             token_kl = F.kl_div(student_log_probs, teacher_log_probs, reduction="none", log_target=True)
-        else:
+        elif effective_alpha == 1.0:
             token_kl = F.kl_div(teacher_log_probs, student_log_probs, reduction="none", log_target=True)
+        else:
+            # Generalized Jensen-Shannon Divergence (full-vocab)
+            alpha_t = torch.tensor(effective_alpha, dtype=student_log_probs.dtype, device=student_log_probs.device)
+            mixture_logps = torch.logsumexp(
+                torch.stack([student_log_probs + torch.log(1 - alpha_t), teacher_log_probs + torch.log(alpha_t)]),
+                dim=0,
+            )
+            kl_teacher = F.kl_div(mixture_logps, teacher_log_probs, reduction="none", log_target=True)
+            kl_student = F.kl_div(mixture_logps, student_log_probs, reduction="none", log_target=True)
+            token_kl = torch.lerp(kl_student, kl_teacher, alpha_t)
         token_loss = token_kl.sum(dim=-1)
         student_topk_mass = torch.ones_like(mask_f)
         student_tail = torch.zeros_like(mask_f)
@@ -909,6 +872,7 @@ def compute_sdpo_logit_loss(
 
     metrics = {
         "logit_loss": loss.detach().item(),
+        "alpha": effective_alpha,
         "topk": float(k if topk_mode else metrics_vocab),
         "approx_mode": 0.0 if topk_mode else 1.0,
         "topk_mass_mean": (student_topk_mass.detach() * mask_f).sum().item() / valid_count.item(),

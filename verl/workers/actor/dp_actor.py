@@ -67,6 +67,14 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
         self.is_trainable_actor = self.actor_optimizer is not None
+        # Separate teacher model for SDPO distillation (EMA or trust-region).
+        # When None (current default), the teacher forward falls back to
+        # self.actor_module under torch.no_grad(), matching the current
+        # same-model/different-prompt pattern.
+        # To restore full original-SDPO EMA teacher semantics, set this to
+        # a ref_module (e.g. ref_module_fsdp) from the FSDP worker init
+        # and call _update_teacher() after each optimizer step.
+        self.teacher_module: Optional[nn.Module] = None
         self.processor = processor
         self.min_pixels = min_pixels
         self.max_pixels = max_pixels
@@ -82,7 +90,8 @@ class DataParallelPPOActor(BasePPOActor):
                 print(
                     f"[actor] sdpo settings: topk={self.config.sdpo_topk}, "
                     f"divergence={self.config.sdpo_divergence}, use_tail={self.config.sdpo_use_tail}, "
-                    f"approx_mode={self.config.sdpo_approx_mode}"
+                    f"approx_mode={self.config.sdpo_approx_mode}, "
+                    f"alpha={self.config.sdpo_alpha}"
                 )
 
         self._sdpo_backward_shape_debug = os.getenv("SDPO_BACKWARD_SHAPE_DEBUG", "0").strip().lower() in {
@@ -846,6 +855,10 @@ class DataParallelPPOActor(BasePPOActor):
 
         else:
             # ---- Default (exp 0) or exp 3: teacher FIRST, student LAST ----
+            # NOTE: Currently uses self.actor_module (same model, different prompt).
+            # To match original SDPO's EMA teacher, set self.teacher_module to a
+            # ref_module_fsdp and pass it to _forward_response_logits via a
+            # `module` kwarg (requires extending that method — future work).
             teacher_forward_start = time.perf_counter()
             with torch.no_grad():
                 if _debug_shapes and self.rank == 0:
@@ -988,6 +1001,7 @@ class DataParallelPPOActor(BasePPOActor):
                     divergence=self.config.sdpo_divergence,
                     use_tail=self.config.sdpo_use_tail,
                     approx_mode=approx_mode,
+                    alpha=self.config.sdpo_alpha,
                     # Pass full logits detached for metrics only (no grad).
                     student_logits_for_metrics=student_logits.detach(),
                     teacher_logits_for_metrics=teacher_logits.detach(),
@@ -1011,6 +1025,7 @@ class DataParallelPPOActor(BasePPOActor):
                     divergence=self.config.sdpo_divergence,
                     use_tail=self.config.sdpo_use_tail,
                     approx_mode=approx_mode,
+                    alpha=self.config.sdpo_alpha,
                 )
 
         metrics = {f"sdpo/{k}": v for k, v in sdpo_metrics.items()}
