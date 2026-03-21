@@ -586,6 +586,17 @@ def compute_sdpo_logit_loss(
     topk_mode = approx_mode in ("topk", "student_topk_tail")
 
     debug_sdpo = os.getenv("EASYR1_DEBUG_SDPO_UPDATE", "0").strip().lower() in {"1", "true", "yes", "on"}
+    _debug_shapes = os.getenv("SDPO_T_DEBUG_SHAPES", "0").strip().lower() in {"1", "true", "yes", "on"}
+    _rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+
+    if _debug_shapes and _rank == 0:
+        print(
+            f"[SDPO_T_BRANCH] compute_sdpo_logit_loss ENTRY "
+            f"approx_mode={approx_mode} topk_mode={topk_mode} "
+            f"divergence={divergence} use_tail={use_tail} topk={topk} "
+            f"response_mask shape={tuple(response_mask.shape)} "
+            f"valid_count={valid_count.item():.0f}"
+        )
 
     if topk_mode:
         # ---- Top-k path: receive pre-computed log-probs ----
@@ -604,24 +615,85 @@ def compute_sdpo_logit_loss(
 
         k = student_topk_logps.size(-1)
 
+        if _debug_shapes and _rank == 0:
+            print(
+                f"[SDPO_T_SHAPE] topk_path inputs k={k} "
+                f"student_topk_logps shape={tuple(student_topk_logps.shape)} "
+                f"stride={student_topk_logps.stride()} "
+                f"is_contiguous={student_topk_logps.is_contiguous()} "
+                f"requires_grad={student_topk_logps.requires_grad} "
+                f"grad_fn={student_topk_logps.grad_fn} "
+                f"teacher_topk_logps shape={tuple(teacher_topk_logps.shape)} "
+                f"requires_grad={teacher_topk_logps.requires_grad}"
+            )
+
         student_topk_prob = student_topk_logps.exp()
         teacher_topk_prob = teacher_topk_logps.exp()
+
+        if _debug_shapes and _rank == 0:
+            print(
+                f"[SDPO_T_SHAPE] after exp() "
+                f"student_topk_prob shape={tuple(student_topk_prob.shape)} "
+                f"requires_grad={student_topk_prob.requires_grad} "
+                f"grad_fn={student_topk_prob.grad_fn} "
+                f"teacher_topk_prob requires_grad={teacher_topk_prob.requires_grad}"
+            )
 
         if divergence == "forward_kl":
             token_loss = (teacher_topk_prob * (teacher_topk_logps - student_topk_logps)).sum(dim=-1)
         else:
             token_loss = (student_topk_prob * (student_topk_logps - teacher_topk_logps)).sum(dim=-1)
 
+        if _debug_shapes and _rank == 0:
+            print(
+                f"[SDPO_T_SHAPE] token_loss (topk KL) shape={tuple(token_loss.shape)} "
+                f"requires_grad={token_loss.requires_grad} grad_fn={token_loss.grad_fn} "
+                f"dtype={token_loss.dtype}"
+            )
+
         student_topk_mass = student_topk_prob.sum(dim=-1)
         teacher_topk_mass = teacher_topk_prob.sum(dim=-1)
         student_tail = (1.0 - student_topk_mass).clamp(1e-12, 1.0)
         teacher_tail = (1.0 - teacher_topk_mass).clamp(1e-12, 1.0)
 
+        if _debug_shapes and _rank == 0:
+            print(
+                f"[SDPO_T_SHAPE] tail tensors "
+                f"student_topk_mass shape={tuple(student_topk_mass.shape)} "
+                f"requires_grad={student_topk_mass.requires_grad} "
+                f"grad_fn={student_topk_mass.grad_fn} "
+                f"student_tail shape={tuple(student_tail.shape)} "
+                f"requires_grad={student_tail.requires_grad} "
+                f"grad_fn={student_tail.grad_fn} "
+                f"teacher_tail shape={tuple(teacher_tail.shape)} "
+                f"requires_grad={teacher_tail.requires_grad}"
+            )
+
         if use_tail:
+            if _debug_shapes and _rank == 0:
+                print(f"[SDPO_T_BRANCH] use_tail=True active, divergence={divergence}")
             if divergence == "forward_kl":
-                token_loss = token_loss + teacher_tail * (torch.log(teacher_tail) - torch.log(student_tail))
+                tail_kl = teacher_tail * (torch.log(teacher_tail) - torch.log(student_tail))
+                if _debug_shapes and _rank == 0:
+                    print(
+                        f"[SDPO_T_SHAPE] tail_kl (forward_kl) shape={tuple(tail_kl.shape)} "
+                        f"requires_grad={tail_kl.requires_grad} grad_fn={tail_kl.grad_fn}"
+                    )
+                token_loss = token_loss + tail_kl
             else:
-                token_loss = token_loss + student_tail * (torch.log(student_tail) - torch.log(teacher_tail))
+                tail_kl = student_tail * (torch.log(student_tail) - torch.log(teacher_tail))
+                if _debug_shapes and _rank == 0:
+                    print(
+                        f"[SDPO_T_SHAPE] tail_kl (reverse_kl) shape={tuple(tail_kl.shape)} "
+                        f"requires_grad={tail_kl.requires_grad} grad_fn={tail_kl.grad_fn}"
+                    )
+                token_loss = token_loss + tail_kl
+
+            if _debug_shapes and _rank == 0:
+                print(
+                    f"[SDPO_T_SHAPE] token_loss (after tail) shape={tuple(token_loss.shape)} "
+                    f"requires_grad={token_loss.requires_grad} grad_fn={token_loss.grad_fn}"
+                )
 
         vocab_size = k  # for metrics; real vocab_size comes from *_for_metrics if provided
 
@@ -658,7 +730,30 @@ def compute_sdpo_logit_loss(
         student_tail = torch.zeros_like(mask_f)
 
     # ---- Loss ----
+    if _debug_shapes and _rank == 0:
+        print(
+            f"[SDPO_T_SHAPE] PRE_LOSS_REDUCE "
+            f"token_loss shape={tuple(token_loss.shape)} "
+            f"requires_grad={token_loss.requires_grad} "
+            f"mask_f shape={tuple(mask_f.shape)} "
+            f"valid_count={valid_count.item():.0f}"
+        )
     loss = (token_loss * mask_f).sum() / valid_count
+    if _debug_shapes and _rank == 0:
+        print(
+            f"[SDPO_T_SHAPE] FINAL_LOSS shape={tuple(loss.shape)} "
+            f"requires_grad={loss.requires_grad} grad_fn={loss.grad_fn} "
+            f"value={loss.item():.6f}"
+        )
+        # Register hook on loss to trace backward entry
+        if loss.requires_grad:
+            def _loss_backward_hook(grad):
+                print(
+                    f"[SDPO_T_BACKWARD] loss.backward entry grad shape={tuple(grad.shape)} "
+                    f"dtype={grad.dtype}"
+                )
+                return grad
+            loss.register_hook(_loss_backward_hook)
 
     # ---- Metrics (all under no_grad) ----
     with torch.no_grad():
