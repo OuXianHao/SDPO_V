@@ -597,12 +597,23 @@ class DataParallelPPOActor(BasePPOActor):
 
         if _debug and self.rank == 0:
             print(
-                f"[SDPO_T_SHAPE] _extract_topk_logps ENTRY caller={_caller} "
+                f"[SDPO_T_SHAPE] step=E01 _extract_topk_logps ENTRY caller={_caller} "
                 f"logits shape={tuple(logits.shape)} dtype={logits.dtype} "
                 f"device={logits.device} requires_grad={logits.requires_grad} "
                 f"is_contiguous={logits.is_contiguous()} stride={logits.stride()} "
-                f"data_ptr={logits.data_ptr()} numel={logits.numel()} k={k}"
+                f"data_ptr={logits.data_ptr()} storage_offset={logits.storage_offset()} "
+                f"numel={logits.numel()} k={k}"
             )
+            # Walk grad_fn chain for the input logits
+            gf = logits.grad_fn
+            chain = []
+            for _i in range(15):
+                if gf is None:
+                    break
+                chain.append(type(gf).__name__)
+                nexts = gf.next_functions
+                gf = nexts[0][0] if nexts else None
+            print(f"[SDPO_T_SHAPE] step=E02 logits grad_fn_chain caller={_caller} chain={chain}")
 
         # Single fused backward through log_softmax — avoids the dual
         # topk + logsumexp backward references that trigger FSDP errors.
@@ -610,12 +621,26 @@ class DataParallelPPOActor(BasePPOActor):
 
         if _debug and self.rank == 0:
             print(
-                f"[SDPO_T_SHAPE] log_probs caller={_caller} "
+                f"[SDPO_T_SHAPE] step=E03 log_probs caller={_caller} "
                 f"shape={tuple(log_probs.shape)} dtype={log_probs.dtype} "
                 f"requires_grad={log_probs.requires_grad} "
                 f"is_contiguous={log_probs.is_contiguous()} stride={log_probs.stride()} "
                 f"grad_fn={log_probs.grad_fn}"
             )
+            # Register backward hook on log_probs (full-vocab intermediate) —
+            # this is the tensor between topk and FSDP.
+            if log_probs.requires_grad and _caller == "student":
+                def _log_probs_bwd_hook(grad):
+                    print(
+                        f"[SDPO_T_BACKWARD] step=B03 log_probs grad "
+                        f"shape={tuple(grad.shape)} dtype={grad.dtype} "
+                        f"numel={grad.numel()} "
+                        f"is_contiguous={grad.is_contiguous()} stride={grad.stride()} "
+                        f"has_nan={bool(grad.isnan().any())} "
+                        f"has_inf={bool(grad.isinf().any())}"
+                    )
+                    return grad
+                log_probs.register_hook(_log_probs_bwd_hook)
 
         if detach_lse:
             # Detach to make gradient sparse (only through gathered entries).
@@ -623,11 +648,19 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             log_probs_for_topk = log_probs
 
+        if _debug and self.rank == 0 and _caller == "student":
+            print(
+                f"[SDPO_T_SHAPE] step=E04 log_probs_for_topk caller={_caller} "
+                f"requires_grad={log_probs_for_topk.requires_grad} "
+                f"is_same_as_log_probs={log_probs_for_topk.data_ptr() == log_probs.data_ptr()} "
+                f"detach_lse={detach_lse}"
+            )
+
         if topk_indices is None:
             topk_logps, topk_indices = torch.topk(log_probs_for_topk, k, dim=-1)
             if _debug and self.rank == 0:
                 print(
-                    f"[SDPO_T_SHAPE] topk (fresh) caller={_caller} "
+                    f"[SDPO_T_SHAPE] step=E05 topk (fresh) caller={_caller} "
                     f"topk_logps shape={tuple(topk_logps.shape)} stride={topk_logps.stride()} "
                     f"is_contiguous={topk_logps.is_contiguous()} "
                     f"requires_grad={topk_logps.requires_grad} grad_fn={topk_logps.grad_fn} "
@@ -637,7 +670,7 @@ class DataParallelPPOActor(BasePPOActor):
             topk_logps = torch.gather(log_probs_for_topk, dim=-1, index=topk_indices)
             if _debug and self.rank == 0:
                 print(
-                    f"[SDPO_T_SHAPE] gather caller={_caller} "
+                    f"[SDPO_T_SHAPE] step=E05 gather caller={_caller} "
                     f"topk_logps shape={tuple(topk_logps.shape)} stride={topk_logps.stride()} "
                     f"is_contiguous={topk_logps.is_contiguous()} "
                     f"requires_grad={topk_logps.requires_grad} grad_fn={topk_logps.grad_fn} "
@@ -650,7 +683,7 @@ class DataParallelPPOActor(BasePPOActor):
 
         if _debug and self.rank == 0:
             print(
-                f"[SDPO_T_SHAPE] _extract_topk_logps EXIT caller={_caller} "
+                f"[SDPO_T_SHAPE] step=E06 _extract_topk_logps EXIT caller={_caller} "
                 f"topk_logps shape={tuple(topk_logps.shape)} numel={topk_logps.numel()} "
                 f"topk_indices shape={tuple(topk_indices.shape)} "
                 f"lse shape={tuple(lse.shape)}"
@@ -1060,12 +1093,48 @@ class DataParallelPPOActor(BasePPOActor):
                                 f"position_ids_shape={tuple(model_inputs['position_ids'].shape)}"
                             )
                         loss, sdpo_metrics = self._compute_sdpo_logit_loss(model_inputs, temperature=temperature)
+                        _debug_shapes_bwd = os.getenv("SDPO_T_DEBUG_SHAPES", "0").strip().lower() in {"1", "true", "yes", "on"}
                         loss = loss * torch.sum(response_mask) * self.world_size / total_response_tokens
+                        if _debug_shapes_bwd and self.rank == 0:
+                            print(
+                                f"[SDPO_T_SHAPE] step=S01 SCALED_LOSS "
+                                f"shape={tuple(loss.shape)} dtype={loss.dtype} "
+                                f"requires_grad={loss.requires_grad} "
+                                f"grad_fn={loss.grad_fn} value={loss.item():.6f}"
+                            )
+                            # Walk the full grad_fn chain from the scaled loss
+                            gf = loss.grad_fn
+                            for _step_i in range(30):
+                                if gf is None:
+                                    break
+                                nf = gf.next_functions
+                                nf_info = []
+                                for f, idx in (nf if nf else []):
+                                    nf_info.append(f"{type(f).__name__}[{idx}]" if f else f"None[{idx}]")
+                                print(
+                                    f"[SDPO_T_SHAPE] step=S01_chain[{_step_i}] "
+                                    f"node={type(gf).__name__} next={nf_info}"
+                                )
+                                # Follow first branch
+                                gf = nf[0][0] if nf else None
+                            # Hook on scaled loss
+                            if loss.requires_grad:
+                                def _scaled_loss_hook(grad):
+                                    print(
+                                        f"[SDPO_T_BACKWARD] step=B00 scaled_loss grad "
+                                        f"shape={tuple(grad.shape)} dtype={grad.dtype} "
+                                        f"numel={grad.numel()}"
+                                    )
+                                    return grad
+                                loss.register_hook(_scaled_loss_hook)
+                            print(f"[SDPO_T_BACKWARD] step=B_START calling loss.backward() NOW")
                         if self._sdpo_backward_shape_debug:
                             with torch.autograd.detect_anomaly(check_nan=True):
                                 loss.backward()
                         else:
                             loss.backward()
+                        if _debug_shapes_bwd and self.rank == 0:
+                            print(f"[SDPO_T_BACKWARD] step=B_END loss.backward() completed successfully")
                         append_to_dict(metrics, sdpo_metrics)
                     else:
                         raise ValueError(f"Unknown actor.loss_mode: {self.config.loss_mode}")
