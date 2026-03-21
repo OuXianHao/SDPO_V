@@ -593,18 +593,19 @@ class DataParallelPPOActor(BasePPOActor):
     ) -> dict[str, torch.Tensor]:
         """Extract top-k log-probabilities from response logits.
 
-        Uses ``log_softmax`` + ``topk`` instead of separate ``topk`` +
-        ``logsumexp`` to avoid creating two backward references to the full
-        ``(B, N, V)`` logits tensor.  The dual-reference pattern
-        (``topk(logits)`` + ``logsumexp(logits)``) causes
-        ``SplitWithSizesBackward0`` errors under FSDP because both ops
-        produce independent backward paths through the same flat-parameter
-        split.  ``log_softmax`` has a fused backward kernel that creates
-        only a single reference — matching the pattern used by the standard
-        PPO path (``log_softmax`` + ``gather``) which is proven to work.
+        Uses ``topk(logits)`` with a detached ``logsumexp(logits)`` for
+        normalization — matching the proven SDPO reference implementation.
+        This avoids placing a ``LogSoftmaxBackward0`` node in the backward
+        graph.  That node materialises a dense ``(B, N, V)`` gradient
+        during backward which, under FSDP with ``use_orig_params=True``
+        and gradient checkpointing, causes ``SplitWithSizesBackward0`` to
+        receive a gradient of 2× the expected flat-parameter size.
 
-        Since ``log_softmax`` is monotonic, ``topk(log_softmax(x))`` returns
-        the same indices as ``topk(x)``.
+        The returned ``topk_logps`` equal ``log_softmax(logits)`` at the
+        top-k positions (since ``topk_logits − logsumexp == log_softmax``
+        at those positions), so forward values are unchanged.  The backward
+        gradient flows only through ``TopkBackward0`` (sparse, K entries
+        per token position) — no dense full-vocab backward node.
 
         Args:
             logits: ``(batch, response_len, vocab_size)`` — response logits
@@ -612,10 +613,7 @@ class DataParallelPPOActor(BasePPOActor):
             k: number of top tokens.
             topk_indices: optional pre-computed indices from another
                 distribution (student's indices reused for teacher).
-            detach_lse: if True, detach the log_softmax result before topk
-                so gradients only flow sparsely through gathered entries.
-                (Kept for API compatibility; less important now that the
-                dual-reference issue is resolved.)
+            detach_lse: ignored (kept for API compatibility).
 
         Returns:
             dict with ``topk_logps``, ``topk_indices``, ``logsumexp``.
@@ -646,71 +644,42 @@ class DataParallelPPOActor(BasePPOActor):
                 gf = nexts[0][0] if nexts else None
             print(f"[SDPO_T_SHAPE] step=E02 logits grad_fn_chain caller={_caller} chain={chain}")
 
-        # Single fused backward through log_softmax — avoids the dual
-        # topk + logsumexp backward references that trigger FSDP errors.
-        log_probs = torch.log_softmax(logits, dim=-1)  # (batch, resp_len, vocab)
-
-        if _debug and self.rank == 0:
-            print(
-                f"[SDPO_T_SHAPE] step=E03 log_probs caller={_caller} "
-                f"shape={tuple(log_probs.shape)} dtype={log_probs.dtype} "
-                f"requires_grad={log_probs.requires_grad} "
-                f"is_contiguous={log_probs.is_contiguous()} stride={log_probs.stride()} "
-                f"grad_fn={log_probs.grad_fn}"
-            )
-            # Register backward hook on log_probs (full-vocab intermediate) —
-            # this is the tensor between topk and FSDP.
-            if log_probs.requires_grad and _caller == "student":
-                def _log_probs_bwd_hook(grad):
-                    print(
-                        f"[SDPO_T_BACKWARD] step=B03 log_probs grad "
-                        f"shape={tuple(grad.shape)} dtype={grad.dtype} "
-                        f"numel={grad.numel()} "
-                        f"is_contiguous={grad.is_contiguous()} stride={grad.stride()} "
-                        f"has_nan={bool(grad.isnan().any())} "
-                        f"has_inf={bool(grad.isinf().any())}"
-                    )
-                    return grad
-                log_probs.register_hook(_log_probs_bwd_hook)
-
-        if detach_lse:
-            # Detach to make gradient sparse (only through gathered entries).
-            log_probs_for_topk = log_probs.detach()
-        else:
-            log_probs_for_topk = log_probs
-
-        if _debug and self.rank == 0 and _caller == "student":
-            print(
-                f"[SDPO_T_SHAPE] step=E04 log_probs_for_topk caller={_caller} "
-                f"requires_grad={log_probs_for_topk.requires_grad} "
-                f"is_same_as_log_probs={log_probs_for_topk.data_ptr() == log_probs.data_ptr()} "
-                f"detach_lse={detach_lse}"
-            )
+        # Match the SDPO reference pattern: topk(logits) with detached
+        # logsumexp for normalization.  This avoids LogSoftmaxBackward0
+        # in the backward graph — that node creates a dense (B, R, V)
+        # intermediate during backward that causes a 2x gradient-size
+        # mismatch at FSDP's SplitWithSizesBackward0 boundary.
+        #
+        # Gradient flows only through topk_logits (sparse, K entries per
+        # position via TopkBackward0 or GatherBackward0), matching the
+        # proven SDPO reference implementation.
+        with torch.no_grad():
+            lse = torch.logsumexp(logits, dim=-1, keepdim=True)  # (batch, resp_len, 1)
 
         if topk_indices is None:
-            topk_logps, topk_indices = torch.topk(log_probs_for_topk, k, dim=-1)
+            topk_logits, topk_indices = torch.topk(logits, k, dim=-1)
             if _debug and self.rank == 0:
                 print(
                     f"[SDPO_T_SHAPE] step=E05 topk (fresh) caller={_caller} "
-                    f"topk_logps shape={tuple(topk_logps.shape)} stride={topk_logps.stride()} "
-                    f"is_contiguous={topk_logps.is_contiguous()} "
-                    f"requires_grad={topk_logps.requires_grad} grad_fn={topk_logps.grad_fn} "
+                    f"topk_logits shape={tuple(topk_logits.shape)} stride={topk_logits.stride()} "
+                    f"is_contiguous={topk_logits.is_contiguous()} "
+                    f"requires_grad={topk_logits.requires_grad} grad_fn={topk_logits.grad_fn} "
                     f"topk_indices shape={tuple(topk_indices.shape)} dtype={topk_indices.dtype}"
                 )
         else:
-            topk_logps = torch.gather(log_probs_for_topk, dim=-1, index=topk_indices)
+            topk_logits = torch.gather(logits, dim=-1, index=topk_indices)
             if _debug and self.rank == 0:
                 print(
                     f"[SDPO_T_SHAPE] step=E05 gather caller={_caller} "
-                    f"topk_logps shape={tuple(topk_logps.shape)} stride={topk_logps.stride()} "
-                    f"is_contiguous={topk_logps.is_contiguous()} "
-                    f"requires_grad={topk_logps.requires_grad} grad_fn={topk_logps.grad_fn} "
+                    f"topk_logits shape={tuple(topk_logits.shape)} stride={topk_logits.stride()} "
+                    f"is_contiguous={topk_logits.is_contiguous()} "
+                    f"requires_grad={topk_logits.requires_grad} grad_fn={topk_logits.grad_fn} "
                     f"topk_indices shape={tuple(topk_indices.shape)}"
                 )
 
-        # Compute logsumexp for metrics compatibility (detached — no grad needed).
-        with torch.no_grad():
-            lse = torch.logsumexp(logits, dim=-1)  # (batch, resp_len)
+        # Proper log-probs: topk_logits - logsumexp.  Grad only through topk_logits.
+        topk_logps = topk_logits - lse  # (batch, resp_len, k)
+        lse = lse.squeeze(-1)  # (batch, resp_len) — for return value compatibility
 
         if _debug and self.rank == 0:
             print(
