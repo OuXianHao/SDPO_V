@@ -284,12 +284,25 @@ class DataParallelPPOActor(BasePPOActor):
             logits = full_logits[:, -response_length - 1 : -1, :]
         else:
             # Decide whether to use the FSDP-safe response-only lm_head path.
-            sdpo_topk_mode = (
-                getattr(self.config, "loss_mode", None) == "sdpo_logit"
-                and getattr(self.config, "sdpo_approx_mode", "topk") in ("topk", "student_topk_tail")
-            )
+            #
+            # DISABLED: The response_only_logits optimization sliced hidden_states
+            # before lm_head inside the FSDP forward context.  This created a
+            # SliceBackward0 node on hidden_states whose backward path confused
+            # FSDP's flat-parameter management — the root FSDP unit's
+            # SplitWithSizesBackward0 received a gradient of 2x the expected size.
+            #
+            # The original dual-backward-reference issue (topk + logsumexp both
+            # referencing the full logits tensor) has been fixed by switching to
+            # log_softmax + topk in _extract_topk_logps.  That approach creates a
+            # single fused backward through log_softmax, so the full-logits path
+            # is now safe.
+            #
+            # To re-enable, set SDPO_FORCE_RESPONSE_ONLY=1.  This is kept for
+            # future debugging if the memory savings are needed and the FSDP
+            # backward issue is separately resolved.
+            force_response_only = os.getenv("SDPO_FORCE_RESPONSE_ONLY", "0").strip().lower() in {"1", "true", "yes", "on"}
             force_full_logits = os.getenv("SDPO_FORCE_FULL_LOGITS", "0").strip().lower() in {"1", "true", "yes", "on"}
-            use_response_only = sdpo_topk_mode and (not force_full_logits)
+            use_response_only = force_response_only and (not force_full_logits)
 
             if use_response_only:
                 # Pass response_only_logits=response_length through the top-level
@@ -329,20 +342,12 @@ class DataParallelPPOActor(BasePPOActor):
                 logits = output.logits
 
                 # Verify the model actually honored response_only_logits.
-                # If it didn't (patch not applied), the logits will be
-                # (batch, full_seq_len, vocab) instead of (batch, response_length, vocab).
-                # Do NOT silently fall back — that re-enters the dangerous
-                # full-sequence backward path that causes SplitWithSizesBackward0.
                 if logits.size(1) != response_length:
                     raise RuntimeError(
-                        f"[SDPO FATAL] response_only_logits={response_length} was NOT "
+                        f"[SDPO] response_only_logits={response_length} was NOT "
                         f"honored by the live model forward. Returned logits shape "
                         f"{tuple(logits.shape)} (expected seq_dim={response_length}). "
-                        f"The VL model forward patch is NOT active. "
-                        f"Ensure apply_vl_forward_patch() is called in "
-                        f"_build_model_optimizer() BEFORE model construction. "
-                        f"Do NOT fall back to full-sequence logits — that path "
-                        f"causes SplitWithSizesBackward0 gradient failures."
+                        f"Ensure apply_vl_forward_patch() is called before model construction."
                     )
                 logits = logits / temperature
                 if self.rank == 0:
