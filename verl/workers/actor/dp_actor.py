@@ -791,38 +791,97 @@ class DataParallelPPOActor(BasePPOActor):
             else:
                 print(f"[SDPO_T_SHAPE] actor_module is NOT FSDP-wrapped: {type(self.actor_module).__name__}")
 
-        # ---- Teacher forward FIRST (no grad) ----
-        # Run teacher before student so that FSDP's internal execution-order
-        # tracking state reflects the student forward (which is the one that
-        # backward will follow).  Running student last ensures FSDP's
-        # pre/post-forward bookkeeping is consistent with the backward pass.
-        teacher_forward_start = time.perf_counter()
-        with torch.no_grad():
-            if _debug_shapes and self.rank == 0:
-                print(
-                    f"[SDPO_T_BRANCH] step=T00 teacher forward ENTRY "
-                    f"fsdp_wrapped={isinstance(self.actor_module, FSDP)}"
-                )
-            teacher_logits = self._forward_response_logits(
-                model_inputs,
-                temperature=temperature,
-                input_ids=teacher_input_ids,
-                attention_mask=teacher_attention_mask,
-                position_ids=teacher_position_ids,
-                multi_modal_inputs=teacher_multi_modal_inputs,
-            )
-            if _debug_shapes and self.rank == 0:
-                print(
-                    f"[SDPO_T_BRANCH] step=T01 teacher forward EXIT "
-                    f"teacher_logits shape={tuple(teacher_logits.shape)} "
-                    f"requires_grad={teacher_logits.requires_grad}"
-                )
-        teacher_forward_elapsed_ms = (time.perf_counter() - teacher_forward_start) * 1000.0
+        # ---- Experiment gate: SDPO_EXP selects which experiment to run ----
+        #   0 = default (teacher-first, student-last, original behaviour)
+        #   1 = SKIP teacher forward entirely; use detached student logits as
+        #       "teacher".  Tests: is the double-forward the root cause?
+        #   2 = Run student FIRST, then teacher.  Tests: does forward order
+        #       matter for FSDP's execution-order bookkeeping?
+        #   3 = Run teacher-first + student-last but call
+        #       actor_module._reset_lazy_init() between them.  Tests: can
+        #       resetting FSDP root state between forwards fix the issue?
+        _sdpo_exp = int(os.getenv("SDPO_EXP", "0"))
+        if _debug_shapes and self.rank == 0:
+            print(f"[SDPO_T_BRANCH] step=EXP SDPO_EXP={_sdpo_exp}")
 
-        # ---- Student forward LAST (with grad) ----
-        student_forward_start = time.perf_counter()
-        student_logits = self._forward_response_logits(model_inputs, temperature=temperature)
-        student_forward_elapsed_ms = (time.perf_counter() - student_forward_start) * 1000.0
+        if _sdpo_exp == 1:
+            # ---- EXPERIMENT 1: no teacher forward at all ----
+            # Run student only; teacher = detached copy of student logits.
+            # This produces meaningless KL (KL(p||p)=0) but tests whether
+            # backward succeeds when there is exactly ONE forward through FSDP.
+            student_forward_start = time.perf_counter()
+            student_logits = self._forward_response_logits(model_inputs, temperature=temperature)
+            student_forward_elapsed_ms = (time.perf_counter() - student_forward_start) * 1000.0
+            teacher_logits = student_logits.detach().clone()
+            teacher_forward_elapsed_ms = 0.0
+            if self.rank == 0:
+                print("[SDPO_T_EXP1] teacher=detached_student, single FSDP forward")
+
+        elif _sdpo_exp == 2:
+            # ---- EXPERIMENT 2: student FIRST, then teacher ----
+            # Reverses the forward order.  If FSDP's execution-order tracking
+            # is the culprit, this should ALSO crash — but the error might
+            # differ (confirming order-sensitivity) or it might succeed
+            # (if FSDP only cares about the LAST forward matching backward).
+            student_forward_start = time.perf_counter()
+            student_logits = self._forward_response_logits(model_inputs, temperature=temperature)
+            student_forward_elapsed_ms = (time.perf_counter() - student_forward_start) * 1000.0
+            teacher_forward_start = time.perf_counter()
+            with torch.no_grad():
+                teacher_logits = self._forward_response_logits(
+                    model_inputs,
+                    temperature=temperature,
+                    input_ids=teacher_input_ids,
+                    attention_mask=teacher_attention_mask,
+                    position_ids=teacher_position_ids,
+                    multi_modal_inputs=teacher_multi_modal_inputs,
+                )
+            teacher_forward_elapsed_ms = (time.perf_counter() - teacher_forward_start) * 1000.0
+            if self.rank == 0:
+                print("[SDPO_T_EXP2] student-first, teacher-second (reversed order)")
+
+        else:
+            # ---- Default (exp 0) or exp 3: teacher FIRST, student LAST ----
+            teacher_forward_start = time.perf_counter()
+            with torch.no_grad():
+                if _debug_shapes and self.rank == 0:
+                    print(
+                        f"[SDPO_T_BRANCH] step=T00 teacher forward ENTRY "
+                        f"fsdp_wrapped={isinstance(self.actor_module, FSDP)}"
+                    )
+                teacher_logits = self._forward_response_logits(
+                    model_inputs,
+                    temperature=temperature,
+                    input_ids=teacher_input_ids,
+                    attention_mask=teacher_attention_mask,
+                    position_ids=teacher_position_ids,
+                    multi_modal_inputs=teacher_multi_modal_inputs,
+                )
+                if _debug_shapes and self.rank == 0:
+                    print(
+                        f"[SDPO_T_BRANCH] step=T01 teacher forward EXIT "
+                        f"teacher_logits shape={tuple(teacher_logits.shape)} "
+                        f"requires_grad={teacher_logits.requires_grad}"
+                    )
+            teacher_forward_elapsed_ms = (time.perf_counter() - teacher_forward_start) * 1000.0
+
+            if _sdpo_exp == 3:
+                # ---- EXPERIMENT 3: reset FSDP lazy init between forwards ----
+                # Attempts to clear stale execution-order state left by the
+                # teacher forward.  If the crash disappears, it confirms the
+                # double-forward corrupts FSDP's _exec_order_data.
+                if isinstance(self.actor_module, FSDP):
+                    if hasattr(self.actor_module, '_reset_lazy_init'):
+                        self.actor_module._reset_lazy_init()
+                        if self.rank == 0:
+                            print("[SDPO_T_EXP3] called _reset_lazy_init() between forwards")
+                    else:
+                        if self.rank == 0:
+                            print("[SDPO_T_EXP3] _reset_lazy_init not available, skipping reset")
+
+            student_forward_start = time.perf_counter()
+            student_logits = self._forward_response_logits(model_inputs, temperature=temperature)
+            student_forward_elapsed_ms = (time.perf_counter() - student_forward_start) * 1000.0
 
         # --- Debug: teacher/student response span alignment ---
         responses = model_inputs["responses"]
