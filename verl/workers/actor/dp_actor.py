@@ -333,15 +333,12 @@ class DataParallelPPOActor(BasePPOActor):
             # FSDP's flat-parameter management — the root FSDP unit's
             # SplitWithSizesBackward0 received a gradient of 2x the expected size.
             #
-            # The original dual-backward-reference issue (topk + logsumexp both
-            # referencing the full logits tensor) has been fixed by switching to
-            # log_softmax + topk in _extract_topk_logps.  That approach creates a
-            # single fused backward through log_softmax, so the full-logits path
-            # is now safe.
+            # The dual-backward-reference issue (topk + logsumexp both
+            # referencing the full logits tensor) is resolved by making logits
+            # .contiguous() before returning (default path below), so both
+            # backward paths accumulate into the copy first.
             #
-            # To re-enable, set SDPO_FORCE_RESPONSE_ONLY=1.  This is kept for
-            # future debugging if the memory savings are needed and the FSDP
-            # backward issue is separately resolved.
+            # To re-enable response_only_logits, set SDPO_FORCE_RESPONSE_ONLY=1.
             force_response_only = os.getenv("SDPO_FORCE_RESPONSE_ONLY", "0").strip().lower() in {"1", "true", "yes", "on"}
             force_full_logits = os.getenv("SDPO_FORCE_FULL_LOGITS", "0").strip().lower() in {"1", "true", "yes", "on"}
             use_response_only = force_response_only and (not force_full_logits)
@@ -432,7 +429,15 @@ class DataParallelPPOActor(BasePPOActor):
                     if self.rank == 0:
                         print(f"[SDPO_FWD_EXP3] in-place div + slice (no contiguous), logits shape={tuple(logits.shape)}")
                 else:
-                    logits = full_logits[:, -response_length - 1 : -1, :] / temperature
+                    # .contiguous() creates a fresh tensor, breaking the view
+                    # relationship with the model output.  This is required so
+                    # that dual backward references in _extract_topk_logps
+                    # (topk + logsumexp) both accumulate into this tensor first,
+                    # then flow back as a single gradient through CopyBackward0
+                    # — avoiding the FSDP SplitWithSizesBackward0 2x-gradient
+                    # mismatch that occurs when two backward paths reach a
+                    # shared view of the flat-parameter output.
+                    logits = (full_logits[:, -response_length - 1 : -1, :] / temperature).contiguous()
 
                 if self._sdpo_backward_shape_debug and self.rank == 0:
                     print(
@@ -635,19 +640,18 @@ class DataParallelPPOActor(BasePPOActor):
     ) -> dict[str, torch.Tensor]:
         """Extract top-k log-probabilities from response logits.
 
-        Uses ``topk(logits)`` with a detached ``logsumexp(logits)`` for
-        normalization — matching the proven SDPO reference implementation.
-        This avoids placing a ``LogSoftmaxBackward0`` node in the backward
-        graph.  That node materialises a dense ``(B, N, V)`` gradient
-        during backward which, under FSDP with ``use_orig_params=True``
-        and gradient checkpointing, causes ``SplitWithSizesBackward0`` to
-        receive a gradient of 2× the expected flat-parameter size.
-
+        Uses ``topk(logits)`` with a live ``logsumexp(logits)`` for
+        normalization — matching the original SDPO reference implementation.
         The returned ``topk_logps`` equal ``log_softmax(logits)`` at the
-        top-k positions (since ``topk_logits − logsumexp == log_softmax``
-        at those positions), so forward values are unchanged.  The backward
-        gradient flows only through ``TopkBackward0`` (sparse, K entries
-        per token position) — no dense full-vocab backward node.
+        top-k positions.  Gradient flows through both the gathered top-k
+        values (via ``GatherBackward0``) and the logsumexp normalizer,
+        giving the correct log-softmax gradient:
+        ``d(topk_logps_j)/d(logit_i) = 1_{i=j} - softmax(logit_i)``.
+
+        The logsumexp backward creates a dense ``(B, R, V)`` gradient.
+        To prevent FSDP ``SplitWithSizesBackward0`` 2x-gradient mismatches,
+        callers must ensure ``logits`` is a contiguous tensor (not a view
+        of the model output).  See ``_forward_response_logits``.
 
         Args:
             logits: ``(batch, response_len, vocab_size)`` — response logits
@@ -686,17 +690,21 @@ class DataParallelPPOActor(BasePPOActor):
                 gf = nexts[0][0] if nexts else None
             print(f"[SDPO_T_SHAPE] step=E02 logits grad_fn_chain caller={_caller} chain={chain}")
 
-        # Match the SDPO reference pattern: topk(logits) with detached
-        # logsumexp for normalization.  This avoids LogSoftmaxBackward0
-        # in the backward graph — that node creates a dense (B, R, V)
-        # intermediate during backward that causes a 2x gradient-size
-        # mismatch at FSDP's SplitWithSizesBackward0 boundary.
+        # Match the SDPO reference pattern: topk(logits) with live
+        # logsumexp for normalization — gradient flows through both the
+        # gathered topk values AND the logsumexp normalizer.  This gives
+        # the correct log_softmax gradient:
+        #   d(topk_logps_j)/d(logit_i) = 1_{i=j} - softmax(logit_i)
+        # The softmax correction term (from logsumexp backward) pushes
+        # down all vocab logits proportionally to their probability,
+        # redistributing mass from non-top-k to top-k positions.
         #
-        # Gradient flows only through topk_logits (sparse, K entries per
-        # position via TopkBackward0 or GatherBackward0), matching the
-        # proven SDPO reference implementation.
-        with torch.no_grad():
-            lse = torch.logsumexp(logits, dim=-1, keepdim=True)  # (batch, resp_len, 1)
+        # Previously logsumexp was detached to avoid an FSDP
+        # SplitWithSizesBackward0 2x-gradient mismatch.  That issue is
+        # now resolved by making the logits .contiguous() in
+        # _forward_response_logits, so the dual backward paths (topk +
+        # logsumexp) accumulate into the contiguous copy first.
+        lse = torch.logsumexp(logits, dim=-1, keepdim=True)  # (batch, resp_len, 1)
 
         if topk_indices is None:
             # Select indices without gradient (removes TopkBackward0 from the
@@ -724,7 +732,7 @@ class DataParallelPPOActor(BasePPOActor):
                     f"topk_indices shape={tuple(topk_indices.shape)}"
                 )
 
-        # Proper log-probs: topk_logits - logsumexp.  Grad only through topk_logits.
+        # Proper log-probs: topk_logits - logsumexp.  Grad through both terms.
         topk_logps = topk_logits - lse  # (batch, resp_len, k)
         lse = lse.squeeze(-1)  # (batch, resp_len) — for return value compatibility
 
