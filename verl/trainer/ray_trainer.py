@@ -643,6 +643,111 @@ class RayPPOTrainer:
 
         raise ValueError(f"Unsupported sdpo feedback mode: {mode}")
 
+    def _export_problem_id_stats(self, batch: DataProto, global_step: int) -> dict[str, float]:
+        """Aggregate rollout results by problem_id and export stats files.
+
+        Writes three files into ``{save_checkpoint_path}/problem_id_stats/step_{global_step}/``:
+
+        * ``valid_problem_ids.txt``   – one problem_id per line (mixed groups only)
+        * ``problem_id_stats.jsonl``  – per-problem_id JSON records
+        * ``summary.json``           – high-level counts and ratios
+
+        Returns a small metrics dict for logging.
+        """
+        if "problem_id" not in batch.non_tensor_batch:
+            print(
+                "[problem_id_stats] WARNING: 'problem_id' not found in batch.non_tensor_batch. "
+                "Skipping export. Make sure your parquet/dataset contains a 'problem_id' column."
+            )
+            return {}
+
+        problem_ids = batch.non_tensor_batch["problem_id"]
+        accuracy_reward = np.asarray(batch.non_tensor_batch["accuracy_reward"], dtype=np.float32)
+
+        # Aggregate by problem_id
+        pid2stats: dict[str, dict] = {}
+        for pid, acc in zip(problem_ids, accuracy_reward):
+            pid_key = str(pid)
+            if pid_key not in pid2stats:
+                pid2stats[pid_key] = {"problem_id": pid, "num_rollouts": 0, "num_correct": 0, "num_wrong": 0}
+            pid2stats[pid_key]["num_rollouts"] += 1
+            if float(acc) >= 1.0 - 1e-6:
+                pid2stats[pid_key]["num_correct"] += 1
+            else:
+                pid2stats[pid_key]["num_wrong"] += 1
+
+        # Classify each problem_id
+        valid_pids = []
+        all_correct_pids = []
+        all_wrong_pids = []
+        records = []
+        for pid_key in sorted(pid2stats.keys()):
+            entry = pid2stats[pid_key]
+            nc, nw = entry["num_correct"], entry["num_wrong"]
+            if nc > 0 and nw > 0:
+                status = "valid"
+                valid_pids.append(entry["problem_id"])
+            elif nw == 0:
+                status = "all_correct"
+                all_correct_pids.append(entry["problem_id"])
+            else:
+                status = "all_wrong"
+                all_wrong_pids.append(entry["problem_id"])
+            records.append({
+                "problem_id": entry["problem_id"],
+                "num_rollouts": entry["num_rollouts"],
+                "num_correct": nc,
+                "num_wrong": nw,
+                "status": status,
+            })
+
+        # Write files
+        out_dir = os.path.join(self.config.trainer.save_checkpoint_path, "problem_id_stats", f"step_{global_step}")
+        os.makedirs(out_dir, exist_ok=True)
+
+        valid_path = os.path.join(out_dir, "valid_problem_ids.txt")
+        with open(valid_path, "w", encoding="utf-8") as f:
+            for pid in valid_pids:
+                f.write(f"{pid}\n")
+
+        stats_path = os.path.join(out_dir, "problem_id_stats.jsonl")
+        with open(stats_path, "w", encoding="utf-8") as f:
+            for rec in records:
+                # Ensure problem_id is serializable (convert numpy types)
+                serializable_rec = {k: (int(v) if isinstance(v, (np.integer,)) else v) for k, v in rec.items()}
+                f.write(json.dumps(serializable_rec, ensure_ascii=False) + "\n")
+
+        total = len(pid2stats)
+        n_valid = len(valid_pids)
+        n_all_correct = len(all_correct_pids)
+        n_all_wrong = len(all_wrong_pids)
+        valid_ratio = n_valid / max(total, 1)
+
+        summary = {
+            "global_step": global_step,
+            "total_problem_ids": total,
+            "valid_problem_ids": n_valid,
+            "all_correct_problem_ids": n_all_correct,
+            "all_wrong_problem_ids": n_all_wrong,
+            "valid_ratio": round(valid_ratio, 4),
+        }
+        summary_path = os.path.join(out_dir, "summary.json")
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
+
+        print(
+            f"[problem_id_stats] step={global_step} total={total} valid={n_valid} "
+            f"all_correct={n_all_correct} all_wrong={n_all_wrong} valid_ratio={valid_ratio:.4f} "
+            f"dir={out_dir}"
+        )
+
+        return {
+            "problem_id_stats/total": float(total),
+            "problem_id_stats/valid": float(n_valid),
+            "problem_id_stats/all_correct": float(n_all_correct),
+            "problem_id_stats/all_wrong": float(n_all_wrong),
+            "problem_id_stats/valid_ratio": valid_ratio,
+        }
 
     def _balance_batch(self, batch: DataProto, metrics: dict[str, Any], logging_prefix: str = "global_seqlen") -> None:
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
@@ -856,6 +961,8 @@ class RayPPOTrainer:
                             batch, mode=self.config.algorithm.sdpo_feedback_mode
                         )
                         metrics.update(sdpo_skip_metrics)
+                        pid_stats_metrics = self._export_problem_id_stats(batch, global_step=self.global_step)
+                        metrics.update(pid_stats_metrics)
                     else:
                         # apply kl penalty if available
                         if not self.config.algorithm.use_kl_loss and self.use_reference_policy:
