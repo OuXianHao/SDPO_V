@@ -28,7 +28,8 @@ from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from ...protocol import DataProto, batch_collate
-from ...trainer.core_algos import compute_grpo_loss, compute_sdpo_logit_loss
+from ...trainer.core_algos import compute_grpo_loss, compute_sdpo_logit_loss, compute_sdpo_v_loss, compute_sdpo_v_calibration_stats
+from ...utils.bad_video import construct_bad_video_inputs
 from ...utils.dataset import process_image, process_video
 from ...utils import torch_functional as VF
 from ...utils.py_functional import append_to_dict
@@ -93,6 +94,16 @@ class DataParallelPPOActor(BasePPOActor):
                     f"approx_mode={self.config.sdpo_approx_mode}, "
                     f"alpha={self.config.sdpo_alpha}"
                 )
+                if self.config.sdpo_v_enabled:
+                    print(
+                        f"[actor] sdpo_v ENABLED: weight={self.config.sdpo_v_weight}, "
+                        f"topk={self.config.sdpo_v_topk}, margin={self.config.sdpo_v_margin}, "
+                        f"bad_video_mode={self.config.sdpo_v_bad_video_mode}, "
+                        f"blur_sigma={self.config.sdpo_v_blur_sigma}, "
+                        f"blur_fraction={self.config.sdpo_v_blur_fraction}, "
+                        f"drop_fraction={self.config.sdpo_v_drop_fraction}, "
+                        f"calibration={self.config.sdpo_v_calibration}"
+                    )
 
         self._sdpo_backward_shape_debug = os.getenv("SDPO_BACKWARD_SHAPE_DEBUG", "0").strip().lower() in {
             "1",
@@ -1089,7 +1100,165 @@ class DataParallelPPOActor(BasePPOActor):
                 f"build_teacher_ms={build_elapsed_ms:.2f} teacher_forward_ms={teacher_forward_elapsed_ms:.2f} "
                 f"student_forward_ms={student_forward_elapsed_ms:.2f}"
             )
+
+        # ================================================================
+        # SDPO-V: visual separation loss (good-video vs bad-video)
+        # Only runs when sdpo_v_enabled=True. Default-off preserves SDPO-T.
+        # ================================================================
+        if self.config.sdpo_v_enabled:
+            sdpo_v_loss, sdpo_v_metrics = self._compute_sdpo_v_loss(
+                model_inputs=model_inputs,
+                student_logits=student_logits,
+                temperature=temperature,
+            )
+            # Joint objective: sdpo_t_loss + weight * sdpo_v_loss
+            combined_loss = sdpo_loss + self.config.sdpo_v_weight * sdpo_v_loss
+            metrics.update({f"sdpo_v/{k}": v for k, v in sdpo_v_metrics.items()})
+            metrics["sdpo/combined_loss"] = combined_loss.detach().item()
+            metrics["sdpo/t_loss"] = sdpo_loss.detach().item()
+            return combined_loss, metrics
+
         return sdpo_loss, metrics
+
+    def _compute_sdpo_v_loss(
+        self,
+        model_inputs: dict[str, Any],
+        student_logits: torch.Tensor,
+        temperature: float,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Compute SDPO-V visual separation loss.
+
+        This method:
+        1. Constructs bad-video multimodal inputs by degrading pixel_values_videos
+        2. Runs a forward pass with bad-video inputs (same text/response tokens)
+        3. Extracts good-branch and bad-branch top-k log-probs at the same
+           good-selected top-k indices
+        4. Computes a token-level margin hinge loss
+
+        Only samples with overall reward == 1 participate (sdpo_v_valid_mask).
+        """
+        _debug = self.config.sdpo_v_debug
+
+        # ---- SDPO-V response mask: response_mask & sdpo_v_valid_mask ----
+        # sdpo_v_valid_mask selects samples where accuracy_reward == 1
+        sdpo_v_mask = (
+            model_inputs["response_mask"].bool()
+            & model_inputs["response_token_mask"].bool()
+            & model_inputs["sdpo_v_valid_mask"].bool()
+        )
+        num_v_valid = int(sdpo_v_mask.any(dim=-1).sum().item())
+
+        if _debug and self.rank == 0:
+            print(
+                f"[sdpo_v] ENTRY num_v_valid_samples={num_v_valid}/{model_inputs['responses'].shape[0]} "
+                f"bad_video_mode={self.config.sdpo_v_bad_video_mode} "
+                f"margin={self.config.sdpo_v_margin} topk={self.config.sdpo_v_topk}"
+            )
+
+        # ---- Construct bad-video multimodal inputs ----
+        # Collate multimodal inputs from the micro-batch
+        mm_inputs = defaultdict(list)
+        if "multi_modal_inputs" in model_inputs:
+            mm_inputs = batch_collate(model_inputs["multi_modal_inputs"])
+            mm_inputs = {key: torch.cat(value, dim=0) for key, value in mm_inputs.items()}
+        else:
+            mm_inputs = {}
+
+        # Get video_grid_thw for frame-level degradation
+        video_grid_thw = mm_inputs.get("video_grid_thw", None)
+
+        bad_mm_inputs = construct_bad_video_inputs(
+            multi_modal_inputs=mm_inputs,
+            video_grid_thw=video_grid_thw,
+            mode=self.config.sdpo_v_bad_video_mode,
+            blur_sigma=self.config.sdpo_v_blur_sigma,
+            blur_fraction=self.config.sdpo_v_blur_fraction,
+            drop_fraction=self.config.sdpo_v_drop_fraction,
+        )
+
+        if _debug and self.rank == 0:
+            if "pixel_values_videos" in mm_inputs:
+                orig_pv = mm_inputs["pixel_values_videos"]
+                bad_pv = bad_mm_inputs["pixel_values_videos"]
+                diff = (orig_pv - bad_pv).abs().mean().item()
+                print(
+                    f"[sdpo_v] bad_video constructed: pixel_values shape={tuple(orig_pv.shape)} "
+                    f"mean_abs_diff={diff:.6f}"
+                )
+
+        # ---- Bad-video forward pass ----
+        # Use the same text tokens (input_ids, attention_mask, position_ids)
+        # but with degraded multimodal inputs. No gradient through teacher;
+        # gradient flows through the bad-video student forward.
+        bad_logits = self._forward_response_logits(
+            model_inputs,
+            temperature=temperature,
+            multi_modal_inputs=bad_mm_inputs,
+        )
+
+        if _debug and self.rank == 0:
+            print(
+                f"[sdpo_v] bad_logits shape={tuple(bad_logits.shape)} "
+                f"student_logits shape={tuple(student_logits.shape)}"
+            )
+
+        # ---- Extract top-k log-probs ----
+        # Good branch: student_logits (already computed in SDPO-T path)
+        # The good branch selects the top-k indices (anchor).
+        v_topk = self.config.sdpo_v_topk
+
+        # Good-branch top-k (indices selected from good/student logits)
+        # We need student_logits to still have grad for the good-branch score.
+        good_topk = self._extract_topk_logps(student_logits, k=v_topk)
+
+        # Bad-branch: gather at the SAME good-selected indices
+        bad_topk = self._extract_topk_logps(
+            bad_logits, k=v_topk, topk_indices=good_topk["topk_indices"]
+        )
+
+        good_topk_logps = good_topk["topk_logps"]  # (batch, resp_len, k)
+        bad_topk_logps = bad_topk["topk_logps"]    # (batch, resp_len, k)
+
+        # Optionally add tail bucket for proper distribution
+        if self.config.sdpo_v_use_tail:
+            def _add_tail(logps: torch.Tensor) -> torch.Tensor:
+                log_s = torch.logsumexp(logps, dim=-1, keepdim=True)
+                log_s = torch.clamp(log_s, max=-1e-7)
+                tail_logp = torch.log(-torch.expm1(log_s))
+                return torch.cat([logps, tail_logp], dim=-1)
+            good_topk_logps = _add_tail(good_topk_logps)
+            bad_topk_logps = _add_tail(bad_topk_logps)
+
+        # ---- Calibration mode: collect stats and return zero loss ----
+        if self.config.sdpo_v_calibration:
+            calib_stats = compute_sdpo_v_calibration_stats(
+                good_topk_logps=good_topk_logps.detach(),
+                bad_topk_logps=bad_topk_logps.detach(),
+                response_mask=sdpo_v_mask,
+            )
+            if self.rank == 0:
+                print(f"[sdpo_v_calibration] {calib_stats}")
+            # Return zero loss so training is unaffected during calibration
+            zero_loss = torch.tensor(0.0, device=student_logits.device, requires_grad=True)
+            return zero_loss, calib_stats
+
+        # ---- Compute SDPO-V margin loss ----
+        v_loss, v_metrics = compute_sdpo_v_loss(
+            good_topk_logps=good_topk_logps,
+            bad_topk_logps=bad_topk_logps,
+            response_mask=sdpo_v_mask,
+            margin=self.config.sdpo_v_margin,
+            use_tail=self.config.sdpo_v_use_tail,
+        )
+
+        if _debug and self.rank == 0:
+            print(
+                f"[sdpo_v] loss={v_loss.item():.6f} "
+                f"delta_mean={v_metrics.get('v_delta_mean', 0):.6f} "
+                f"active_frac={v_metrics.get('v_active_frac', 0):.4f}"
+            )
+
+        return v_loss, v_metrics
 
     def _optimizer_step(self) -> torch.Tensor:
         if isinstance(self.actor_module, FSDP):
@@ -1170,7 +1339,7 @@ class DataParallelPPOActor(BasePPOActor):
         if self.config.loss_mode == "grpo_on_policy":
             select_keys.extend(["old_log_probs", "advantages"])
         elif self.config.loss_mode == "sdpo_logit":
-            select_keys.extend(["sdpo_valid_mask", "response_token_mask"])
+            select_keys.extend(["sdpo_valid_mask", "response_token_mask", "sdpo_v_valid_mask"])
             non_tensor_select_keys.extend(
                 ["raw_prompt_text", "prompt_text", "feedback_text", "teacher_prompt_text", "multi_modal_data", "pad_token_id"]
             )

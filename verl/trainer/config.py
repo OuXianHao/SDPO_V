@@ -104,6 +104,32 @@ class AlgorithmConfig:
     sdpo_teacher_update_rate: float = 0.0
     """EMA update rate for teacher weights (0.0=frozen ref teacher, 0.05=original SDPO default)."""
 
+    # ---- SDPO-V (visual separation) settings ----
+    sdpo_v_enabled: bool = False
+    """Enable SDPO-V visual separation loss. When False, training is identical to SDPO-T only."""
+    sdpo_v_weight: float = 1.0
+    """Weight for the SDPO-V loss term in the joint objective."""
+    sdpo_v_topk: int = 100
+    """Number of top-k tokens for SDPO-V score computation."""
+    sdpo_v_use_tail: bool = False
+    """Whether to append tail bucket when computing SDPO-V top-k log-probs."""
+    sdpo_v_margin: float = 0.1
+    """Global margin for the SDPO-V hinge loss: L = max(0, margin - (s_good - s_bad))."""
+    sdpo_v_margin_mode: str = "constant"
+    """Margin mode for SDPO-V. Currently only 'constant' is supported."""
+    sdpo_v_bad_video_mode: str = "blur"
+    """Bad-video construction strategy: 'blur', 'drop', 'blur_and_drop'."""
+    sdpo_v_blur_sigma: float = 5.0
+    """Gaussian blur sigma for bad-video blur mode."""
+    sdpo_v_blur_fraction: float = 0.5
+    """Fraction of frames to blur (0.0 to 1.0)."""
+    sdpo_v_drop_fraction: float = 0.5
+    """Fraction of frames to drop (replaced by zeros) in drop mode."""
+    sdpo_v_debug: bool = False
+    """Enable extra SDPO-V debug logging."""
+    sdpo_v_calibration: bool = False
+    """Enable calibration mode: collect delta_t statistics instead of applying loss."""
+
 
 @dataclass
 class TrainerConfig:
@@ -179,6 +205,19 @@ class PPOConfig:
         self.worker.actor.sdpo_feedback_mode = self.algorithm.sdpo_feedback_mode
         self.worker.actor.sdpo_alpha = self.algorithm.sdpo_alpha
         self.worker.actor.sdpo_teacher_update_rate = self.algorithm.sdpo_teacher_update_rate
+        # SDPO-V config propagation
+        self.worker.actor.sdpo_v_enabled = self.algorithm.sdpo_v_enabled
+        self.worker.actor.sdpo_v_weight = self.algorithm.sdpo_v_weight
+        self.worker.actor.sdpo_v_topk = self.algorithm.sdpo_v_topk
+        self.worker.actor.sdpo_v_use_tail = self.algorithm.sdpo_v_use_tail
+        self.worker.actor.sdpo_v_margin = self.algorithm.sdpo_v_margin
+        self.worker.actor.sdpo_v_margin_mode = self.algorithm.sdpo_v_margin_mode
+        self.worker.actor.sdpo_v_bad_video_mode = self.algorithm.sdpo_v_bad_video_mode
+        self.worker.actor.sdpo_v_blur_sigma = self.algorithm.sdpo_v_blur_sigma
+        self.worker.actor.sdpo_v_blur_fraction = self.algorithm.sdpo_v_blur_fraction
+        self.worker.actor.sdpo_v_drop_fraction = self.algorithm.sdpo_v_drop_fraction
+        self.worker.actor.sdpo_v_debug = self.algorithm.sdpo_v_debug
+        self.worker.actor.sdpo_v_calibration = self.algorithm.sdpo_v_calibration
 
     def deep_post_init(self):
         recursive_post_init(self)
