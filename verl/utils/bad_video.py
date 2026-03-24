@@ -41,52 +41,82 @@ def _gaussian_kernel_1d(sigma: float, kernel_size: int, device: torch.device, dt
     return kernel
 
 
-def _gaussian_blur_frames(
-    frames: torch.Tensor,
+def _gaussian_blur_2d(
+    image: torch.Tensor,
+    sigma: float,
+) -> torch.Tensor:
+    """Apply 2D Gaussian blur to a (C, H, W) tensor."""
+    C, H, W = image.shape
+    kernel_size = max(int(math.ceil(sigma * 3)) | 1, 3)
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    kernel_1d = _gaussian_kernel_1d(sigma, kernel_size, image.device, image.dtype)
+    kernel_2d = kernel_1d.unsqueeze(0) * kernel_1d.unsqueeze(1)  # (K, K)
+    kernel_2d = kernel_2d.view(1, 1, kernel_size, kernel_size).expand(C, 1, -1, -1)
+    pad = kernel_size // 2
+    # (C, H, W) -> (1, C, H, W) for grouped conv2d
+    x = image.unsqueeze(0)
+    x_padded = F.pad(x, (pad, pad, pad, pad), mode="reflect")
+    blurred = F.conv2d(x_padded, kernel_2d, groups=C)
+    return blurred.squeeze(0)  # (C, H, W)
+
+
+def _blur_patchified_frame(
+    frame_patches: torch.Tensor,
+    h_patches: int,
+    w_patches: int,
+    patch_size: int,
+    temporal_patch_size: int,
+    in_channels: int,
     sigma: float = 5.0,
 ) -> torch.Tensor:
-    """Apply Gaussian blur to frames tensor.
+    """Apply true 2D spatial Gaussian blur to one temporal frame's patchified pixels.
+
+    The Qwen processor patchifies video frames into a flat tensor where each row
+    is a flattened spatiotemporal patch: (temporal_patch_size, in_channels, patch_size, patch_size).
+    Rows are laid out in (H_patches, W_patches) order.
+
+    This function reconstructs the spatial image, applies 2D blur, then
+    re-patchifies to the original shape.
 
     Args:
-        frames: (N, C, H, W) or (N, C*H*W) — if flattened, we cannot blur
-                spatially, so we blur along the feature dimension as a proxy.
-                For pixel_values_videos from Qwen2-VL, the shape is typically
-                (total_patches, patch_dim) where each row is a flattened patch.
+        frame_patches: (H_patches * W_patches, patch_dim) patchified pixels for
+            one temporal frame.
+        h_patches: Number of spatial patches in height.
+        w_patches: Number of spatial patches in width.
+        patch_size: Spatial patch size (pixels per patch side).
+        temporal_patch_size: Number of raw frames grouped per temporal patch.
+        in_channels: Number of color channels (typically 3).
         sigma: Gaussian blur sigma.
 
     Returns:
-        Blurred frames with same shape.
+        Blurred patches with the same shape as input.
     """
-    if frames.dim() == 2:
-        # pixel_values_videos is (total_visual_tokens, hidden_dim)
-        # Apply 1D blur along the hidden_dim as spatial proxy
-        kernel_size = max(int(math.ceil(sigma * 3)) | 1, 3)  # ensure odd
-        if kernel_size % 2 == 0:
-            kernel_size += 1
-        kernel = _gaussian_kernel_1d(sigma, kernel_size, frames.device, frames.dtype)
-        # Treat as (N, 1, D) for conv1d
-        x = frames.unsqueeze(1)  # (N, 1, D)
-        pad = kernel_size // 2
-        x_padded = F.pad(x, (pad, pad), mode="reflect")
-        blurred = F.conv1d(x_padded, kernel.view(1, 1, -1))
-        return blurred.squeeze(1)
-    elif frames.dim() == 4:
-        # (N, C, H, W) — proper 2D spatial blur
-        N, C, H, W = frames.shape
-        kernel_size = max(int(math.ceil(sigma * 3)) | 1, 3)
-        if kernel_size % 2 == 0:
-            kernel_size += 1
-        kernel_1d = _gaussian_kernel_1d(sigma, kernel_size, frames.device, frames.dtype)
-        kernel_2d = kernel_1d.unsqueeze(0) * kernel_1d.unsqueeze(1)  # (K, K)
-        kernel_2d = kernel_2d.view(1, 1, kernel_size, kernel_size).expand(C, 1, -1, -1)
-        pad = kernel_size // 2
-        x_padded = F.pad(frames, (pad, pad, pad, pad), mode="reflect")
-        blurred = F.conv2d(x_padded, kernel_2d, groups=C)
-        return blurred
-    else:
-        # Fallback: add Gaussian noise as degradation
-        noise = torch.randn_like(frames) * sigma * 0.01
-        return frames + noise
+    num_patches, patch_dim = frame_patches.shape
+    assert num_patches == h_patches * w_patches
+
+    # Reconstruct spatial form.
+    # Qwen processor layout per patch row: (temporal_patch_size, in_channels, patch_size, patch_size)
+    # Patches ordered as (H_patches, W_patches) in row-major.
+    frame = frame_patches.view(
+        h_patches, w_patches, temporal_patch_size, in_channels, patch_size, patch_size
+    )
+    # -> (temporal_patch_size * in_channels, H_patches * patch_size, W_patches * patch_size)
+    frame = frame.permute(2, 3, 0, 4, 1, 5).reshape(
+        temporal_patch_size * in_channels,
+        h_patches * patch_size,
+        w_patches * patch_size,
+    )
+
+    # Apply real 2D spatial Gaussian blur.
+    frame = _gaussian_blur_2d(frame, sigma)
+
+    # Re-patchify: reverse the reshape.
+    frame = frame.view(
+        temporal_patch_size, in_channels, h_patches, patch_size, w_patches, patch_size
+    )
+    frame = frame.permute(2, 4, 0, 1, 3, 5).reshape(num_patches, patch_dim)
+    return frame
 
 
 def construct_bad_video_inputs(
@@ -96,6 +126,9 @@ def construct_bad_video_inputs(
     blur_sigma: float = 5.0,
     blur_fraction: float = 0.5,
     drop_fraction: float = 0.5,
+    patch_size: int = 14,
+    temporal_patch_size: int = 2,
+    in_channels: int = 3,
 ) -> dict[str, torch.Tensor]:
     """Construct bad-video multimodal inputs by degrading pixel_values_videos.
 
@@ -116,6 +149,9 @@ def construct_bad_video_inputs(
         blur_sigma: Gaussian blur sigma.
         blur_fraction: Fraction of frames to blur.
         drop_fraction: Fraction of frames to drop (zero out).
+        patch_size: Spatial patch size from the vision config (default 14).
+        temporal_patch_size: Temporal patch size from the vision config (default 2).
+        in_channels: Number of input channels from the vision config (default 3).
 
     Returns:
         New dict with degraded pixel_values_videos (and all other keys
@@ -162,9 +198,15 @@ def construct_bad_video_inputs(
             for fi in blur_indices:
                 start = offset + int(fi.item()) * tokens_per_frame
                 end = start + tokens_per_frame
-                pixel_values[start:end] = _gaussian_blur_frames(
-                    pixel_values[start:end].unsqueeze(0), sigma=blur_sigma
-                ).squeeze(0)
+                pixel_values[start:end] = _blur_patchified_frame(
+                    pixel_values[start:end],
+                    h_patches=h_patches,
+                    w_patches=w_patches,
+                    patch_size=patch_size,
+                    temporal_patch_size=temporal_patch_size,
+                    in_channels=in_channels,
+                    sigma=blur_sigma,
+                )
 
         elif mode == "drop":
             num_drop = max(1, int(t_frames * drop_fraction))
@@ -188,9 +230,15 @@ def construct_bad_video_inputs(
             for fi in blur_indices:
                 start = offset + int(fi.item()) * tokens_per_frame
                 end = start + tokens_per_frame
-                pixel_values[start:end] = _gaussian_blur_frames(
-                    pixel_values[start:end].unsqueeze(0), sigma=blur_sigma
-                ).squeeze(0)
+                pixel_values[start:end] = _blur_patchified_frame(
+                    pixel_values[start:end],
+                    h_patches=h_patches,
+                    w_patches=w_patches,
+                    patch_size=patch_size,
+                    temporal_patch_size=temporal_patch_size,
+                    in_channels=in_channels,
+                    sigma=blur_sigma,
+                )
             for fi in drop_indices:
                 start = offset + int(fi.item()) * tokens_per_frame
                 end = start + tokens_per_frame
