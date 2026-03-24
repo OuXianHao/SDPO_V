@@ -201,6 +201,13 @@ class RayPPOTrainer:
                 f"approx_mode={config.algorithm.sdpo_approx_mode}, "
                 f"feedback_mode={config.algorithm.sdpo_feedback_mode}"
             )
+            if config.algorithm.sdpo_v_enabled:
+                print(
+                    f"[trainer] sdpo_v ENABLED: weight={config.algorithm.sdpo_v_weight}, "
+                    f"margin={config.algorithm.sdpo_v_margin}, topk={config.algorithm.sdpo_v_topk}, "
+                    f"bad_video_mode={config.algorithm.sdpo_v_bad_video_mode}, "
+                    f"calibration={config.algorithm.sdpo_v_calibration}"
+                )
 
         # define KL control
         if config.algorithm.disable_kl or self.loss_mode == "sdpo_logit":
@@ -607,10 +614,22 @@ class RayPPOTrainer:
             batch.non_tensor_batch["teacher_prompt_text"] = self._build_teacher_prompt_text_scalar(batch)
             batch.batch["sdpo_valid_mask"] = sdpo_valid_mask
 
+            # ---- SDPO-V validity mask: samples with accuracy_reward == 1 ----
+            # SDPO-V trains on correct samples only (reward == 1), which is
+            # different from SDPO-T's mixed-group gating logic.
+            # This mask is per-sample, broadcast to token level.
+            sample_reward_is_1 = np.isclose(accuracy_reward, 1.0)  # (batch_size,)
+            sdpo_v_valid_mask = (
+                response_mask
+                & torch.from_numpy(sample_reward_is_1).to(response_mask.device).unsqueeze(-1)
+            )
+            batch.batch["sdpo_v_valid_mask"] = sdpo_v_valid_mask
+
             sdpo_skip_metrics = {
                 "sdpo/num_all_correct_skipped": float(num_all_correct_skipped),
                 "sdpo/num_all_wrong_skipped": float(num_all_wrong_skipped),
                 "sdpo/num_mixed_kept": float(num_mixed_kept),
+                "sdpo_v/num_reward_1_samples": float(sample_reward_is_1.sum()),
             }
             return batch, sdpo_skip_metrics
 
@@ -633,11 +652,20 @@ class RayPPOTrainer:
             batch.non_tensor_batch["successful_sibling_text"] = successful_sibling_texts
             batch.batch["sdpo_valid_mask"] = response_mask & torch.from_numpy(sample_valid_mask).to(response_mask.device).unsqueeze(-1)
 
+            # ---- SDPO-V validity mask: samples with accuracy_reward == 1 ----
+            sample_reward_is_1 = np.isclose(accuracy_reward, 1.0)
+            sdpo_v_valid_mask = (
+                response_mask
+                & torch.from_numpy(sample_reward_is_1).to(response_mask.device).unsqueeze(-1)
+            )
+            batch.batch["sdpo_v_valid_mask"] = sdpo_v_valid_mask
+
             sdpo_skip_metrics = {
                 "sdpo/successful_rollout_failed_samples": float(failed_mask.sum().item()),
                 "sdpo/successful_rollout_kept_samples": float(sample_valid_mask.sum().item()),
                 "sdpo/successful_rollout_skipped_no_success_sibling": float((failed_mask & ~has_successful_sibling).sum().item()),
                 "sdpo/successful_rollout_skipped_self_success": float((~failed_mask).sum().item()),
+                "sdpo_v/num_reward_1_samples": float(sample_reward_is_1.sum()),
             }
             return batch, sdpo_skip_metrics
 

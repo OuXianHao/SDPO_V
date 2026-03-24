@@ -886,6 +886,137 @@ def compute_sdpo_logit_loss(
     return loss, metrics
 
 
+def compute_sdpo_v_loss(
+    good_topk_logps: torch.Tensor,
+    bad_topk_logps: torch.Tensor,
+    response_mask: torch.Tensor,
+    margin: float = 0.1,
+    use_tail: bool = False,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """SDPO-V visual separation loss.
+
+    Computes a token-level margin hinge loss that encourages the good-video
+    branch to assign higher average log-probability (on good-selected top-k
+    tokens) than the bad-video branch.
+
+    Loss per token:
+        L_t = max(0, margin - (s_good_t - s_bad_t))
+
+    where s_t = mean of top-k log-probs at position t.
+
+    Args:
+        good_topk_logps: (batch, resp_len, k) — proper log-probs from good branch.
+        bad_topk_logps:  (batch, resp_len, k) — proper log-probs from bad branch,
+                         gathered at the SAME good-selected top-k indices.
+        response_mask:   (batch, resp_len) — boolean mask for valid response tokens.
+        margin: Global constant margin.
+        use_tail: Whether the log-probs include a tail bucket (last dim).
+
+    Returns:
+        loss: Scalar loss tensor.
+        metrics: Dict of float metrics for logging.
+    """
+    mask_f = response_mask.float()
+    valid_count = mask_f.sum().clamp_min(1.0)
+
+    # Compute per-token scores: mean log-prob over the top-k dimension
+    # If use_tail, we use all k+1 categories; otherwise just the k top tokens.
+    # Score = mean(log_prob) over the token subset at each position.
+    s_good = good_topk_logps.mean(dim=-1)  # (batch, resp_len)
+    s_bad = bad_topk_logps.mean(dim=-1)    # (batch, resp_len)
+
+    # Token-level delta and hinge loss
+    delta = s_good - s_bad  # (batch, resp_len), positive means good > bad
+    hinge = torch.clamp(margin - delta, min=0.0)  # (batch, resp_len)
+
+    # Masked reduction
+    masked_hinge = hinge * mask_f
+    loss = masked_hinge.sum() / valid_count
+
+    # Metrics (all detached)
+    with torch.no_grad():
+        delta_masked = delta * mask_f
+        delta_mean = delta_masked.sum() / valid_count
+        delta_sq = (delta ** 2) * mask_f
+        delta_var = delta_sq.sum() / valid_count - delta_mean ** 2
+        delta_std = delta_var.clamp_min(0.0).sqrt()
+
+        # Fraction of tokens where hinge is active (margin not met)
+        active_frac = ((hinge > 0).float() * mask_f).sum() / valid_count
+
+        # Fraction of tokens where good > bad (delta > 0)
+        positive_frac = ((delta > 0).float() * mask_f).sum() / valid_count
+
+    metrics = {
+        "v_loss": loss.detach().item(),
+        "v_margin": margin,
+        "v_delta_mean": delta_mean.item(),
+        "v_delta_std": delta_std.item(),
+        "v_active_frac": active_frac.item(),
+        "v_positive_frac": positive_frac.item(),
+        "v_s_good_mean": (s_good.detach() * mask_f).sum().item() / valid_count.item(),
+        "v_s_bad_mean": (s_bad.detach() * mask_f).sum().item() / valid_count.item(),
+    }
+    return loss, metrics
+
+
+def compute_sdpo_v_calibration_stats(
+    good_topk_logps: torch.Tensor,
+    bad_topk_logps: torch.Tensor,
+    response_mask: torch.Tensor,
+) -> dict[str, float]:
+    """Collect delta_t = s_good - s_bad statistics for margin calibration.
+
+    Returns percentile-based summary statistics to help choose a good margin.
+
+    Args:
+        good_topk_logps: (batch, resp_len, k)
+        bad_topk_logps:  (batch, resp_len, k) — gathered at same indices
+        response_mask:   (batch, resp_len) — boolean mask
+
+    Returns:
+        Dict with count, mean, std, p10, p25, p50, p75, p90 of delta_t,
+        plus a recommended_margin (p25 of delta).
+    """
+    with torch.no_grad():
+        s_good = good_topk_logps.mean(dim=-1)  # (batch, resp_len)
+        s_bad = bad_topk_logps.mean(dim=-1)
+        delta = s_good - s_bad  # (batch, resp_len)
+
+        # Flatten and select valid tokens
+        valid_mask = response_mask.bool().view(-1)
+        delta_flat = delta.view(-1)
+        valid_deltas = delta_flat[valid_mask]
+
+        if valid_deltas.numel() == 0:
+            return {
+                "calib_count": 0, "calib_mean": 0.0, "calib_std": 0.0,
+                "calib_p10": 0.0, "calib_p25": 0.0, "calib_p50": 0.0,
+                "calib_p75": 0.0, "calib_p90": 0.0,
+                "calib_recommended_margin": 0.0,
+            }
+
+        count = valid_deltas.numel()
+        mean = valid_deltas.mean().item()
+        std = valid_deltas.std().item() if count > 1 else 0.0
+
+        percentiles = torch.tensor([0.1, 0.25, 0.5, 0.75, 0.9], device=valid_deltas.device)
+        quantiles = torch.quantile(valid_deltas.float(), percentiles)
+        p10, p25, p50, p75, p90 = [q.item() for q in quantiles]
+
+        return {
+            "calib_count": count,
+            "calib_mean": mean,
+            "calib_std": std,
+            "calib_p10": p10,
+            "calib_p25": p25,
+            "calib_p50": p50,
+            "calib_p75": p75,
+            "calib_p90": p90,
+            "calib_recommended_margin": p25,
+        }
+
+
 def compute_value_loss(
     vpreds: torch.Tensor,
     returns: torch.Tensor,

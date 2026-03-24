@@ -148,6 +148,19 @@ class ActorConfig:
     sdpo_feedback_mode: str = field(default="successful_rollout", init=False)
     sdpo_alpha: Optional[float] = field(default=None, init=False)
     sdpo_teacher_update_rate: float = field(default=0.0, init=False)
+    # ---- SDPO-V auto-keys (set from AlgorithmConfig) ----
+    sdpo_v_enabled: bool = field(default=False, init=False)
+    sdpo_v_weight: float = field(default=1.0, init=False)
+    sdpo_v_topk: int = field(default=100, init=False)
+    sdpo_v_use_tail: bool = field(default=False, init=False)
+    sdpo_v_margin: float = field(default=0.1, init=False)
+    sdpo_v_margin_mode: str = field(default="constant", init=False)
+    sdpo_v_bad_video_mode: str = field(default="blur", init=False)
+    sdpo_v_blur_sigma: float = field(default=5.0, init=False)
+    sdpo_v_blur_fraction: float = field(default=0.5, init=False)
+    sdpo_v_drop_fraction: float = field(default=0.5, init=False)
+    sdpo_v_debug: bool = field(default=False, init=False)
+    sdpo_v_calibration: bool = field(default=False, init=False)
 
 
 @dataclass
