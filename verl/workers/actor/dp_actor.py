@@ -1167,6 +1167,12 @@ class DataParallelPPOActor(BasePPOActor):
         # Get video_grid_thw for frame-level degradation
         video_grid_thw = mm_inputs.get("video_grid_thw", None)
 
+        # Extract vision config for proper spatial blur reconstruction.
+        _vcfg = getattr(getattr(self.actor_module, "config", None), "vision_config", None)
+        _patch_size = getattr(_vcfg, "patch_size", 14)
+        _temporal_patch_size = getattr(_vcfg, "temporal_patch_size", 2)
+        _in_channels = getattr(_vcfg, "in_channels", 3)
+
         bad_mm_inputs = construct_bad_video_inputs(
             multi_modal_inputs=mm_inputs,
             video_grid_thw=video_grid_thw,
@@ -1174,6 +1180,9 @@ class DataParallelPPOActor(BasePPOActor):
             blur_sigma=self.config.sdpo_v_blur_sigma,
             blur_fraction=self.config.sdpo_v_blur_fraction,
             drop_fraction=self.config.sdpo_v_drop_fraction,
+            patch_size=_patch_size,
+            temporal_patch_size=_temporal_patch_size,
+            in_channels=_in_channels,
         )
 
         if _debug and self.rank == 0:
