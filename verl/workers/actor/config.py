@@ -161,6 +161,14 @@ class ActorConfig:
     sdpo_v_drop_fraction: float = field(default=0.5, init=False)
     sdpo_v_debug: bool = field(default=False, init=False)
     sdpo_v_calibration: bool = field(default=False, init=False)
+    # ---- SDPO-V soft-KL auto-keys (set from AlgorithmConfig) ----
+    sdpo_v_softkl_enabled: bool = field(default=False, init=False)
+    sdpo_v_softkl_weight: float = field(default=1.0, init=False)
+    sdpo_v_softkl_topk: int = field(default=100, init=False)
+    sdpo_v_softkl_tau: float = field(default=1.0, init=False)
+    sdpo_v_softkl_use_tail: bool = field(default=False, init=False)
+    sdpo_v_softkl_debug: bool = field(default=False, init=False)
+    sdpo_v_softkl_use_ema_bad_ref: bool = field(default=True, init=False)
 
 
 @dataclass

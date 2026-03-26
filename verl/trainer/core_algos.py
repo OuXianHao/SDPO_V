@@ -1017,6 +1017,81 @@ def compute_sdpo_v_calibration_stats(
         }
 
 
+def compute_sdpo_v_softkl_loss(
+    good_topk_logps: torch.Tensor,
+    bad_ref_topk_logps: torch.Tensor,
+    response_mask: torch.Tensor,
+    tau: float = 1.0,
+    use_tail: bool = False,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """SDPO-V soft-capped forward KL loss.
+
+    Computes a token-level forward KL divergence between the good-video branch
+    (reference/anchor) and the bad-video EMA reference branch, then applies a
+    soft cap to produce a bounded, smooth reward-like signal.
+
+    For each valid token position t:
+        KL_t = D_KL(p_good || p_bad_ref) = sum_k p_good_k * (log p_good_k - log p_bad_ref_k)
+        phi(KL_t) = tau * (1 - exp(-KL_t / tau))
+        L = -mean_t phi(KL_t)
+
+    Args:
+        good_topk_logps:     (batch, resp_len, k) — log-probs from good branch
+                             (proper log-probs normalized by full vocab logsumexp).
+        bad_ref_topk_logps:  (batch, resp_len, k) — log-probs from bad-video EMA
+                             reference branch, gathered at the SAME good-selected
+                             top-k indices.
+        response_mask:       (batch, resp_len) — boolean mask for valid response tokens.
+        tau:  Soft-cap temperature. phi(x) = tau * (1 - exp(-x / tau)).
+        use_tail: Whether the log-probs include a tail bucket (last dim).
+
+    Returns:
+        loss: Scalar loss tensor (negative of mean soft-capped KL).
+        metrics: Dict of float metrics for logging.
+    """
+    mask_f = response_mask.float()
+    valid_count = mask_f.sum().clamp_min(1.0)
+
+    # ---- Renormalize to local distributions on the top-k (or k+1) subset ----
+    # Input logps are proper log-probs (logit - logsumexp over full vocab).
+    # We need local distributions over just the k categories.
+    good_local_logps = good_topk_logps - torch.logsumexp(good_topk_logps, dim=-1, keepdim=True)
+    bad_local_logps = bad_ref_topk_logps - torch.logsumexp(bad_ref_topk_logps, dim=-1, keepdim=True)
+
+    # ---- Token-level forward KL: D_KL(p_good || p_bad_ref) ----
+    # = sum_k p_good_k * (log p_good_k - log p_bad_ref_k)
+    good_probs = good_local_logps.exp()  # (batch, resp_len, k)
+    kl_per_category = good_probs * (good_local_logps - bad_local_logps)  # (batch, resp_len, k)
+    # Clamp individual terms to avoid NaN from 0 * (-inf)
+    kl_per_category = kl_per_category.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
+    kl_t = kl_per_category.sum(dim=-1)  # (batch, resp_len)
+    # Forward KL should be >= 0; clamp for numerical safety
+    kl_t = kl_t.clamp_min(0.0)
+
+    # ---- Soft cap: phi(x) = tau * (1 - exp(-x / tau)) ----
+    tau_safe = max(tau, 1e-8)
+    phi_t = tau_safe * (1.0 - torch.exp(-kl_t / tau_safe))  # (batch, resp_len)
+
+    # ---- Masked reduction: L = -mean(phi(KL_t)) ----
+    masked_phi = phi_t * mask_f
+    loss = -(masked_phi.sum() / valid_count)
+
+    # ---- Metrics (all detached) ----
+    with torch.no_grad():
+        kl_masked = kl_t * mask_f
+        kl_mean = kl_masked.sum() / valid_count
+        phi_mean = masked_phi.sum() / valid_count
+
+    metrics = {
+        "vsk_loss": loss.detach().item(),
+        "vsk_tau": tau,
+        "vsk_kl_raw_mean": kl_mean.item(),
+        "vsk_kl_capped_mean": phi_mean.item(),
+        "vsk_valid_tokens": int(valid_count.item()),
+    }
+    return loss, metrics
+
+
 def compute_value_loss(
     vpreds: torch.Tensor,
     returns: torch.Tensor,
