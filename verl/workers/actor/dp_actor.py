@@ -1218,20 +1218,30 @@ class DataParallelPPOActor(BasePPOActor):
                     f"mean_abs_diff={diff:.6f}"
                 )
 
-        # ---- Bad-video forward pass ----
+        # ---- Bad-video EMA reference forward (no_grad) ----
         # Use the same text tokens (input_ids, attention_mask, position_ids)
-        # but with degraded multimodal inputs. No gradient through teacher;
-        # gradient flows through the bad-video student forward.
-        bad_logits = self._forward_response_logits(
-            model_inputs,
-            temperature=temperature,
-            multi_modal_inputs=bad_mm_inputs,
-        )
+        # but with degraded multimodal inputs. The bad-video reference branch
+        # runs through the EMA teacher module under no_grad for stability,
+        # matching the soft-KL line's reference-branch design.
+        if self.teacher_module is not None and self.teacher_module is not self.actor_module:
+            bad_ref_module = self.teacher_module
+        else:
+            bad_ref_module = self.actor_module
 
+        with torch.no_grad():
+            bad_logits = self._forward_response_logits(
+                model_inputs,
+                temperature=temperature,
+                multi_modal_inputs=bad_mm_inputs,
+                module=bad_ref_module,
+            )
+
+        _ema_active = (bad_ref_module is not self.actor_module)
         if _debug and self.rank == 0:
             print(
                 f"[sdpo_v] bad_logits shape={tuple(bad_logits.shape)} "
-                f"student_logits shape={tuple(student_logits.shape)}"
+                f"student_logits shape={tuple(student_logits.shape)} "
+                f"ema_active={_ema_active} requires_grad={bad_logits.requires_grad}"
             )
 
         # ---- Extract top-k log-probs ----
