@@ -130,6 +130,22 @@ class AlgorithmConfig:
     sdpo_v_calibration: bool = False
     """Enable calibration mode: collect delta_t statistics instead of applying loss."""
 
+    # ---- SDPO-V soft-capped forward KL settings ----
+    sdpo_v_softkl_enabled: bool = False
+    """Enable SDPO-V soft-capped forward KL loss. Independent of the hinge line."""
+    sdpo_v_softkl_weight: float = 1.0
+    """Weight for the SDPO-V soft-KL loss term in the joint objective."""
+    sdpo_v_softkl_topk: int = 100
+    """Number of top-k tokens for the soft-KL distribution."""
+    sdpo_v_softkl_tau: float = 1.0
+    """Soft-cap temperature: phi(x) = tau * (1 - exp(-x / tau))."""
+    sdpo_v_softkl_use_tail: bool = False
+    """Whether to append tail bucket for proper distribution in soft-KL."""
+    sdpo_v_softkl_debug: bool = False
+    """Enable extra debug logging for the soft-KL line."""
+    sdpo_v_softkl_use_ema_bad_ref: bool = True
+    """Use EMA teacher module (no_grad) for the bad-video reference branch."""
+
 
 @dataclass
 class TrainerConfig:
@@ -218,6 +234,14 @@ class PPOConfig:
         self.worker.actor.sdpo_v_drop_fraction = self.algorithm.sdpo_v_drop_fraction
         self.worker.actor.sdpo_v_debug = self.algorithm.sdpo_v_debug
         self.worker.actor.sdpo_v_calibration = self.algorithm.sdpo_v_calibration
+        # SDPO-V soft-KL config propagation
+        self.worker.actor.sdpo_v_softkl_enabled = self.algorithm.sdpo_v_softkl_enabled
+        self.worker.actor.sdpo_v_softkl_weight = self.algorithm.sdpo_v_softkl_weight
+        self.worker.actor.sdpo_v_softkl_topk = self.algorithm.sdpo_v_softkl_topk
+        self.worker.actor.sdpo_v_softkl_tau = self.algorithm.sdpo_v_softkl_tau
+        self.worker.actor.sdpo_v_softkl_use_tail = self.algorithm.sdpo_v_softkl_use_tail
+        self.worker.actor.sdpo_v_softkl_debug = self.algorithm.sdpo_v_softkl_debug
+        self.worker.actor.sdpo_v_softkl_use_ema_bad_ref = self.algorithm.sdpo_v_softkl_use_ema_bad_ref
 
     def deep_post_init(self):
         recursive_post_init(self)

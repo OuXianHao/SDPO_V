@@ -28,7 +28,7 @@ from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from ...protocol import DataProto, batch_collate
-from ...trainer.core_algos import compute_grpo_loss, compute_sdpo_logit_loss, compute_sdpo_v_loss, compute_sdpo_v_calibration_stats
+from ...trainer.core_algos import compute_grpo_loss, compute_sdpo_logit_loss, compute_sdpo_v_loss, compute_sdpo_v_calibration_stats, compute_sdpo_v_softkl_loss
 from ...utils.bad_video import construct_bad_video_inputs
 from ...utils.dataset import process_image, process_video
 from ...utils import torch_functional as VF
@@ -103,6 +103,13 @@ class DataParallelPPOActor(BasePPOActor):
                         f"blur_fraction={self.config.sdpo_v_blur_fraction}, "
                         f"drop_fraction={self.config.sdpo_v_drop_fraction}, "
                         f"calibration={self.config.sdpo_v_calibration}"
+                    )
+                if self.config.sdpo_v_softkl_enabled:
+                    print(
+                        f"[actor] sdpo_v_softkl ENABLED: weight={self.config.sdpo_v_softkl_weight}, "
+                        f"topk={self.config.sdpo_v_softkl_topk}, tau={self.config.sdpo_v_softkl_tau}, "
+                        f"use_tail={self.config.sdpo_v_softkl_use_tail}, "
+                        f"use_ema_bad_ref={self.config.sdpo_v_softkl_use_ema_bad_ref}"
                     )
 
         self._sdpo_backward_shape_debug = os.getenv("SDPO_BACKWARD_SHAPE_DEBUG", "0").strip().lower() in {
@@ -1102,18 +1109,34 @@ class DataParallelPPOActor(BasePPOActor):
             )
 
         # ================================================================
-        # SDPO-V: visual separation loss (good-video vs bad-video)
-        # Only runs when sdpo_v_enabled=True. Default-off preserves SDPO-T.
+        # SDPO-V: visual separation losses (good-video vs bad-video)
+        # Hinge line: sdpo_v_enabled. Soft-KL line: sdpo_v_softkl_enabled.
+        # Both are default-off and can coexist independently.
         # ================================================================
+        combined_loss = sdpo_loss
+        has_v_component = False
+
         if self.config.sdpo_v_enabled:
             sdpo_v_loss, sdpo_v_metrics = self._compute_sdpo_v_loss(
                 model_inputs=model_inputs,
                 student_logits=student_logits,
                 temperature=temperature,
             )
-            # Joint objective: sdpo_t_loss + weight * sdpo_v_loss
-            combined_loss = sdpo_loss + self.config.sdpo_v_weight * sdpo_v_loss
+            combined_loss = combined_loss + self.config.sdpo_v_weight * sdpo_v_loss
             metrics.update({f"sdpo_v/{k}": v for k, v in sdpo_v_metrics.items()})
+            has_v_component = True
+
+        if self.config.sdpo_v_softkl_enabled:
+            sdpo_v_sk_loss, sdpo_v_sk_metrics = self._compute_sdpo_v_softkl_loss(
+                model_inputs=model_inputs,
+                student_logits=student_logits,
+                temperature=temperature,
+            )
+            combined_loss = combined_loss + self.config.sdpo_v_softkl_weight * sdpo_v_sk_loss
+            metrics.update({f"sdpo_v_softkl/{k}": v for k, v in sdpo_v_sk_metrics.items()})
+            has_v_component = True
+
+        if has_v_component:
             metrics["sdpo/combined_loss"] = combined_loss.detach().item()
             metrics["sdpo/t_loss"] = sdpo_loss.detach().item()
             return combined_loss, metrics
@@ -1268,6 +1291,138 @@ class DataParallelPPOActor(BasePPOActor):
             )
 
         return v_loss, v_metrics
+
+    def _compute_sdpo_v_softkl_loss(
+        self,
+        model_inputs: dict[str, Any],
+        student_logits: torch.Tensor,
+        temperature: float,
+        bad_mm_inputs: Optional[dict[str, torch.Tensor]] = None,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Compute SDPO-V soft-capped forward KL loss.
+
+        This method:
+        1. Constructs bad-video multimodal inputs (or reuses pre-computed ones)
+        2. Runs a forward pass with bad-video inputs through the EMA teacher
+           module under no_grad (or actor_module fallback)
+        3. Extracts good-branch and bad-ref-branch top-k log-probs at the same
+           good-selected top-k indices
+        4. Computes a token-level soft-capped forward KL loss
+
+        Only samples with overall reward == 1 participate (sdpo_v_valid_mask).
+        """
+        _debug = self.config.sdpo_v_softkl_debug
+
+        # ---- SDPO-V response mask (shared with hinge line) ----
+        sdpo_v_mask = (
+            model_inputs["response_mask"].bool()
+            & model_inputs["response_token_mask"].bool()
+            & model_inputs["sdpo_v_valid_mask"].bool()
+        )
+        num_v_valid = int(sdpo_v_mask.any(dim=-1).sum().item())
+
+        if _debug and self.rank == 0:
+            print(
+                f"[sdpo_v_softkl] ENTRY num_v_valid_samples={num_v_valid}/{model_inputs['responses'].shape[0]} "
+                f"topk={self.config.sdpo_v_softkl_topk} tau={self.config.sdpo_v_softkl_tau} "
+                f"use_ema_bad_ref={self.config.sdpo_v_softkl_use_ema_bad_ref}"
+            )
+
+        # ---- Construct bad-video multimodal inputs (reuse if provided) ----
+        if bad_mm_inputs is None:
+            mm_inputs = defaultdict(list)
+            if "multi_modal_inputs" in model_inputs:
+                mm_inputs = batch_collate(model_inputs["multi_modal_inputs"])
+                mm_inputs = {key: torch.cat(value, dim=0) for key, value in mm_inputs.items()}
+            else:
+                mm_inputs = {}
+
+            video_grid_thw = mm_inputs.get("video_grid_thw", None)
+            _vcfg = getattr(getattr(self.actor_module, "config", None), "vision_config", None)
+            _patch_size = getattr(_vcfg, "patch_size", 14)
+            _temporal_patch_size = getattr(_vcfg, "temporal_patch_size", 2)
+            _in_channels = getattr(_vcfg, "in_channels", 3)
+
+            bad_mm_inputs = construct_bad_video_inputs(
+                multi_modal_inputs=mm_inputs,
+                video_grid_thw=video_grid_thw,
+                mode=self.config.sdpo_v_bad_video_mode,
+                blur_sigma=self.config.sdpo_v_blur_sigma,
+                blur_fraction=self.config.sdpo_v_blur_fraction,
+                drop_fraction=self.config.sdpo_v_drop_fraction,
+                patch_size=_patch_size,
+                temporal_patch_size=_temporal_patch_size,
+                in_channels=_in_channels,
+            )
+
+        # ---- Bad-video EMA reference forward (no_grad) ----
+        use_ema = self.config.sdpo_v_softkl_use_ema_bad_ref
+        if use_ema and self.teacher_module is not None and self.teacher_module is not self.actor_module:
+            bad_ref_module = self.teacher_module
+        else:
+            bad_ref_module = self.actor_module
+
+        ema_active = (bad_ref_module is not self.actor_module)
+
+        with torch.no_grad():
+            bad_ref_logits = self._forward_response_logits(
+                model_inputs,
+                temperature=temperature,
+                multi_modal_inputs=bad_mm_inputs,
+                module=bad_ref_module,
+            )
+
+        if _debug and self.rank == 0:
+            print(
+                f"[sdpo_v_softkl] bad_ref_logits shape={tuple(bad_ref_logits.shape)} "
+                f"ema_active={ema_active} requires_grad={bad_ref_logits.requires_grad}"
+            )
+
+        # ---- Extract top-k log-probs ----
+        sk_topk = self.config.sdpo_v_softkl_topk
+
+        # Good branch: student_logits (with grad), selects top-k indices
+        good_topk = self._extract_topk_logps(student_logits, k=sk_topk)
+
+        # Bad-ref branch: gather at the SAME good-selected indices (no grad)
+        bad_ref_topk = self._extract_topk_logps(
+            bad_ref_logits, k=sk_topk, topk_indices=good_topk["topk_indices"]
+        )
+
+        good_topk_logps = good_topk["topk_logps"]      # (batch, resp_len, k)
+        bad_ref_topk_logps = bad_ref_topk["topk_logps"]  # (batch, resp_len, k)
+
+        # Optionally add tail bucket
+        if self.config.sdpo_v_softkl_use_tail:
+            def _add_tail(logps: torch.Tensor) -> torch.Tensor:
+                log_s = torch.logsumexp(logps, dim=-1, keepdim=True)
+                log_s = torch.clamp(log_s, max=-1e-7)
+                tail_logp = torch.log(-torch.expm1(log_s))
+                return torch.cat([logps, tail_logp], dim=-1)
+            good_topk_logps = _add_tail(good_topk_logps)
+            bad_ref_topk_logps = _add_tail(bad_ref_topk_logps)
+
+        # ---- Compute soft-capped forward KL loss ----
+        sk_loss, sk_metrics = compute_sdpo_v_softkl_loss(
+            good_topk_logps=good_topk_logps,
+            bad_ref_topk_logps=bad_ref_topk_logps,
+            response_mask=sdpo_v_mask,
+            tau=self.config.sdpo_v_softkl_tau,
+            use_tail=self.config.sdpo_v_softkl_use_tail,
+        )
+
+        # Add EMA status to metrics
+        sk_metrics["vsk_ema_active"] = 1.0 if ema_active else 0.0
+
+        if _debug and self.rank == 0:
+            print(
+                f"[sdpo_v_softkl] loss={sk_loss.item():.6f} "
+                f"kl_raw_mean={sk_metrics.get('vsk_kl_raw_mean', 0):.6f} "
+                f"kl_capped_mean={sk_metrics.get('vsk_kl_capped_mean', 0):.6f} "
+                f"ema_active={ema_active}"
+            )
+
+        return sk_loss, sk_metrics
 
     def _optimizer_step(self) -> torch.Tensor:
         if isinstance(self.actor_module, FSDP):
