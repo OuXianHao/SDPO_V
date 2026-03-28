@@ -750,12 +750,12 @@ class RayPPOTrainer:
 
         gen_batch, pad_size = pad_dataproto_to_divisor(gen_batch, self.actor_rollout_ref_wg.world_size)
 
-        # Re-prepare the rollout engine for guideline generation
-        self.actor_rollout_ref_wg.prepare_rollout_engine()
+        # Use EMA teacher / ref weights for guideline generation
+        self.actor_rollout_ref_wg.prepare_teacher_rollout_engine()
         try:
             gen_output = self.actor_rollout_ref_wg.generate_sequences(gen_batch)
         finally:
-            self.actor_rollout_ref_wg.release_rollout_engine()
+            self.actor_rollout_ref_wg.release_teacher_rollout_engine()
 
         if pad_size > 0:
             gen_output = unpad_dataproto(gen_output, pad_size)
