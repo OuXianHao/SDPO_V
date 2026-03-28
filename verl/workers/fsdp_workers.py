@@ -647,6 +647,29 @@ class FSDPWorker(Worker):
     def release_rollout_engine(self):
         self.rollout_sharding_manager.offload_vllm()
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def prepare_teacher_rollout_engine(self):
+        """Load vLLM rollout engine with EMA teacher / ref weights instead of student actor weights."""
+        assert self._has_ref, "prepare_teacher_rollout_engine requires a reference model"
+        # Temporarily point the sharding manager at the ref module so that
+        # _sync_weight_to_vllm loads teacher weights into the vLLM engine.
+        self._rollout_module_backup = self.rollout_sharding_manager.module
+        self._rollout_offload_backup = self.rollout_sharding_manager.use_param_offload
+        self.rollout_sharding_manager.module = self.ref_fsdp_module
+        self.rollout_sharding_manager.use_param_offload = self._use_ref_param_offload
+        self.rollout_sharding_manager.load_vllm_and_sync_weights()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def release_teacher_rollout_engine(self):
+        """Offload vLLM rollout engine and restore sharding manager to use student actor weights."""
+        # Restore the original actor module and offload flag *before* offload
+        # so that offload_vllm()'s self.module.train() call targets the actor.
+        self.rollout_sharding_manager.module = self._rollout_module_backup
+        self.rollout_sharding_manager.use_param_offload = self._rollout_offload_backup
+        del self._rollout_module_backup
+        del self._rollout_offload_backup
+        self.rollout_sharding_manager.offload_vllm()
+
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
         assert self._has_rollout
