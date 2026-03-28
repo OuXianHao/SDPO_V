@@ -745,6 +745,7 @@ class RayPPOTrainer:
                 "max_pixels": self.config.data.max_pixels,
                 "video_fps": self.config.data.video_fps,
                 "temperature": 0.0,
+                "n": 1,
             },
         )
 
