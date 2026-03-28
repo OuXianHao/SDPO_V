@@ -18,6 +18,7 @@ This trainer supports model-agonistic model initialization with huggingface.
 
 import json
 import os
+import re
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -60,6 +61,53 @@ from .metrics import (
     compute_timing_metrics,
     reduce_metrics,
 )
+
+
+GUIDELINE_SUMMARY_PROMPT = """You are given multiple candidate reasoning traces for the same video multiple-choice question. Some are correct and some are incorrect.
+
+Your task is to analyze these rollouts based on the provided video, and produce a feedback guideline that can improve future reasoning on this sample.
+
+Instructions:
+- Identify the key reasoning patterns used by correct rollouts.
+- Identify the typical mistakes made by incorrect rollouts.
+- Focus on how to inspect the video evidence better.
+- Pay special attention to temporal sequence, transitions, object interactions, state changes, repeated actions, and mismatches between the video and the options.
+- Do NOT say which option is correct.
+- Avoid vague advice such as "reason carefully" or "pay attention to the video".
+- Make each guidance point concrete and operational.
+- The final "Actionable guidance" section should be the most important part, because it will be reused as guiding feedback for later reasoning.
+
+Output format:
+
+<guideline_analysis>
+Strengths of correct reasoning:
+- ...
+- ...
+
+Common mistakes to avoid:
+- ...
+- ...
+</guideline_analysis>
+
+<guideline_feedback>
+- ...
+- ...
+- ...
+- ...
+</guideline_feedback>
+
+Question:
+{question}
+
+Options:
+{options}
+
+Candidate rollouts:
+
+{rollout_blocks}
+
+Now write the guideline.
+"""
 
 
 class Role(IntEnum):
@@ -569,6 +617,216 @@ class RayPPOTrainer:
 
         return np.array(teacher_prompt_texts, dtype=object)
 
+    # ---- Guideline-based feedback helpers (SDPO-T only) ----
+
+    def _select_mixed_rollouts_per_uid(
+        self,
+        uids: np.ndarray,
+        accuracy_reward: np.ndarray,
+        response_texts: np.ndarray,
+    ) -> dict[str, list[tuple[str, bool]]]:
+        """Select up to 5 mixed (correct+incorrect) rollouts per uid for guideline generation."""
+        uid2rollouts: dict[str, list[tuple[str, bool]]] = defaultdict(list)
+        for idx, uid in enumerate(uids):
+            is_correct = bool(np.isclose(float(accuracy_reward[idx]), 1.0))
+            uid2rollouts[uid].append((str(response_texts[idx]), is_correct))
+
+        result: dict[str, list[tuple[str, bool]]] = {}
+        for uid, rollouts in uid2rollouts.items():
+            correct = [r for r in rollouts if r[1]]
+            incorrect = [r for r in rollouts if not r[1]]
+            if not correct or not incorrect:
+                continue
+            n_target = min(5, len(correct) + len(incorrect))
+            n_correct = max(1, min(len(correct), n_target // 2))
+            n_incorrect = n_target - n_correct
+            if n_incorrect > len(incorrect):
+                n_incorrect = len(incorrect)
+                n_correct = n_target - n_incorrect
+            result[uid] = correct[:n_correct] + incorrect[:n_incorrect]
+        return result
+
+    @staticmethod
+    def _parse_guideline_feedback(text: str) -> Optional[str]:
+        """Extract <guideline_feedback>...</guideline_feedback> block from generated text."""
+        match = re.search(r"<guideline_feedback>(.*?)</guideline_feedback>", text, re.DOTALL)
+        if match:
+            content = match.group(1).strip()
+            return content if content else None
+        return None
+
+    def _generate_guidelines(
+        self,
+        batch: DataProto,
+        uid_mixed_rollouts: dict[str, list[tuple[str, bool]]],
+    ) -> dict[str, Optional[str]]:
+        """Generate guideline feedback for each qualifying uid group using the rollout engine."""
+        from tensordict import TensorDict
+
+        uids = batch.non_tensor_batch["uid"]
+        raw_prompt_texts = batch.non_tensor_batch["raw_prompt_text"]
+        multi_modal_data_all = batch.non_tensor_batch.get("multi_modal_data", None)
+
+        # Map uid -> first index in batch (all samples in a uid share the same question/video)
+        uid2first_idx: dict[str, int] = {}
+        for idx, uid in enumerate(uids):
+            if uid not in uid2first_idx:
+                uid2first_idx[uid] = int(idx)
+
+        uid_order: list[str] = []
+        raw_prompt_ids_list: list[list[int]] = []
+        gen_multi_modal_data: list = []
+
+        apply_template = (
+            self.processor.apply_chat_template if self.processor is not None else self.tokenizer.apply_chat_template
+        )
+
+        for uid, rollouts in uid_mixed_rollouts.items():
+            first_idx = uid2first_idx[uid]
+            raw_prompt_text = str(raw_prompt_texts[first_idx])
+
+            # Build rollout blocks
+            blocks = []
+            for i, (text, is_correct) in enumerate(rollouts):
+                label = "CORRECT" if is_correct else "INCORRECT"
+                blocks.append(f"--- Rollout {i + 1} [{label}] ---\n{text}")
+            rollout_blocks_text = "\n\n".join(blocks)
+
+            question_text = raw_prompt_text.replace("<video>", "").strip()
+            guideline_body = GUIDELINE_SUMMARY_PROMPT.format(
+                question=question_text,
+                options="(included in question above)",
+                rollout_blocks=rollout_blocks_text,
+            )
+
+            # Prepend video marker if the original prompt uses video
+            content = f"<video>\n{guideline_body}" if "<video>" in raw_prompt_text else guideline_body
+            messages = [{"role": "user", "content": content}]
+            prompt_str = apply_template(messages, add_generation_prompt=True, tokenize=False)
+            raw_ids = self.tokenizer.encode(prompt_str, add_special_tokens=False)
+
+            uid_order.append(uid)
+            raw_prompt_ids_list.append(raw_ids)
+            gen_multi_modal_data.append(multi_modal_data_all[first_idx] if multi_modal_data_all is not None else None)
+
+        if not uid_order:
+            return {}
+
+        # Build simplified input_ids / attention_mask / position_ids for DataProto
+        # (vLLM generation uses raw_prompt_ids + multi_modal_data, not these tensors)
+        max_len = max(len(ids) for ids in raw_prompt_ids_list)
+        pad_token_id = self.tokenizer.pad_token_id or 0
+        padded_ids, padded_attn, padded_pos = [], [], []
+        for raw_ids in raw_prompt_ids_list:
+            ids_t = torch.tensor(raw_ids, dtype=torch.long)
+            pad_len = max_len - ids_t.size(0)
+            if pad_len > 0:
+                padded_ids.append(torch.cat([torch.full((pad_len,), pad_token_id, dtype=torch.long), ids_t]))
+                padded_attn.append(torch.cat([torch.zeros(pad_len, dtype=torch.long), torch.ones_like(ids_t)]))
+                padded_pos.append(torch.cat([torch.zeros(pad_len, dtype=torch.long), torch.arange(ids_t.size(0))]))
+            else:
+                padded_ids.append(ids_t)
+                padded_attn.append(torch.ones_like(ids_t))
+                padded_pos.append(torch.arange(ids_t.size(0)))
+
+        has_mm = any(d is not None for d in gen_multi_modal_data)
+        non_tensor = {"raw_prompt_ids": np.array(raw_prompt_ids_list, dtype=object)}
+        if has_mm:
+            non_tensor["multi_modal_data"] = np.array(gen_multi_modal_data, dtype=object)
+
+        gen_batch = DataProto(
+            batch=TensorDict(
+                {"input_ids": torch.stack(padded_ids), "attention_mask": torch.stack(padded_attn), "position_ids": torch.stack(padded_pos)},
+                batch_size=[len(uid_order)],
+            ),
+            non_tensor_batch=non_tensor,
+            meta_info={
+                "min_pixels": self.config.data.min_pixels,
+                "max_pixels": self.config.data.max_pixels,
+                "video_fps": self.config.data.video_fps,
+                "temperature": 0.0,
+            },
+        )
+
+        gen_batch, pad_size = pad_dataproto_to_divisor(gen_batch, self.actor_rollout_ref_wg.world_size)
+
+        # Re-prepare the rollout engine for guideline generation
+        self.actor_rollout_ref_wg.prepare_rollout_engine()
+        try:
+            gen_output = self.actor_rollout_ref_wg.generate_sequences(gen_batch)
+        finally:
+            self.actor_rollout_ref_wg.release_rollout_engine()
+
+        if pad_size > 0:
+            gen_output = unpad_dataproto(gen_output, pad_size)
+
+        # Decode responses and parse guideline blocks
+        response_ids = gen_output.batch["responses"]
+        response_mask = gen_output.batch["response_mask"]
+        uid_guidelines: dict[str, Optional[str]] = {}
+        for i, uid in enumerate(uid_order):
+            resp_len = int(response_mask[i].sum().item())
+            resp_text = self.tokenizer.decode(response_ids[i][:resp_len], skip_special_tokens=True)
+            uid_guidelines[uid] = self._parse_guideline_feedback(resp_text)
+
+        return uid_guidelines
+
+    def _build_teacher_prompt_text_guideline(
+        self,
+        raw_prompt_texts: np.ndarray,
+        uids: np.ndarray,
+        accuracy_reward: np.ndarray,
+        uid_guidelines: dict[str, Optional[str]],
+        successful_sibling_texts: np.ndarray,
+        has_successful_sibling: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
+        """Build teacher prompt text using guideline feedback, with fallback to successful rollout."""
+        format_prompt = self.config.worker.actor.teacher_format_prompt
+        teacher_prompt_texts = []
+        sample_valid_mask = np.zeros(len(uids), dtype=bool)
+        guideline_used = 0
+        fallback_used = 0
+
+        for idx in range(len(uids)):
+            uid = uids[idx]
+            raw_prompt_text = str(raw_prompt_texts[idx])
+            is_correct = bool(np.isclose(float(accuracy_reward[idx]), 1.0))
+
+            if is_correct:
+                content_text = raw_prompt_text
+            elif uid in uid_guidelines and uid_guidelines[uid] is not None:
+                content_text = (
+                    f"{raw_prompt_text}\n\n"
+                    "Guideline feedback:\n\n"
+                    f"{uid_guidelines[uid]}\n\n"
+                    "Correctly solve the original question."
+                )
+                sample_valid_mask[idx] = True
+                guideline_used += 1
+            elif has_successful_sibling[idx]:
+                content_text = (
+                    f"{raw_prompt_text}\n\n"
+                    "Correct solution:\n\n"
+                    f"{successful_sibling_texts[idx]}\n\n"
+                    "Correctly solve the original question."
+                )
+                sample_valid_mask[idx] = True
+                fallback_used += 1
+            else:
+                content_text = raw_prompt_text
+
+            if format_prompt and format_prompt != "":
+                teacher_prompt_text = Template(format_prompt.strip()).render(content=content_text)
+            else:
+                teacher_prompt_text = content_text
+            teacher_prompt_texts.append(teacher_prompt_text)
+
+        guideline_metrics = {
+            "sdpo/guideline_used_samples": float(guideline_used),
+            "sdpo/guideline_fallback_successful_rollout": float(fallback_used),
+        }
+        return np.array(teacher_prompt_texts, dtype=object), sample_valid_mask, guideline_metrics
+
     def _attach_sdpo_fields(self, batch: DataProto, mode: str = "scalar_text") -> tuple[DataProto, dict[str, float]]:
         if "accuracy_reward" not in batch.non_tensor_batch:
             raise KeyError(
@@ -667,6 +925,58 @@ class RayPPOTrainer:
                 "sdpo/successful_rollout_skipped_self_success": float((~failed_mask).sum().item()),
                 "sdpo_v/num_reward_1_samples": float(sample_reward_is_1.sum()),
             }
+            return batch, sdpo_skip_metrics
+
+        if mode == "guideline_mixed_rollouts":
+            response_texts = self._decode_response_texts(batch)
+
+            # Try guideline generation for uid groups with mixed correct/incorrect rollouts
+            uid_mixed_rollouts = self._select_mixed_rollouts_per_uid(uids, accuracy_reward, response_texts)
+            uid_guidelines: dict[str, Optional[str]] = {}
+            if uid_mixed_rollouts:
+                try:
+                    uid_guidelines = self._generate_guidelines(batch, uid_mixed_rollouts)
+                except Exception as e:
+                    print(f"[sdpo-guideline] Generation failed ({e}), falling back to successful_rollout for all.")
+                    uid_guidelines = {}
+
+            # Compute successful sibling texts for fallback
+            successful_sibling_texts, has_successful_sibling = self._sample_successful_sibling_texts(
+                uids=uids, accuracy_reward=accuracy_reward, response_texts=response_texts,
+            )
+
+            teacher_prompt_texts, sample_valid_mask, guideline_metrics = self._build_teacher_prompt_text_guideline(
+                raw_prompt_texts=batch.non_tensor_batch["raw_prompt_text"],
+                uids=uids,
+                accuracy_reward=accuracy_reward,
+                uid_guidelines=uid_guidelines,
+                successful_sibling_texts=successful_sibling_texts,
+                has_successful_sibling=has_successful_sibling,
+            )
+
+            batch.non_tensor_batch["teacher_prompt_text"] = teacher_prompt_texts
+            batch.non_tensor_batch["feedback_text"] = np.array(["" for _ in range(len(batch))], dtype=object)
+            batch.non_tensor_batch["successful_sibling_text"] = successful_sibling_texts
+            batch.batch["sdpo_valid_mask"] = (
+                response_mask & torch.from_numpy(sample_valid_mask).to(response_mask.device).unsqueeze(-1)
+            )
+
+            # SDPO-V validity mask (unchanged from other modes)
+            sample_reward_is_1 = np.isclose(accuracy_reward, 1.0)
+            sdpo_v_valid_mask = (
+                response_mask
+                & torch.from_numpy(sample_reward_is_1).to(response_mask.device).unsqueeze(-1)
+            )
+            batch.batch["sdpo_v_valid_mask"] = sdpo_v_valid_mask
+
+            failed_mask = accuracy_reward != 1.0
+            sdpo_skip_metrics = {
+                "sdpo/guideline_failed_samples": float(failed_mask.sum().item()),
+                "sdpo/guideline_kept_samples": float(sample_valid_mask.sum().item()),
+                "sdpo/guideline_skipped_self_success": float((~failed_mask).sum().item()),
+                "sdpo_v/num_reward_1_samples": float(sample_reward_is_1.sum()),
+            }
+            sdpo_skip_metrics.update(guideline_metrics)
             return batch, sdpo_skip_metrics
 
         raise ValueError(f"Unsupported sdpo feedback mode: {mode}")

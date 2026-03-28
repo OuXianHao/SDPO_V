@@ -99,6 +99,7 @@ class AlgorithmConfig:
     sdpo_use_tail: bool = True
     sdpo_approx_mode: str = "topk"
     sdpo_feedback_mode: str = "successful_rollout"
+    """SDPO-T feedback mode: 'successful_rollout', 'scalar_text', or 'guideline_mixed_rollouts'."""
     sdpo_alpha: Optional[float] = None
     """Alpha for divergence interpolation: 0.0=forward KL, 1.0=reverse KL, in-between=GJS. None=derive from sdpo_divergence."""
     sdpo_teacher_update_rate: float = 0.0
