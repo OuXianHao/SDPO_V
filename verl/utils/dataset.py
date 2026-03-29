@@ -32,7 +32,7 @@ from . import torch_functional as VF
 from .debug_dump import DEBUG_DUMP_WRITER
 
 
-_VIDEO_FIXED_FRAMES = 32
+_VIDEO_FIXED_FRAMES = 16
 _VIDEO_DEBUG_COUNTER = 0
 _VIDEO_SAMPLING_STATS = {
     "fixed_ok": 0,

@@ -99,18 +99,25 @@ def format_reward(response: str) -> float:
 
 def accuracy_reward(response: str, ground_truth: str) -> float:
     response = _normalize_response(response)
-    gt = str(ground_truth).strip().upper()
+    gt_raw = _normalize_response(ground_truth)
 
-    if gt not in _VALID_OPTION_SET:
+    # 格式不合法，accuracy 直接记 0
+    if format_reward(response) == 0.0:
         return 0.0
 
-    # 1) 优先从最后一个 <answer>...</answer> 中解析
+    # 解析 prediction
     given_answer = _extract_answer_content(response)
     pred = _extract_option_letter(given_answer) if given_answer is not None else None
 
-    # 2) 如果 answer block 里没解析出来，再退化到全文解析
-    if pred is None:
-        pred = _extract_option_letter(response)
+    # 解析 ground truth
+    gt_answer = _extract_answer_content(gt_raw)
+    if gt_answer is not None:
+        gt = _extract_option_letter(gt_answer)
+    else:
+        gt = _extract_option_letter(gt_raw)
+
+    if gt not in _VALID_OPTION_SET:
+        return 0.0
 
     return 1.0 if pred == gt else 0.0
 

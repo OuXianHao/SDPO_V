@@ -688,7 +688,7 @@ class RayPPOTrainer:
 
             # Build rollout blocks (truncate each rollout to prevent
             # progressive prompt bloat as student outputs get longer/messier)
-            _MAX_ROLLOUT_CHARS = 2048
+            _MAX_ROLLOUT_CHARS = 3072
             blocks = []
             for i, (text, is_correct) in enumerate(rollouts):
                 label = "CORRECT" if is_correct else "INCORRECT"
@@ -818,7 +818,7 @@ class RayPPOTrainer:
             elif uid in uid_guidelines and uid_guidelines[uid] is not None:
                 content_text = (
                     f"{raw_prompt_text}\n\n"
-                    "Guideline feedback:\n\n"
+                    "Here is some guidance that may help you solve the problem:\n\n"
                     f"{uid_guidelines[uid]}\n\n"
                     "Correctly solve the original question.\n"
                     "Important: Your final answer must be enclosed in exactly one pair of "
