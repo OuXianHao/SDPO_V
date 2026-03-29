@@ -63,6 +63,13 @@ from .metrics import (
 )
 
 
+def _sanitize_sibling_text(text: str) -> str:
+    """Remove <answer>/<think> tags from sibling text to avoid structural contamination in teacher prompts."""
+    text = re.sub(r"</?answer>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"</?think>", "", text, flags=re.IGNORECASE)
+    return text.strip()
+
+
 GUIDELINE_SUMMARY_PROMPT = """You are given multiple candidate reasoning traces for the same video multiple-choice question. Some are correct and some are incorrect.
 
 Your task is to analyze these rollouts based on the provided video, and produce a feedback guideline that can improve future reasoning on this sample.
@@ -563,18 +570,30 @@ class RayPPOTrainer:
 
     @staticmethod
     def _collect_successful_rollout_indices_per_uid(
-        uids: np.ndarray, accuracy_reward: np.ndarray
+        uids: np.ndarray,
+        accuracy_reward: np.ndarray,
+        format_reward: Optional[np.ndarray] = None,
     ) -> dict[Any, list[int]]:
         uid2successful_indices: dict[Any, list[int]] = defaultdict(list)
-        for idx, (uid, reward) in enumerate(zip(uids, accuracy_reward)):
-            if np.isclose(float(reward), 1.0):
-                uid2successful_indices[uid].append(idx)
+        for idx, (uid, acc) in enumerate(zip(uids, accuracy_reward)):
+            if not np.isclose(float(acc), 1.0):
+                continue
+            # Require format compliance when format_reward is available
+            if format_reward is not None and not np.isclose(float(format_reward[idx]), 1.0):
+                continue
+            uid2successful_indices[uid].append(idx)
         return uid2successful_indices
 
     def _sample_successful_sibling_texts(
-        self, uids: np.ndarray, accuracy_reward: np.ndarray, response_texts: np.ndarray
+        self,
+        uids: np.ndarray,
+        accuracy_reward: np.ndarray,
+        response_texts: np.ndarray,
+        format_reward: Optional[np.ndarray] = None,
     ) -> tuple[np.ndarray, np.ndarray]:
-        uid2successful_indices = self._collect_successful_rollout_indices_per_uid(uids=uids, accuracy_reward=accuracy_reward)
+        uid2successful_indices = self._collect_successful_rollout_indices_per_uid(
+            uids=uids, accuracy_reward=accuracy_reward, format_reward=format_reward,
+        )
         sampled_successful_texts: list[Optional[str]] = []
         has_successful_sibling = np.zeros(len(uids), dtype=bool)
 
@@ -606,7 +625,7 @@ class RayPPOTrainer:
                 content_text = (
                     f"{raw_prompt_text}\n\n"
                     "Correct solution:\n\n"
-                    f"{successful_sibling_text}\n\n"
+                    f"{_sanitize_sibling_text(successful_sibling_text)}\n\n"
                     "Correctly solve the original question."
                 )
             if format_prompt is None or format_prompt == "":
@@ -808,7 +827,7 @@ class RayPPOTrainer:
                 content_text = (
                     f"{raw_prompt_text}\n\n"
                     "Correct solution:\n\n"
-                    f"{successful_sibling_texts[idx]}\n\n"
+                    f"{_sanitize_sibling_text(str(successful_sibling_texts[idx]))}\n\n"
                     "Correctly solve the original question."
                 )
                 sample_valid_mask[idx] = True
@@ -894,10 +913,14 @@ class RayPPOTrainer:
 
         if mode == "successful_rollout":
             response_texts = self._decode_response_texts(batch)
+            fmt_reward = batch.non_tensor_batch.get("format_reward", None)
+            if fmt_reward is not None:
+                fmt_reward = np.asarray(fmt_reward, dtype=np.float32)
             successful_sibling_texts, has_successful_sibling = self._sample_successful_sibling_texts(
                 uids=uids,
                 accuracy_reward=accuracy_reward,
                 response_texts=response_texts,
+                format_reward=fmt_reward,
             )
             failed_mask = accuracy_reward != 1.0
             sample_valid_mask = failed_mask & has_successful_sibling
@@ -942,8 +965,12 @@ class RayPPOTrainer:
                     uid_guidelines = {}
 
             # Compute successful sibling texts for fallback
+            fmt_reward = batch.non_tensor_batch.get("format_reward", None)
+            if fmt_reward is not None:
+                fmt_reward = np.asarray(fmt_reward, dtype=np.float32)
             successful_sibling_texts, has_successful_sibling = self._sample_successful_sibling_texts(
                 uids=uids, accuracy_reward=accuracy_reward, response_texts=response_texts,
+                format_reward=fmt_reward,
             )
 
             teacher_prompt_texts, sample_valid_mask, guideline_metrics = self._build_teacher_prompt_text_guideline(
@@ -1291,6 +1318,10 @@ class RayPPOTrainer:
                             batch.non_tensor_batch["accuracy_reward"] = np.asarray(
                                 reward_metrics["accuracy"], dtype=np.float32
                             )
+                            if "format" in reward_metrics:
+                                batch.non_tensor_batch["format_reward"] = np.asarray(
+                                    reward_metrics["format"], dtype=np.float32
+                                )
                         reward_metrics = {f"reward/{k}": v for k, v in reduce_metrics(reward_metrics).items()}
                         metrics.update(reward_metrics)
                     # In sdpo_logit mode, reward is used only to construct teacher feedback text,
