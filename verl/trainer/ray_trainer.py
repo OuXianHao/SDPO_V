@@ -708,7 +708,10 @@ class RayPPOTrainer:
             blocks = []
             for i, (text, is_correct) in enumerate(rollouts):
                 label = "CORRECT" if is_correct else "INCORRECT"
-                blocks.append(f"--- Rollout {i + 1} [{label}] ---\n{text}")
+                # Sanitize structural tags so the teacher model generating guidelines
+                # is not confused by <answer>/<think> tags from student rollouts.
+                sanitized = _sanitize_sibling_text(text)
+                blocks.append(f"--- Rollout {i + 1} [{label}] ---\n{sanitized}")
             rollout_blocks_text = "\n\n".join(blocks)
 
             question_text = raw_prompt_text.replace("<video>", "").strip()
@@ -784,10 +787,20 @@ class RayPPOTrainer:
         response_ids = gen_output.batch["responses"]
         response_mask = gen_output.batch["response_mask"]
         uid_guidelines: dict[str, Optional[str]] = {}
+        n_parsed_ok = 0
         for i, uid in enumerate(uid_order):
             resp_len = int(response_mask[i].sum().item())
             resp_text = self.tokenizer.decode(response_ids[i][:resp_len], skip_special_tokens=True)
-            uid_guidelines[uid] = self._parse_guideline_feedback(resp_text)
+            parsed = self._parse_guideline_feedback(resp_text)
+            uid_guidelines[uid] = parsed
+            if parsed is not None:
+                n_parsed_ok += 1
+        n_total = len(uid_order)
+        if n_total > 0:
+            print(
+                f"[sdpo-guideline] parse success: {n_parsed_ok}/{n_total} "
+                f"({100.0 * n_parsed_ok / n_total:.1f}%)"
+            )
 
         return uid_guidelines
 
@@ -815,10 +828,11 @@ class RayPPOTrainer:
             if is_correct:
                 content_text = raw_prompt_text
             elif uid in uid_guidelines and uid_guidelines[uid] is not None:
+                sanitized_guideline = _sanitize_sibling_text(uid_guidelines[uid])
                 content_text = (
                     f"{raw_prompt_text}\n\n"
                     "Guideline feedback:\n\n"
-                    f"{uid_guidelines[uid]}\n\n"
+                    f"{sanitized_guideline}\n\n"
                     "Correctly solve the original question."
                 )
                 sample_valid_mask[idx] = True
@@ -998,10 +1012,16 @@ class RayPPOTrainer:
             batch.batch["sdpo_v_valid_mask"] = sdpo_v_valid_mask
 
             failed_mask = accuracy_reward != 1.0
+            # Guideline generation diagnostics
+            n_uids_requested = len(uid_mixed_rollouts)
+            n_uids_parsed_ok = sum(1 for v in uid_guidelines.values() if v is not None)
             sdpo_skip_metrics = {
                 "sdpo/guideline_failed_samples": float(failed_mask.sum().item()),
                 "sdpo/guideline_kept_samples": float(sample_valid_mask.sum().item()),
                 "sdpo/guideline_skipped_self_success": float((~failed_mask).sum().item()),
+                "sdpo/guideline_uids_requested": float(n_uids_requested),
+                "sdpo/guideline_uids_parsed_ok": float(n_uids_parsed_ok),
+                "sdpo/guideline_parse_success_rate": float(n_uids_parsed_ok / max(n_uids_requested, 1)),
                 "sdpo_v/num_reward_1_samples": float(sample_reward_is_1.sum()),
             }
             sdpo_skip_metrics.update(guideline_metrics)
