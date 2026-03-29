@@ -75,6 +75,7 @@ Instructions:
 - Do NOT say which option is correct.
 - Avoid vague advice such as "reason carefully" or "pay attention to the video".
 - Make each guidance point concrete and operational.
+- If any incorrect rollout has format issues (missing <answer> tags, extra text after </answer>, multiple answer blocks), include a guidance point about strict output format compliance.
 - The final "Actionable guidance" section should be the most important part, because it will be reused as guiding feedback for later reasoning.
 
 Output format:
@@ -685,11 +686,14 @@ class RayPPOTrainer:
             first_idx = uid2first_idx[uid]
             raw_prompt_text = str(raw_prompt_texts[first_idx])
 
-            # Build rollout blocks
+            # Build rollout blocks (truncate each rollout to prevent
+            # progressive prompt bloat as student outputs get longer/messier)
+            _MAX_ROLLOUT_CHARS = 2048
             blocks = []
             for i, (text, is_correct) in enumerate(rollouts):
                 label = "CORRECT" if is_correct else "INCORRECT"
-                blocks.append(f"--- Rollout {i + 1} [{label}] ---\n{text}")
+                truncated = text[:_MAX_ROLLOUT_CHARS] + "..." if len(text) > _MAX_ROLLOUT_CHARS else text
+                blocks.append(f"--- Rollout {i + 1} [{label}] ---\n{truncated}")
             rollout_blocks_text = "\n\n".join(blocks)
 
             question_text = raw_prompt_text.replace("<video>", "").strip()
@@ -765,10 +769,26 @@ class RayPPOTrainer:
         response_ids = gen_output.batch["responses"]
         response_mask = gen_output.batch["response_mask"]
         uid_guidelines: dict[str, Optional[str]] = {}
+        num_parse_success = 0
+        num_parse_fail = 0
+        guideline_lengths: list[int] = []
         for i, uid in enumerate(uid_order):
             resp_len = int(response_mask[i].sum().item())
             resp_text = self.tokenizer.decode(response_ids[i][:resp_len], skip_special_tokens=True)
-            uid_guidelines[uid] = self._parse_guideline_feedback(resp_text)
+            parsed = self._parse_guideline_feedback(resp_text)
+            uid_guidelines[uid] = parsed
+            if parsed is not None:
+                num_parse_success += 1
+                guideline_lengths.append(len(parsed))
+            else:
+                num_parse_fail += 1
+
+        # Store diagnostics for logging (attached to self for retrieval by caller)
+        self._guideline_diag = {
+            "sdpo/guideline_parse_success": float(num_parse_success),
+            "sdpo/guideline_parse_fail": float(num_parse_fail),
+            "sdpo/guideline_avg_length": float(sum(guideline_lengths) / max(len(guideline_lengths), 1)),
+        }
 
         return uid_guidelines
 
@@ -800,7 +820,9 @@ class RayPPOTrainer:
                     f"{raw_prompt_text}\n\n"
                     "Guideline feedback:\n\n"
                     f"{uid_guidelines[uid]}\n\n"
-                    "Correctly solve the original question."
+                    "Correctly solve the original question.\n"
+                    "Important: Your final answer must be enclosed in exactly one pair of "
+                    "<answer> and </answer> tags. Do not output any text after </answer>."
                 )
                 sample_valid_mask[idx] = True
                 guideline_used += 1
@@ -978,6 +1000,10 @@ class RayPPOTrainer:
                 "sdpo_v/num_reward_1_samples": float(sample_reward_is_1.sum()),
             }
             sdpo_skip_metrics.update(guideline_metrics)
+            # Attach guideline generation diagnostics if available
+            if hasattr(self, "_guideline_diag"):
+                sdpo_skip_metrics.update(self._guideline_diag)
+                del self._guideline_diag
             return batch, sdpo_skip_metrics
 
         raise ValueError(f"Unsupported sdpo feedback mode: {mode}")
