@@ -122,7 +122,7 @@ def accuracy_reward(response: str, ground_truth: str) -> float:
     return 1.0 if pred == gt else 0.0
 
 
-def compute_score(reward_input: dict[str, Any], format_weight: float = 0.1) -> dict[str, float]:
+def compute_score(reward_input: dict[str, Any], format_weight: float = 0.3) -> dict[str, float]:
     response = _normalize_response(reward_input["response"])
 
     format_score = format_reward(response)

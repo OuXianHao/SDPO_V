@@ -8,13 +8,13 @@ export all_proxy="http://127.0.0.1:7890"
 export WANDB_API_KEY='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'
 # ---------- W&B ----------
 export WANDB_PROJECT="EasyR1-SDPO"
-export WANDB_NAME="qwen3vl8b_perceptiontest_sdpo_guideline_ema005_run3"
+export WANDB_NAME="qwen3vl8b_perceptiontest_sdpo_guideline_ema005_run4"
 export WANDB_MODE="online"
 
 # ---------- Debug (disabled for half-day training) ----------
 export SDPO_DEBUG_DUMP=1
 export SDPO_SKIP_DEBUG=0
-export SDPO_DEBUG_DUMP_PATH="/ssd5/xhou/outputs/sdpo_debug_qwen3vl8b_perceptiontest_sdpo_guideline_ema005_run3.jsonl"
+export SDPO_DEBUG_DUMP_PATH="/ssd5/xhou/outputs/sdpo_debug_qwen3vl8b_perceptiontest_sdpo_guideline_ema005_run4.jsonl"
 export SDPO_VIDEO_SAMPLING_DEBUG_MAX=200000000000000
 
 export EASYR1_DEBUG_SDPO_UPDATE=0
@@ -53,9 +53,9 @@ python -m verl.trainer.main \
   data.video_key=videos \
   data.image_dir="${DATA_ROOT}" \
   data.format_prompt=./examples/format_prompt/r1v.jinja \
-  data.rollout_batch_size=128 \
+  data.rollout_batch_size=64 \
   data.max_prompt_length=4096 \
-  data.max_response_length=1536 \
+  data.max_response_length=1800 \
   data.max_pixels=524288 \
   worker.reward.reward_function=./examples/reward_function/r1v.py:compute_score \
   worker.actor.model.model_path="${MODEL_PATH}" \
@@ -63,7 +63,7 @@ python -m verl.trainer.main \
   worker.actor.model.lora.rank=0 \
   worker.actor.fsdp.torch_dtype=bf16 \
   worker.actor.optim.lr=1e-5 \
-  worker.actor.global_batch_size=128 \
+  worker.actor.global_batch_size=64 \
   worker.actor.micro_batch_size_per_device_for_update=4 \
   worker.actor.micro_batch_size_per_device_for_experience=2 \
   worker.actor.padding_free=false \
@@ -75,7 +75,7 @@ python -m verl.trainer.main \
   worker.rollout.temperature=0.7 \
   worker.rollout.top_p=1.0 \
   worker.rollout.tensor_parallel_size=1 \
-  worker.rollout.gpu_memory_utilization=0.7 \
+  worker.rollout.gpu_memory_utilization=0.65 \
   worker.rollout.max_model_len=12224 \
   worker.rollout.max_num_batched_tokens=32768 \
   worker.rollout.val_override_config='{"temperature":0.7,"top_p":1.0,"n":1}' \
@@ -87,8 +87,8 @@ python -m verl.trainer.main \
   trainer.save_freq=15 \
   trainer.logger='["console","wandb"]' \
   trainer.project_name=EasyR1_SDPO \
-  trainer.experiment_name=qwen3vl8b_perceptiontest_sdpo_guideline_ema005_run3 \
-  trainer.save_checkpoint_path=/ssd5/xhou/outputs/checkpoints/qwen3vl8b_perceptiontest_sdpo_guideline_ema005_run3 \
+  trainer.experiment_name=qwen3vl8b_perceptiontest_sdpo_guideline_ema005_run4 \
+  trainer.save_checkpoint_path=/ssd5/xhou/outputs/checkpoints/qwen3vl8b_perceptiontest_sdpo_guideline_ema005_run4 \
   trainer.find_last_checkpoint=true \
   trainer.n_gpus_per_node=4 \
   algorithm.loss_mode=sdpo_logit \
