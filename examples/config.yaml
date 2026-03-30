@@ -50,7 +50,8 @@ worker:
 
       Before giving the final answer, the Assistant should reason about how the answer is obtained from the video.
       The reasoning should be grounded in the visual evidence, especially temporal order, repeated actions, object motion, state changes, and outcome differences.
-      Keep the reasoning clear and concise, and place it before the final answer.
+      Respond concisely. Your thinking should be brief and focused — identify the core logic, skip trivial steps, and avoid verbose or redundant thinking. Keep your thinking within 500 words.
+      Place the reasoning before the final answer.
 
       The final answer must be enclosed in exactly one pair of <answer> and </answer> tags.
       Do not output any text after </answer>.

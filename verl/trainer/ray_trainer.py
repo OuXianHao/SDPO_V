@@ -77,6 +77,7 @@ Instructions:
 - Make each guidance point concrete and operational.
 - If any incorrect rollout has format issues (missing <answer> tags, extra text after </answer>, multiple answer blocks), include a guidance point about strict output format compliance.
 - The final "Actionable guidance" section should be the most important part, because it will be reused as guiding feedback for later reasoning.
+- Provide a concise guideline within 5 sentences that captures only the core reasoning strategy.
 
 Output format:
 
@@ -608,7 +609,10 @@ class RayPPOTrainer:
                     f"{raw_prompt_text}\n\n"
                     "Correct solution:\n\n"
                     f"{successful_sibling_text}\n\n"
-                    "Correctly solve the original question."
+                    "Correctly solve the original question.\n"
+                    "Respond concisely. Your thinking should be brief and focused — "
+                    "identify the core logic, skip trivial steps, and avoid verbose or redundant thinking. "
+                    "Keep your thinking within 500 words."
                 )
             if format_prompt is None or format_prompt == "":
                 teacher_prompt_text = content_text
@@ -821,6 +825,9 @@ class RayPPOTrainer:
                     "Here is some guidance that may help you solve the problem:\n\n"
                     f"{uid_guidelines[uid]}\n\n"
                     "Correctly solve the original question.\n"
+                    "Respond concisely. Your thinking should be brief and focused — "
+                    "identify the core logic, skip trivial steps, and avoid verbose or redundant thinking. "
+                    "Keep your thinking within 500 words.\n"
                     "Important: Your final answer must be enclosed in exactly one pair of "
                     "<answer> and </answer> tags. Do not output any text after </answer>."
                 )
@@ -831,7 +838,10 @@ class RayPPOTrainer:
                     f"{raw_prompt_text}\n\n"
                     "Correct solution:\n\n"
                     f"{successful_sibling_texts[idx]}\n\n"
-                    "Correctly solve the original question."
+                    "Correctly solve the original question.\n"
+                    "Respond concisely. Your thinking should be brief and focused — "
+                    "identify the core logic, skip trivial steps, and avoid verbose or redundant thinking. "
+                    "Keep your thinking within 500 words."
                 )
                 sample_valid_mask[idx] = True
                 fallback_used += 1
