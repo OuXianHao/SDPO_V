@@ -22,7 +22,8 @@ BASE_PROMPT_TEMPLATE = """A conversation between User and Assistant. The user as
 
 Before giving the final answer, the Assistant should reason about how the answer is obtained from the video.
 The reasoning should be grounded in the visual evidence, especially temporal order, repeated actions, object motion, state changes, and outcome differences.
-Keep the reasoning clear and concise, and place it before the final answer.
+Respond concisely. Your thinking should be brief and focused — identify the core logic, skip trivial steps, and avoid verbose or redundant thinking. Keep your thinking within 500 words.
+Place the reasoning before the final answer.
 
 The final answer must be enclosed in exactly one pair of <answer> and </answer> tags.
 Do not output any text after </answer>.
@@ -43,6 +44,7 @@ Instructions:
 - Avoid vague advice such as "reason carefully" or "pay attention to the video".
 - Make each guidance point concrete and operational.
 - The final "Actionable guidance" section should be the most important part, because it will be reused as feedback for later reasoning.
+- Provide a concise guideline within 5 sentences that captures only the core reasoning strategy.
 
 Output format:
 
@@ -80,7 +82,8 @@ CORRECT_ROLLOUT_FEEDBACK_TEMPLATE = """A conversation between User and Assistant
 
 Before giving the final answer, the Assistant should reason about how the answer is obtained from the video.
 The reasoning should be grounded in the visual evidence, especially temporal order, repeated actions, object motion, state changes, and outcome differences.
-Keep the reasoning clear and concise, and place it before the final answer.
+Respond concisely. Your thinking should be brief and focused — identify the core logic, skip trivial steps, and avoid verbose or redundant thinking. Keep your thinking within 500 words.
+Place the reasoning before the final answer.
 
 Below is one rollout that is known to be a correct solution for this same sample. Use it as reference feedback to guide your reasoning, but still ground your answer in the video.
 
@@ -98,7 +101,8 @@ GUIDELINE_FEEDBACK_TEMPLATE = """A conversation between User and Assistant. The 
 
 Before giving the final answer, the Assistant should reason about how the answer is obtained from the video.
 The reasoning should be grounded in the visual evidence, especially temporal order, repeated actions, object motion, state changes, and outcome differences.
-Keep the reasoning clear and concise, and place it before the final answer.
+Respond concisely. Your thinking should be brief and focused — identify the core logic, skip trivial steps, and avoid verbose or redundant thinking. Keep your thinking within 500 words.
+Place the reasoning before the final answer.
 
 Below is feedback distilled from multiple candidate rollouts for this same sample. Use it to guide your reasoning, but still ground your answer in the video.
 
