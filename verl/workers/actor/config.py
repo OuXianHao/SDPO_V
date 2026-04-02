@@ -162,6 +162,7 @@ class ActorConfig:
     sdpo_v_shuffle_fraction: float = field(default=0.2, init=False)
     sdpo_v_debug: bool = field(default=False, init=False)
     sdpo_v_calibration: bool = field(default=False, init=False)
+    sdpo_v_warmup_steps: int = field(default=0, init=False)
     # ---- SDPO-V soft-KL auto-keys (set from AlgorithmConfig) ----
     sdpo_v_softkl_enabled: bool = field(default=False, init=False)
     sdpo_v_softkl_weight: float = field(default=1.0, init=False)

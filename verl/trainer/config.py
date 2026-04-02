@@ -132,6 +132,8 @@ class AlgorithmConfig:
     """Enable extra SDPO-V debug logging."""
     sdpo_v_calibration: bool = False
     """Enable calibration mode: collect delta_t statistics instead of applying loss."""
+    sdpo_v_warmup_steps: int = 0
+    """Number of training steps to skip SDPO-V loss (return zero loss). Allows SDPO-T to stabilize before adding the visual separation objective."""
 
     # ---- SDPO-V soft-capped forward KL settings ----
     sdpo_v_softkl_enabled: bool = False
@@ -238,6 +240,7 @@ class PPOConfig:
         self.worker.actor.sdpo_v_shuffle_fraction = self.algorithm.sdpo_v_shuffle_fraction
         self.worker.actor.sdpo_v_debug = self.algorithm.sdpo_v_debug
         self.worker.actor.sdpo_v_calibration = self.algorithm.sdpo_v_calibration
+        self.worker.actor.sdpo_v_warmup_steps = self.algorithm.sdpo_v_warmup_steps
         # SDPO-V soft-KL config propagation
         self.worker.actor.sdpo_v_softkl_enabled = self.algorithm.sdpo_v_softkl_enabled
         self.worker.actor.sdpo_v_softkl_weight = self.algorithm.sdpo_v_softkl_weight

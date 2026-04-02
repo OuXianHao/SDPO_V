@@ -76,6 +76,7 @@ class DataParallelPPOActor(BasePPOActor):
         # a ref_module (e.g. ref_module_fsdp) from the FSDP worker init
         # and call _update_teacher() after each optimizer step.
         self.teacher_module: Optional[nn.Module] = None
+        self._sdpo_v_step_counter: int = 0  # tracks optimizer steps for SDPO-V warmup
         self.processor = processor
         self.min_pixels = min_pixels
         self.max_pixels = max_pixels
@@ -1158,15 +1159,31 @@ class DataParallelPPOActor(BasePPOActor):
         combined_loss = sdpo_loss
         has_v_component = False
 
+        # ---- SDPO-V warmup gate ----
+        # During warmup, SDPO-V losses are computed (for metrics) but NOT
+        # added to combined_loss.  This lets SDPO-T stabilize the model
+        # before the visual separation signal is introduced.
+        _v_warmup = self.config.sdpo_v_warmup_steps
+        _v_active = self._sdpo_v_step_counter >= _v_warmup
+
         if self.config.sdpo_v_enabled:
             sdpo_v_loss, sdpo_v_metrics = self._compute_sdpo_v_loss(
                 model_inputs=model_inputs,
                 student_logits=student_logits,
                 temperature=temperature,
             )
-            combined_loss = combined_loss + self.config.sdpo_v_weight * sdpo_v_loss
+            effective_v_weight = self.config.sdpo_v_weight if _v_active else 0.0
+            if effective_v_weight > 0.0:
+                combined_loss = combined_loss + effective_v_weight * sdpo_v_loss
             metrics.update({f"sdpo_v/{k}": v for k, v in sdpo_v_metrics.items()})
-            has_v_component = True
+            metrics["sdpo_v/warmup_active"] = 1.0 if _v_active else 0.0
+            metrics["sdpo_v/effective_weight"] = effective_v_weight
+            has_v_component = _v_active
+            if not _v_active and self.rank == 0:
+                print(
+                    f"[sdpo_v_warmup] step {self._sdpo_v_step_counter}/{_v_warmup}: "
+                    f"SDPO-V loss={sdpo_v_loss.item():.6f} (NOT applied, warmup)"
+                )
 
         if self.config.sdpo_v_softkl_enabled:
             sdpo_v_sk_loss, sdpo_v_sk_metrics = self._compute_sdpo_v_softkl_loss(
@@ -1174,9 +1191,11 @@ class DataParallelPPOActor(BasePPOActor):
                 student_logits=student_logits,
                 temperature=temperature,
             )
-            combined_loss = combined_loss + self.config.sdpo_v_softkl_weight * sdpo_v_sk_loss
+            effective_sk_weight = self.config.sdpo_v_softkl_weight if _v_active else 0.0
+            if effective_sk_weight > 0.0:
+                combined_loss = combined_loss + effective_sk_weight * sdpo_v_sk_loss
             metrics.update({f"sdpo_v_softkl/{k}": v for k, v in sdpo_v_sk_metrics.items()})
-            has_v_component = True
+            has_v_component = has_v_component or _v_active
 
         if has_v_component:
             metrics["sdpo/combined_loss"] = combined_loss.detach().item()
@@ -1490,6 +1509,7 @@ class DataParallelPPOActor(BasePPOActor):
             self.actor_optimizer.step()
 
         self.actor_optimizer.zero_grad()
+        self._sdpo_v_step_counter += 1
         return grad_norm
 
     @torch.no_grad()
