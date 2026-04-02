@@ -1023,6 +1023,7 @@ def compute_sdpo_v_softkl_loss(
     response_mask: torch.Tensor,
     tau: float = 1.0,
     use_tail: bool = False,
+    kl_max: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """SDPO-V soft-capped forward KL loss.
 
@@ -1032,6 +1033,7 @@ def compute_sdpo_v_softkl_loss(
 
     For each valid token position t:
         KL_t = D_KL(p_good || p_bad_ref) = sum_k p_good_k * (log p_good_k - log p_bad_ref_k)
+        KL_t = clamp(KL_t, 0, kl_max)   [if kl_max > 0]
         phi(KL_t) = tau * (1 - exp(-KL_t / tau))
         L = -mean_t phi(KL_t)
 
@@ -1044,6 +1046,11 @@ def compute_sdpo_v_softkl_loss(
         response_mask:       (batch, resp_len) — boolean mask for valid response tokens.
         tau:  Soft-cap temperature. phi(x) = tau * (1 - exp(-x / tau)).
         use_tail: Whether the log-probs include a tail bucket (last dim).
+        kl_max: Hard ceiling on per-token KL before the soft cap.
+                When > 0, KL is clamped to [0, kl_max], which also zeros the
+                gradient for tokens whose KL already exceeds the target.
+                This prevents the mode-seeking KL-maximization objective
+                from pushing logits to extremes.  Default 0 = no ceiling.
 
     Returns:
         loss: Scalar loss tensor (negative of mean soft-capped KL).
@@ -1068,6 +1075,14 @@ def compute_sdpo_v_softkl_loss(
     # Forward KL should be >= 0; clamp for numerical safety
     kl_t = kl_t.clamp_min(0.0)
 
+    # ---- KL ceiling: prevent unbounded KL maximization ----
+    # When kl_max > 0, tokens whose KL already exceeds the target receive
+    # zero gradient (clamp kills the backward signal).  This is the key
+    # safeguard against the mode-seeking collapse observed when the negative
+    # loss drives logits to extremes within the first few steps.
+    if kl_max > 0:
+        kl_t = kl_t.clamp(max=kl_max)
+
     # ---- Soft cap: phi(x) = tau * (1 - exp(-x / tau)) ----
     tau_safe = max(tau, 1e-8)
     phi_t = tau_safe * (1.0 - torch.exp(-kl_t / tau_safe))  # (batch, resp_len)
@@ -1081,6 +1096,10 @@ def compute_sdpo_v_softkl_loss(
         kl_masked = kl_t * mask_f
         kl_mean = kl_masked.sum() / valid_count
         phi_mean = masked_phi.sum() / valid_count
+        # Track how many tokens hit the ceiling (useful for tuning kl_max)
+        kl_ceil_frac = 0.0
+        if kl_max > 0:
+            kl_ceil_frac = float(((kl_t >= kl_max - 1e-6) & response_mask.bool()).sum().item()) / max(valid_count.item(), 1.0)
 
     metrics = {
         "vsk_loss": loss.detach().item(),
@@ -1088,6 +1107,8 @@ def compute_sdpo_v_softkl_loss(
         "vsk_kl_raw_mean": kl_mean.item(),
         "vsk_kl_capped_mean": phi_mean.item(),
         "vsk_valid_tokens": int(valid_count.item()),
+        "vsk_kl_max": kl_max,
+        "vsk_kl_ceil_frac": kl_ceil_frac,
     }
     return loss, metrics
 

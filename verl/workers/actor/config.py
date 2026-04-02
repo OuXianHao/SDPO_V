@@ -170,6 +170,7 @@ class ActorConfig:
     sdpo_v_softkl_use_tail: bool = field(default=False, init=False)
     sdpo_v_softkl_debug: bool = field(default=False, init=False)
     sdpo_v_softkl_use_ema_bad_ref: bool = field(default=True, init=False)
+    sdpo_v_softkl_kl_max: float = field(default=1.0, init=False)
 
 
 @dataclass

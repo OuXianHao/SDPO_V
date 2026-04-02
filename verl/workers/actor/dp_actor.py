@@ -1421,6 +1421,7 @@ class DataParallelPPOActor(BasePPOActor):
             response_mask=sdpo_v_mask,
             tau=self.config.sdpo_v_softkl_tau,
             use_tail=self.config.sdpo_v_softkl_use_tail,
+            kl_max=self.config.sdpo_v_softkl_kl_max,
         )
 
         # Add EMA status to metrics
