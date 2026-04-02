@@ -148,6 +148,11 @@ class AlgorithmConfig:
     """Enable extra debug logging for the soft-KL line."""
     sdpo_v_softkl_use_ema_bad_ref: bool = True
     """Use EMA teacher module (no_grad) for the bad-video reference branch."""
+    sdpo_v_softkl_kl_max: float = 1.0
+    """Hard ceiling on per-token KL before the soft cap.
+    Tokens whose KL already exceeds this value receive zero gradient,
+    preventing the mode-seeking KL-maximization objective from pushing
+    logits to extremes.  Set to 0 to disable the ceiling."""
 
 
 @dataclass
@@ -246,6 +251,7 @@ class PPOConfig:
         self.worker.actor.sdpo_v_softkl_use_tail = self.algorithm.sdpo_v_softkl_use_tail
         self.worker.actor.sdpo_v_softkl_debug = self.algorithm.sdpo_v_softkl_debug
         self.worker.actor.sdpo_v_softkl_use_ema_bad_ref = self.algorithm.sdpo_v_softkl_use_ema_bad_ref
+        self.worker.actor.sdpo_v_softkl_kl_max = self.algorithm.sdpo_v_softkl_kl_max
 
     def deep_post_init(self):
         recursive_post_init(self)
