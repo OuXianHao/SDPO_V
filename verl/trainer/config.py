@@ -119,13 +119,15 @@ class AlgorithmConfig:
     sdpo_v_margin_mode: str = "constant"
     """Margin mode for SDPO-V. Currently only 'constant' is supported."""
     sdpo_v_bad_video_mode: str = "blur"
-    """Bad-video construction strategy: 'blur', 'drop', 'blur_and_drop'."""
+    """Bad-video construction strategy: 'blur', 'drop', 'blur_and_drop', 'shuffle'."""
     sdpo_v_blur_sigma: float = 5.0
     """Gaussian blur sigma for bad-video blur mode."""
     sdpo_v_blur_fraction: float = 0.5
     """Fraction of frames to blur (0.0 to 1.0)."""
     sdpo_v_drop_fraction: float = 0.5
     """Fraction of frames to drop (replaced by zeros) in drop mode."""
+    sdpo_v_shuffle_fraction: float = 0.2
+    """Fraction of frames to temporally shuffle in 'shuffle' mode (0.0 to 1.0)."""
     sdpo_v_debug: bool = False
     """Enable extra SDPO-V debug logging."""
     sdpo_v_calibration: bool = False
@@ -233,6 +235,7 @@ class PPOConfig:
         self.worker.actor.sdpo_v_blur_sigma = self.algorithm.sdpo_v_blur_sigma
         self.worker.actor.sdpo_v_blur_fraction = self.algorithm.sdpo_v_blur_fraction
         self.worker.actor.sdpo_v_drop_fraction = self.algorithm.sdpo_v_drop_fraction
+        self.worker.actor.sdpo_v_shuffle_fraction = self.algorithm.sdpo_v_shuffle_fraction
         self.worker.actor.sdpo_v_debug = self.algorithm.sdpo_v_debug
         self.worker.actor.sdpo_v_calibration = self.algorithm.sdpo_v_calibration
         # SDPO-V soft-KL config propagation

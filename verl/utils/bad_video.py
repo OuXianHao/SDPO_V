@@ -21,6 +21,8 @@ Supported modes:
   - "blur": Gaussian-blur a fraction of temporal frames.
   - "drop": Zero-out a fraction of temporal frames.
   - "blur_and_drop": Apply both blur and drop (on disjoint frame subsets).
+  - "shuffle": Randomly select a fraction of temporal frames and shuffle
+    their temporal positions, leaving the rest unchanged.
 
 All operations are applied in-place on a **clone** of the original tensor
 so the good-video branch is never modified.
@@ -126,6 +128,7 @@ def construct_bad_video_inputs(
     blur_sigma: float = 5.0,
     blur_fraction: float = 0.5,
     drop_fraction: float = 0.5,
+    shuffle_fraction: float = 0.2,
     patch_size: int = 14,
     temporal_patch_size: int = 2,
     in_channels: int = 3,
@@ -145,10 +148,11 @@ def construct_bad_video_inputs(
         multi_modal_inputs: Dict of multimodal tensors (pixel_values_videos,
             video_grid_thw, etc). Will NOT be modified.
         video_grid_thw: (num_videos, 3) tensor of (T, H, W) per video.
-        mode: Degradation mode — "blur", "drop", or "blur_and_drop".
+        mode: Degradation mode — "blur", "drop", "blur_and_drop", or "shuffle".
         blur_sigma: Gaussian blur sigma.
         blur_fraction: Fraction of frames to blur.
         drop_fraction: Fraction of frames to drop (zero out).
+        shuffle_fraction: Fraction of frames to temporally shuffle (for "shuffle" mode).
         patch_size: Spatial patch size from the vision config (default 14).
         temporal_patch_size: Temporal patch size from the vision config (default 2).
         in_channels: Number of input channels from the vision config (default 3).
@@ -243,6 +247,45 @@ def construct_bad_video_inputs(
                 start = offset + int(fi.item()) * tokens_per_frame
                 end = start + tokens_per_frame
                 pixel_values[start:end] = 0.0
+
+        elif mode == "shuffle":
+            # Randomly select a fraction of temporal frames and shuffle their
+            # temporal positions among themselves.  Unselected frames stay put.
+            # Need at least 2 frames to perform a meaningful shuffle.
+            if t_frames < 2:
+                offset += total_tokens
+                continue
+
+            num_shuffle = max(2, int(t_frames * shuffle_fraction))
+            num_shuffle = min(num_shuffle, t_frames)
+
+            # Pick which frame indices participate in the shuffle
+            selected = torch.randperm(t_frames, device=pixel_values.device)[:num_shuffle]
+            selected_sorted = selected.sort().values  # original positions in order
+
+            # Extract pixel data for the selected frames
+            frame_data = []
+            for fi in selected_sorted:
+                start = offset + int(fi.item()) * tokens_per_frame
+                end = start + tokens_per_frame
+                frame_data.append(pixel_values[start:end].clone())
+
+            # Generate a non-identity permutation (retry if identity)
+            perm = torch.randperm(num_shuffle, device=pixel_values.device)
+            if num_shuffle > 1:
+                identity = torch.arange(num_shuffle, device=pixel_values.device)
+                max_retries = 10
+                for _ in range(max_retries):
+                    if not torch.equal(perm, identity):
+                        break
+                    perm = torch.randperm(num_shuffle, device=pixel_values.device)
+
+            # Write shuffled frame data back into the original positions
+            for i, fi in enumerate(selected_sorted):
+                start = offset + int(fi.item()) * tokens_per_frame
+                end = start + tokens_per_frame
+                pixel_values[start:end] = frame_data[perm[i]]
+
         else:
             raise ValueError(f"Unknown bad-video mode: {mode}")
 
