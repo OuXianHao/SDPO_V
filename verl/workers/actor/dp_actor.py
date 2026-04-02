@@ -1280,12 +1280,12 @@ class DataParallelPPOActor(BasePPOActor):
                     f"mean_abs_diff={diff:.6f}"
                 )
 
-        # ---- Bad-video EMA reference forward (no_grad) ----
-        # Use the same text tokens (input_ids, attention_mask, position_ids)
-        # but with degraded multimodal inputs. The bad-video reference branch
-        # runs through the EMA teacher module under no_grad for stability,
-        # matching the soft-KL line's reference-branch design.
-        if self.teacher_module is not None and self.teacher_module is not self.actor_module:
+        # ---- Bad-video reference forward (no_grad) ----
+        # Same frozen-ref guard as the soft-KL branch: when the teacher is
+        # frozen (update_rate == 0), use the current student under no_grad to
+        # avoid parasitic weight-drift KL.
+        teacher_update_rate = getattr(self.config, "sdpo_teacher_update_rate", 0.0)
+        if teacher_update_rate > 0 and self.teacher_module is not None and self.teacher_module is not self.actor_module:
             bad_ref_module = self.teacher_module
         else:
             bad_ref_module = self.actor_module
@@ -1428,14 +1428,35 @@ class DataParallelPPOActor(BasePPOActor):
                 in_channels=_in_channels,
             )
 
-        # ---- Bad-video EMA reference forward (no_grad) ----
+        # ---- Bad-video reference forward (no_grad) ----
+        # IMPORTANT: When sdpo_teacher_update_rate == 0, the "EMA" teacher is
+        # actually frozen at initialization.  Using a frozen ref as the bad-video
+        # baseline causes KL(student_good || frozen_bad) to grow from weight drift
+        # (not just from video-quality discrimination), creating an escalating
+        # gradient that destabilizes training around step 5.
+        #
+        # Fix: when the teacher is frozen (update_rate == 0), use the CURRENT
+        # student model (actor_module) for the bad-video branch under no_grad.
+        # This way KL measures only the video-quality difference at current weights,
+        # eliminating the parasitic weight-drift signal.
         use_ema = self.config.sdpo_v_softkl_use_ema_bad_ref
-        if use_ema and self.teacher_module is not None and self.teacher_module is not self.actor_module:
+        teacher_update_rate = getattr(self.config, "sdpo_teacher_update_rate", 0.0)
+        if use_ema and teacher_update_rate > 0 and self.teacher_module is not None and self.teacher_module is not self.actor_module:
+            # EMA teacher is actively tracking the student — safe to use as reference
             bad_ref_module = self.teacher_module
         else:
+            # Frozen ref or no separate teacher — use current student model to
+            # avoid parasitic weight-drift KL
             bad_ref_module = self.actor_module
 
         ema_active = (bad_ref_module is not self.actor_module)
+        if _debug and self.rank == 0:
+            print(
+                f"[sdpo_v_softkl] bad_ref_selection: use_ema={use_ema} "
+                f"teacher_update_rate={teacher_update_rate} "
+                f"ema_active={ema_active} "
+                f"using={'teacher_module' if ema_active else 'actor_module(no_grad)'}"
+            )
 
         with torch.no_grad():
             bad_ref_logits = self._forward_response_logits(

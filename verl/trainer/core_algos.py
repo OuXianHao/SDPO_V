@@ -1080,14 +1080,21 @@ def compute_sdpo_v_softkl_loss(
     with torch.no_grad():
         kl_masked = kl_t * mask_f
         kl_mean = kl_masked.sum() / valid_count
+        kl_max = (kl_t * mask_f.bool().float()).max()  # max per-token KL
         phi_mean = masked_phi.sum() / valid_count
+        # Effective gradient attenuation from the soft cap: mean exp(-KL/tau).
+        # Values near 1.0 mean the cap is inactive (small KL).
+        # Values near 0.0 mean the cap is fully damping the gradient.
+        grad_atten = (torch.exp(-kl_t / tau_safe) * mask_f).sum() / valid_count
 
     metrics = {
         "vsk_loss": loss.detach().item(),
         "vsk_tau": tau,
         "vsk_kl_raw_mean": kl_mean.item(),
+        "vsk_kl_raw_max": kl_max.item(),
         "vsk_kl_capped_mean": phi_mean.item(),
         "vsk_valid_tokens": int(valid_count.item()),
+        "vsk_grad_attenuation": grad_atten.item(),
     }
     return loss, metrics
 
