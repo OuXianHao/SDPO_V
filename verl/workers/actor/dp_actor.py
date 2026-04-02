@@ -608,6 +608,48 @@ class DataParallelPPOActor(BasePPOActor):
             teacher_multi_modal_inputs.append(processor_inputs)
 
         max_length = max(sequence_ids.size(0) for sequence_ids in teacher_sequences)
+
+        # ---- Guard: cap teacher sequences to student sequence length ----
+        # Teacher prompts are longer than student prompts (they include
+        # feedback/rollout text) but share the same response suffix.
+        # If the teacher prompt is excessively long (e.g. large vision
+        # token expansion + long rollout text), it can cause OOM when the
+        # entire micro-batch is padded to max_length.  We cap to the
+        # student sequence length so teacher sequences are at most as long
+        # as the student's (matching the tokenised student prompt length).
+        student_seq_len = model_inputs["input_ids"].size(1)
+        if max_length > student_seq_len:
+            resp_len = responses.size(-1)
+            if self.rank == 0:
+                print(
+                    f"[teacher-truncate] capping teacher max_length {max_length} "
+                    f"-> {student_seq_len} (student seq_len). "
+                    f"response_length={resp_len}"
+                )
+            max_length = student_seq_len
+            prompt_budget = student_seq_len - resp_len
+            truncated_sequences: list[torch.Tensor] = []
+            truncated_attns: list[torch.Tensor] = []
+            truncated_positions: list[torch.Tensor] = []
+            for i, (seq, attn, pos) in enumerate(
+                zip(teacher_sequences, teacher_attention_masks, teacher_position_ids)
+            ):
+                t_prompt_len = seq.size(-1 if seq.dim() == 1 else -1) - resp_len
+                if t_prompt_len > prompt_budget:
+                    # Right-truncate the prompt portion, keep the response suffix
+                    seq = torch.cat([seq[:prompt_budget], seq[-resp_len:]], dim=-1)
+                    attn = torch.cat([attn[:prompt_budget], attn[-resp_len:]], dim=-1)
+                    if pos.dim() == 2:
+                        pos = torch.cat([pos[:, :prompt_budget], pos[:, -resp_len:]], dim=-1)
+                    else:
+                        pos = torch.cat([pos[:prompt_budget], pos[-resp_len:]], dim=-1)
+                truncated_sequences.append(seq)
+                truncated_attns.append(attn)
+                truncated_positions.append(pos)
+            teacher_sequences = truncated_sequences
+            teacher_attention_masks = truncated_attns
+            teacher_position_ids = truncated_positions
+
         padded_input_ids = []
         padded_attention_masks = []
         padded_position_ids = []

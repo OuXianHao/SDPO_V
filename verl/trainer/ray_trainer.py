@@ -528,11 +528,15 @@ class RayPPOTrainer:
         return {"val/reward_score": self.val_reward_score, **val_reward_metrics, **val_length_metrics}
 
     def _build_feedback_text(self, batch: DataProto) -> np.ndarray:
+        _MAX_FEEDBACK_RESPONSE_CHARS = 3072
         response_texts = self._decode_response_texts(batch)
         feedback_texts = []
         for i, response_text in enumerate(response_texts):
             score = float(batch.batch["token_level_scores"][i].sum().item())
-            feedback = f"Response quality score: {score:.4f}. Improve correctness and faithfulness.\n[Response]: {response_text}"
+            resp_str = str(response_text)
+            if len(resp_str) > _MAX_FEEDBACK_RESPONSE_CHARS:
+                resp_str = resp_str[:_MAX_FEEDBACK_RESPONSE_CHARS] + "..."
+            feedback = f"Response quality score: {score:.4f}. Improve correctness and faithfulness.\n[Response]: {resp_str}"
             feedback_texts.append(feedback)
 
         return np.array(feedback_texts, dtype=object)
@@ -600,15 +604,22 @@ class RayPPOTrainer:
         self, raw_prompt_texts: np.ndarray, successful_sibling_texts: np.ndarray
     ) -> np.ndarray:
         format_prompt = self.config.worker.actor.teacher_format_prompt
+        # Cap rollout text embedded in teacher prompt to prevent unbounded
+        # prompt growth.  3072 chars ≈ 750-1000 tokens — enough to convey
+        # the reasoning strategy without exploding the teacher sequence.
+        _MAX_TEACHER_ROLLOUT_CHARS = 3072
         teacher_prompt_texts = []
         for raw_prompt_text, successful_sibling_text in zip(raw_prompt_texts, successful_sibling_texts):
             if successful_sibling_text is None:
                 content_text = str(raw_prompt_text)
             else:
+                sibling_str = str(successful_sibling_text)
+                if len(sibling_str) > _MAX_TEACHER_ROLLOUT_CHARS:
+                    sibling_str = sibling_str[:_MAX_TEACHER_ROLLOUT_CHARS] + "..."
                 content_text = (
                     f"{raw_prompt_text}\n\n"
                     "Correct solution:\n\n"
-                    f"{successful_sibling_text}\n\n"
+                    f"{sibling_str}\n\n"
                     "Correctly solve the original question.\n"
                     "Respond concisely. Your thinking should be brief and focused — "
                     "identify the core logic, skip trivial steps, and avoid verbose or redundant thinking. "
@@ -951,12 +962,23 @@ class RayPPOTrainer:
             )
             batch.batch["sdpo_v_valid_mask"] = sdpo_v_valid_mask
 
+            n_kept = int(sample_valid_mask.sum().item())
+            n_reward_1 = int(sample_reward_is_1.sum())
+            if n_kept == 0 and n_reward_1 == 0:
+                print(
+                    f"[REWARD_COLLAPSE] step={self.global_step}: "
+                    f"ALL SDPO training is inert — no successful rollouts exist. "
+                    f"SDPO-T kept=0, SDPO-V reward_1=0 out of {len(batch)} samples. "
+                    f"Model cannot recover without external intervention (lower LR, "
+                    f"checkpoint rollback, or data change)."
+                )
+
             sdpo_skip_metrics = {
                 "sdpo/successful_rollout_failed_samples": float(failed_mask.sum().item()),
-                "sdpo/successful_rollout_kept_samples": float(sample_valid_mask.sum().item()),
+                "sdpo/successful_rollout_kept_samples": float(n_kept),
                 "sdpo/successful_rollout_skipped_no_success_sibling": float((failed_mask & ~has_successful_sibling).sum().item()),
                 "sdpo/successful_rollout_skipped_self_success": float((~failed_mask).sum().item()),
-                "sdpo_v/num_reward_1_samples": float(sample_reward_is_1.sum()),
+                "sdpo_v/num_reward_1_samples": float(n_reward_1),
             }
             return batch, sdpo_skip_metrics
 
@@ -1003,11 +1025,19 @@ class RayPPOTrainer:
             batch.batch["sdpo_v_valid_mask"] = sdpo_v_valid_mask
 
             failed_mask = accuracy_reward != 1.0
+            n_kept = int(sample_valid_mask.sum().item())
+            n_reward_1 = int(sample_reward_is_1.sum())
+            if n_kept == 0 and n_reward_1 == 0:
+                print(
+                    f"[REWARD_COLLAPSE] step={self.global_step}: "
+                    f"ALL SDPO training is inert (guideline mode) — "
+                    f"kept=0, reward_1=0 out of {len(batch)} samples."
+                )
             sdpo_skip_metrics = {
                 "sdpo/guideline_failed_samples": float(failed_mask.sum().item()),
-                "sdpo/guideline_kept_samples": float(sample_valid_mask.sum().item()),
+                "sdpo/guideline_kept_samples": float(n_kept),
                 "sdpo/guideline_skipped_self_success": float((~failed_mask).sum().item()),
-                "sdpo_v/num_reward_1_samples": float(sample_reward_is_1.sum()),
+                "sdpo_v/num_reward_1_samples": float(n_reward_1),
             }
             sdpo_skip_metrics.update(guideline_metrics)
             # Attach guideline generation diagnostics if available
@@ -1283,6 +1313,23 @@ class RayPPOTrainer:
                 # NOTE: this breaks the order of data inside the batch.
                 # Please take care when you implement group based adv computation such as GRPO and rloo
                 self._balance_batch(batch, metrics=metrics)
+
+                # ---- Per-sample seqlen diagnostics ----
+                _resp_len = batch.batch["responses"].size(-1)
+                _resp_sums = batch.batch["attention_mask"][:, -_resp_len:].sum(-1).float()
+                _prompt_sums = batch.batch["attention_mask"][:, :-_resp_len].sum(-1).float()
+                _clip_ratio = (_resp_sums == _resp_len).float().mean().item()
+                metrics["debug/per_sample_resp_mean"] = _resp_sums.mean().item()
+                metrics["debug/per_sample_resp_max"] = _resp_sums.max().item()
+                metrics["debug/per_sample_prompt_mean"] = _prompt_sums.mean().item()
+                metrics["debug/resp_clip_ratio"] = _clip_ratio
+                if _clip_ratio > 0.9:
+                    print(
+                        f"[WARN] step={self.global_step}: {_clip_ratio*100:.0f}% of responses "
+                        f"hit max_response_length={_resp_len}. "
+                        f"Avg response tokens: {_resp_sums.mean():.0f}. "
+                        f"This usually indicates model degeneration (no EOS generated)."
+                    )
 
                 # compute global valid tokens
                 batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
