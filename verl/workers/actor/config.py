@@ -171,6 +171,10 @@ class ActorConfig:
     sdpo_v_softkl_debug: bool = field(default=False, init=False)
     sdpo_v_softkl_use_ema_bad_ref: bool = field(default=True, init=False)
     sdpo_v_softkl_kl_max: float = field(default=1.0, init=False)
+    # ---- Combined DAPO+SDPO lambda weights (set from AlgorithmConfig) ----
+    lambda_dapo: float = field(default=1.0, init=False)
+    lambda_sdpo_t: float = field(default=0.1, init=False)
+    lambda_sdpo_v: float = field(default=0.1, init=False)
 
 
 @dataclass

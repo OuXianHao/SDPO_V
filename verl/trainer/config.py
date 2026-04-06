@@ -65,7 +65,7 @@ class DataConfig:
 @dataclass
 class AlgorithmConfig:
     loss_mode: str = "grpo_on_policy"
-    """training objective mode, support `grpo_on_policy`, `sdpo_logit`"""
+    """training objective mode, support `grpo_on_policy`, `sdpo_logit`, `dapo_with_sdpo`"""
     gamma: float = 1.0
     """discount factor for ppo gae advantage estimator"""
     lam: float = 1.0
@@ -104,6 +104,14 @@ class AlgorithmConfig:
     """Alpha for divergence interpolation: 0.0=forward KL, 1.0=reverse KL, in-between=GJS. None=derive from sdpo_divergence."""
     sdpo_teacher_update_rate: float = 0.0
     """EMA update rate for teacher weights (0.0=frozen ref teacher, 0.05=original SDPO default)."""
+
+    # ---- Combined DAPO+SDPO loss weights (dapo_with_sdpo mode) ----
+    lambda_dapo: float = 1.0
+    """Weight for the DAPO/GRPO main loss in combined mode."""
+    lambda_sdpo_t: float = 0.1
+    """Weight for the SDPO-T auxiliary loss in combined mode."""
+    lambda_sdpo_v: float = 0.1
+    """Weight for the SDPO-V auxiliary loss in combined mode."""
 
     # ---- SDPO-V (visual separation) settings ----
     sdpo_v_enabled: bool = False
@@ -252,6 +260,10 @@ class PPOConfig:
         self.worker.actor.sdpo_v_softkl_debug = self.algorithm.sdpo_v_softkl_debug
         self.worker.actor.sdpo_v_softkl_use_ema_bad_ref = self.algorithm.sdpo_v_softkl_use_ema_bad_ref
         self.worker.actor.sdpo_v_softkl_kl_max = self.algorithm.sdpo_v_softkl_kl_max
+        # Combined DAPO+SDPO lambda propagation
+        self.worker.actor.lambda_dapo = self.algorithm.lambda_dapo
+        self.worker.actor.lambda_sdpo_t = self.algorithm.lambda_sdpo_t
+        self.worker.actor.lambda_sdpo_v = self.algorithm.lambda_sdpo_v
 
     def deep_post_init(self):
         recursive_post_init(self)

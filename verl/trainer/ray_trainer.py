@@ -244,7 +244,7 @@ class RayPPOTrainer:
 
         self.loss_mode = config.algorithm.loss_mode
         print(f"[trainer] selected loss_mode={self.loss_mode}")
-        if self.loss_mode == "sdpo_logit":
+        if self.loss_mode in ("sdpo_logit", "dapo_with_sdpo"):
             print(
                 f"[trainer] sdpo settings: topk={config.algorithm.sdpo_topk}, "
                 f"divergence={config.algorithm.sdpo_divergence}, use_tail={config.algorithm.sdpo_use_tail}, "
@@ -258,9 +258,16 @@ class RayPPOTrainer:
                     f"bad_video_mode={config.algorithm.sdpo_v_bad_video_mode}, "
                     f"calibration={config.algorithm.sdpo_v_calibration}"
                 )
+        if self.loss_mode == "dapo_with_sdpo":
+            print(
+                f"[trainer] dapo_with_sdpo weights: lambda_dapo={config.algorithm.lambda_dapo}, "
+                f"lambda_sdpo_t={config.algorithm.lambda_sdpo_t}, "
+                f"lambda_sdpo_v={config.algorithm.lambda_sdpo_v}"
+            )
 
         # define KL control
-        if config.algorithm.disable_kl or self.loss_mode == "sdpo_logit":
+        # dapo_with_sdpo uses filter-disabled DAPO: no KL, no reference policy
+        if config.algorithm.disable_kl or self.loss_mode in ("sdpo_logit", "dapo_with_sdpo"):
             self.use_reference_policy = False
             self.kl_ctrl = FixedKLController(init_kl_coef=0.0)
             if config.algorithm.disable_kl:
@@ -269,19 +276,19 @@ class RayPPOTrainer:
             self.use_reference_policy = True
             self.kl_ctrl = get_kl_controller(config.algorithm)
 
-        if self.loss_mode == "sdpo_logit":
+        if self.loss_mode in ("sdpo_logit", "dapo_with_sdpo"):
             self.use_critic = False
         elif config.algorithm.adv_estimator == AdvantageEstimator.GAE:
             self.use_critic = True
         else:
             self.use_critic = False
 
-        if self.loss_mode == "grpo_on_policy" and config.algorithm.adv_estimator not in list(AdvantageEstimator):
+        if self.loss_mode in ("grpo_on_policy", "dapo_with_sdpo") and config.algorithm.adv_estimator not in list(AdvantageEstimator):
             raise NotImplementedError(f"Unknown advantage estimator: {config.algorithm.adv_estimator}.")
 
-        if config.algorithm.loss_mode not in ("grpo_on_policy", "sdpo_logit"):
-            raise ValueError("algorithm.loss_mode must be one of {`grpo_on_policy`, `sdpo_logit`}.")
-        print(f"[trainer] teacher feedback fields enabled={config.algorithm.loss_mode == 'sdpo_logit'}")
+        if config.algorithm.loss_mode not in ("grpo_on_policy", "sdpo_logit", "dapo_with_sdpo"):
+            raise ValueError("algorithm.loss_mode must be one of {`grpo_on_policy`, `sdpo_logit`, `dapo_with_sdpo`}.")
+        print(f"[trainer] teacher feedback fields enabled={config.algorithm.loss_mode in ('sdpo_logit', 'dapo_with_sdpo')}")
 
         if config.data.rollout_batch_size % config.worker.actor.global_batch_size != 0:
             raise ValueError("Rollout batch size must be divisible by actor global batch size.")
@@ -305,7 +312,7 @@ class RayPPOTrainer:
                 )
 
         if (
-            self.loss_mode == "grpo_on_policy"
+            self.loss_mode in ("grpo_on_policy", "dapo_with_sdpo")
             and config.algorithm.adv_estimator in (AdvantageEstimator.GRPO, AdvantageEstimator.RLOO)
             and config.worker.rollout.n == 1
         ):
@@ -315,6 +322,8 @@ class RayPPOTrainer:
             raise ValueError("grpo_on_policy requires actor.ppo_epochs=1 for strict on-policy single update.")
         if self.loss_mode == "sdpo_logit" and config.worker.actor.ppo_epochs != 1:
             raise ValueError("sdpo_logit requires actor.ppo_epochs=1 for clean standalone online SDPO.")
+        if self.loss_mode == "dapo_with_sdpo" and config.worker.actor.ppo_epochs != 1:
+            raise ValueError("dapo_with_sdpo requires actor.ppo_epochs=1 for on-policy combined training.")
 
         if config.trainer.max_steps is not None:
             self.training_steps = config.trainer.max_steps
@@ -1018,6 +1027,77 @@ class RayPPOTrainer:
 
         raise ValueError(f"Unsupported sdpo feedback mode: {mode}")
 
+    def _attach_sdpo_fields_combined(self, batch: DataProto) -> tuple[DataProto, dict[str, float]]:
+        """Attach SDPO fields for the dapo_with_sdpo combined mode.
+
+        Key differences from _attach_sdpo_fields:
+        - SDPO-T valid mask: mixed-group gating only (all rollouts in mixed groups participate).
+          Unlike the legacy ``successful_rollout`` mode which only keeps wrong rollouts.
+        - SDPO-V valid mask: all rollouts participate (no correct-only restriction).
+          Only engineering safety masks (response_mask, empty-mask protection) are applied.
+        - Teacher prompt construction uses the ``scalar_text`` path (feedback text with
+          accuracy info) to keep it simple and compatible with all-rollout participation.
+        """
+        if "accuracy_reward" not in batch.non_tensor_batch:
+            raise KeyError(
+                "Missing `accuracy_reward` in batch.non_tensor_batch. "
+                "dapo_with_sdpo requires binary accuracy reward from reward function."
+            )
+
+        uids = batch.non_tensor_batch["uid"]
+        accuracy_reward = np.asarray(batch.non_tensor_batch["accuracy_reward"], dtype=np.float32)
+        if len(accuracy_reward) != len(batch):
+            raise ValueError("`accuracy_reward` length must match batch size.")
+
+        response_mask = batch.batch["response_mask"].clone().bool()
+        batch.batch["response_token_mask"] = response_mask
+
+        # ---- SDPO-T valid mask: mixed-group gating, all rollouts in mixed groups ----
+        sdpo_valid_mask = torch.ones_like(response_mask, dtype=torch.bool)
+        uid2indices = defaultdict(list)
+        for idx, uid in enumerate(uids):
+            uid2indices[uid].append(idx)
+
+        num_all_correct_skipped = 0
+        num_all_wrong_skipped = 0
+        num_mixed_kept = 0
+
+        for indices in uid2indices.values():
+            group_acc = accuracy_reward[indices]
+            all_correct = bool(np.all(np.isclose(group_acc, 1.0)))
+            all_wrong = bool(np.all(np.isclose(group_acc, 0.0)))
+
+            if all_correct:
+                sdpo_valid_mask[indices] = False
+                num_all_correct_skipped += 1
+            elif all_wrong:
+                sdpo_valid_mask[indices] = False
+                num_all_wrong_skipped += 1
+            else:
+                # Mixed group: ALL rollouts participate (both correct and incorrect)
+                num_mixed_kept += 1
+
+        # Build teacher feedback / prompt text using scalar_text path
+        feedback_text = self._build_feedback_text(batch)
+        batch.non_tensor_batch["feedback_text"] = feedback_text
+        batch.non_tensor_batch["teacher_prompt_text"] = self._build_teacher_prompt_text_scalar(batch)
+        batch.batch["sdpo_valid_mask"] = sdpo_valid_mask
+
+        # ---- SDPO-V valid mask: ALL rollouts participate (widened) ----
+        # Only engineering safety masks are applied: response_mask ensures
+        # we only operate on valid response tokens. No correctness gating.
+        sdpo_v_valid_mask = response_mask  # all rollouts with valid response tokens
+        batch.batch["sdpo_v_valid_mask"] = sdpo_v_valid_mask
+
+        sdpo_skip_metrics = {
+            "sdpo/num_all_correct_skipped": float(num_all_correct_skipped),
+            "sdpo/num_all_wrong_skipped": float(num_all_wrong_skipped),
+            "sdpo/num_mixed_kept": float(num_mixed_kept),
+            "sdpo/combined_mode_sdpo_t_valid_samples": float(sdpo_valid_mask.any(dim=-1).sum().item()),
+            "sdpo_v/num_valid_samples": float(sdpo_v_valid_mask.any(dim=-1).sum().item()),
+        }
+        return batch, sdpo_skip_metrics
+
     def _export_problem_id_stats(self, batch: DataProto, global_step: int) -> dict[str, float]:
         """Aggregate rollout results by problem_id and export stats files.
 
@@ -1163,7 +1243,7 @@ class RayPPOTrainer:
             new_batch.non_tensor_batch["uid"] = np.array(
                 [str(uuid.uuid4()) for _ in range(len(new_batch.batch))], dtype=object
             )
-            if self.config.algorithm.loss_mode == "sdpo_logit":
+            if self.config.algorithm.loss_mode in ("sdpo_logit", "dapo_with_sdpo"):
                 new_batch.non_tensor_batch["pad_token_id"] = np.array(
                     [self.tokenizer.pad_token_id for _ in range(len(new_batch.batch))], dtype=object
                 )
@@ -1194,7 +1274,7 @@ class RayPPOTrainer:
 
             # repeat to align with repeated responses in rollout
             new_batch = new_batch.repeat(repeat_times=self.config.worker.rollout.n, interleave=True)
-            if self.config.algorithm.loss_mode == "sdpo_logit" and "raw_prompt_ids" in gen_batch.non_tensor_batch:
+            if self.config.algorithm.loss_mode in ("sdpo_logit", "dapo_with_sdpo") and "raw_prompt_ids" in gen_batch.non_tensor_batch:
                 new_batch.non_tensor_batch["raw_prompt_ids"] = np.repeat(
                     gen_batch.non_tensor_batch["raw_prompt_ids"], self.config.worker.rollout.n
                 )
@@ -1293,8 +1373,8 @@ class RayPPOTrainer:
                         batch.meta_info["global_step"] = self.global_step
                         reward_ref = self.reward_fn.compute_reward.remote(batch)
 
-                # recompute old_log_probs (only needed by on-policy GRPO objective)
-                if self.loss_mode == "grpo_on_policy":
+                # recompute old_log_probs (needed by on-policy GRPO / DAPO objective)
+                if self.loss_mode in ("grpo_on_policy", "dapo_with_sdpo"):
                     with timer("old", timing_raw):
                         old_log_probs = self.actor_rollout_ref_wg.compute_log_probs(batch)
                         batch = batch.union(old_log_probs)
@@ -1318,7 +1398,7 @@ class RayPPOTrainer:
                         if reward_tensor.size(0) != len(batch):
                             raise ValueError("Reward tensor batch size must align with expanded rollout batch.")
                         batch.batch["token_level_scores"] = reward_tensor
-                        if self.config.algorithm.loss_mode == "sdpo_logit":
+                        if self.config.algorithm.loss_mode in ("sdpo_logit", "dapo_with_sdpo"):
                             if "accuracy" not in reward_metrics:
                                 raise KeyError(
                                     "SDPO skip-by-group requires reward metric `accuracy`. "
@@ -1329,16 +1409,34 @@ class RayPPOTrainer:
                             )
                         reward_metrics = {f"reward/{k}": v for k, v in reduce_metrics(reward_metrics).items()}
                         metrics.update(reward_metrics)
-                    # In sdpo_logit mode, reward is used only to construct teacher feedback text,
-                    # not to compute PPO/GRPO advantages or the main optimization objective.
+
                     if self.config.algorithm.loss_mode == "sdpo_logit":
+                        # In sdpo_logit mode, reward is used only to construct teacher feedback text,
+                        # not to compute PPO/GRPO advantages or the main optimization objective.
                         batch, sdpo_skip_metrics = self._attach_sdpo_fields(
                             batch, mode=self.config.algorithm.sdpo_feedback_mode
                         )
                         metrics.update(sdpo_skip_metrics)
                         pid_stats_metrics = self._export_problem_id_stats(batch, global_step=self.global_step)
                         metrics.update(pid_stats_metrics)
+                    elif self.config.algorithm.loss_mode == "dapo_with_sdpo":
+                        # Combined mode: prepare BOTH DAPO advantages AND SDPO fields.
+                        # 1) DAPO/GRPO advantages (filter-disabled: all groups participate)
+                        batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+                        batch = compute_advantage(
+                            batch,
+                            adv_estimator=self.config.algorithm.adv_estimator,
+                            gamma=self.config.algorithm.gamma,
+                            lam=self.config.algorithm.lam,
+                        )
+                        metrics["grpo/reward_mean"] = batch.batch["token_level_scores"].sum(dim=-1).float().mean().item()
+                        metrics["grpo/adv_mean"] = batch.batch["advantages"].float().mean().item()
+                        metrics["grpo/adv_std"] = batch.batch["advantages"].float().std().item()
+                        # 2) SDPO fields (mixed-group gating for SDPO-T, widened masks for SDPO-V)
+                        batch, sdpo_skip_metrics = self._attach_sdpo_fields_combined(batch)
+                        metrics.update(sdpo_skip_metrics)
                     else:
+                        # grpo_on_policy mode
                         # apply kl penalty if available
                         if not self.config.algorithm.use_kl_loss and self.use_reference_policy:
                             # apply kl penalty to reward

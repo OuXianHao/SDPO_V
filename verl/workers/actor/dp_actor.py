@@ -87,13 +87,19 @@ class DataParallelPPOActor(BasePPOActor):
 
         if self.is_trainable_actor and self.rank == 0:
             print(f"[actor] selected loss_mode={self.config.loss_mode}")
-            if self.config.loss_mode == "sdpo_logit":
+            if self.config.loss_mode in ("sdpo_logit", "dapo_with_sdpo"):
                 print(
                     f"[actor] sdpo settings: topk={self.config.sdpo_topk}, "
                     f"divergence={self.config.sdpo_divergence}, use_tail={self.config.sdpo_use_tail}, "
                     f"approx_mode={self.config.sdpo_approx_mode}, "
                     f"alpha={self.config.sdpo_alpha}"
                 )
+                if self.config.loss_mode == "dapo_with_sdpo":
+                    print(
+                        f"[actor] dapo_with_sdpo weights: lambda_dapo={self.config.lambda_dapo}, "
+                        f"lambda_sdpo_t={self.config.lambda_sdpo_t}, "
+                        f"lambda_sdpo_v={self.config.lambda_sdpo_v}"
+                    )
                 if self.config.sdpo_v_enabled:
                     print(
                         f"[actor] sdpo_v ENABLED: weight={self.config.sdpo_v_weight}, "
@@ -1437,6 +1443,181 @@ class DataParallelPPOActor(BasePPOActor):
 
         return sk_loss, sk_metrics
 
+    def _compute_dapo_with_sdpo_loss(
+        self,
+        model_inputs: dict[str, Any],
+        temperature: float,
+        total_response_tokens: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Combined DAPO + SDPO-T + SDPO-V loss for dapo_with_sdpo mode.
+
+        Uses a SINGLE student forward pass:
+        1. Calls _forward_response_logits() → student_logits (batch, resp_len, vocab)
+        2. Derives log_probs from student_logits for the GRPO/DAPO loss
+        3. Computes SDPO-T loss from student_logits + teacher_logits
+        4. Optionally computes SDPO-V loss from student_logits + bad-video logits
+
+        Returns:
+            combined_loss: scalar (before per-token scaling)
+            metrics: dict of float metrics
+        """
+        metrics: dict[str, float] = {}
+        responses = model_inputs["responses"]
+        response_mask = model_inputs["response_mask"]  # used by DAPO (unmasked)
+
+        # ================================================================
+        # STEP 1: Build teacher inputs (needed for SDPO-T)
+        # ================================================================
+        teacher_input_ids, teacher_attention_mask, teacher_position_ids, teacher_multi_modal_inputs = (
+            self._build_teacher_inputs(model_inputs)
+        )
+
+        # ================================================================
+        # STEP 2: Teacher forward (no_grad) — for SDPO-T
+        # ================================================================
+        teacher_model = self.teacher_module  # None → falls back to actor_module
+        with torch.no_grad():
+            teacher_logits = self._forward_response_logits(
+                model_inputs,
+                temperature=temperature,
+                input_ids=teacher_input_ids,
+                attention_mask=teacher_attention_mask,
+                position_ids=teacher_position_ids,
+                multi_modal_inputs=teacher_multi_modal_inputs,
+                module=teacher_model,
+            )
+
+        # ================================================================
+        # STEP 3: Student forward (with grad) — shared for DAPO + SDPO-T + SDPO-V
+        # ================================================================
+        student_logits = self._forward_response_logits(model_inputs, temperature=temperature)
+
+        # Verify alignment
+        if teacher_logits.shape[:2] != student_logits.shape[:2]:
+            raise ValueError(
+                f"Teacher/student response span mismatch: teacher={tuple(teacher_logits.shape)}, "
+                f"student={tuple(student_logits.shape)}."
+            )
+
+        # ================================================================
+        # STEP 4: Derive log_probs for DAPO/GRPO loss from student_logits
+        # ================================================================
+        log_probs = self.log_probs_from_logits(student_logits, responses)  # (batch, resp_len)
+
+        old_log_probs = model_inputs["old_log_probs"]
+        advantages = model_inputs["advantages"]
+
+        dapo_loss, grpo_metrics = compute_grpo_loss(
+            old_log_probs=old_log_probs,
+            log_probs=log_probs,
+            advantages=advantages,
+            response_mask=response_mask,  # DAPO uses normal response_mask, NOT sdpo_valid_mask
+            clip_ratio_low=self.config.clip_ratio_low,
+            clip_ratio_high=self.config.clip_ratio_high,
+            clip_ratio_dual=self.config.clip_ratio_dual,
+            loss_avg_mode=self.config.loss_avg_mode,
+        )
+        metrics.update({f"grpo/{k}": v for k, v in grpo_metrics.items()})
+
+        # ================================================================
+        # STEP 5: SDPO-T loss (uses sdpo_valid_mask for mixed-group gating)
+        # ================================================================
+        sdpo_t_response_mask = (
+            model_inputs["response_mask"].bool()
+            & model_inputs["response_token_mask"].bool()
+            & model_inputs["sdpo_valid_mask"].bool()
+        )
+
+        approx_mode = self.config.sdpo_approx_mode
+        topk_mode = approx_mode in ("topk", "student_topk_tail")
+        topk_k = self.config.sdpo_topk
+
+        if topk_mode:
+            student_topk = self._extract_topk_logps(student_logits, k=topk_k)
+            with torch.no_grad():
+                teacher_topk = self._extract_topk_logps(
+                    teacher_logits, k=topk_k, topk_indices=student_topk["topk_indices"]
+                )
+            sdpo_t_loss, sdpo_t_metrics = compute_sdpo_logit_loss(
+                student_topk_logps=student_topk["topk_logps"],
+                teacher_topk_logps=teacher_topk["topk_logps"],
+                response_mask=sdpo_t_response_mask,
+                topk=topk_k,
+                divergence=self.config.sdpo_divergence,
+                use_tail=self.config.sdpo_use_tail,
+                approx_mode=approx_mode,
+                alpha=self.config.sdpo_alpha,
+                student_logits_for_metrics=student_logits.detach(),
+                teacher_logits_for_metrics=teacher_logits.detach(),
+            )
+        else:
+            sdpo_t_loss, sdpo_t_metrics = compute_sdpo_logit_loss(
+                student_logits=student_logits,
+                teacher_logits=teacher_logits,
+                response_mask=sdpo_t_response_mask,
+                topk=topk_k,
+                divergence=self.config.sdpo_divergence,
+                use_tail=self.config.sdpo_use_tail,
+                approx_mode=approx_mode,
+                alpha=self.config.sdpo_alpha,
+            )
+        metrics.update({f"sdpo/{k}": v for k, v in sdpo_t_metrics.items()})
+
+        # ================================================================
+        # STEP 6: SDPO-V loss (if enabled)
+        # ================================================================
+        sdpo_v_loss_val = torch.tensor(0.0, device=student_logits.device)
+        if self.config.sdpo_v_enabled:
+            sdpo_v_loss, sdpo_v_metrics = self._compute_sdpo_v_loss(
+                model_inputs=model_inputs,
+                student_logits=student_logits,
+                temperature=temperature,
+            )
+            sdpo_v_loss_val = sdpo_v_loss
+            metrics.update({f"sdpo_v/{k}": v for k, v in sdpo_v_metrics.items()})
+
+        if self.config.sdpo_v_softkl_enabled:
+            sdpo_v_sk_loss, sdpo_v_sk_metrics = self._compute_sdpo_v_softkl_loss(
+                model_inputs=model_inputs,
+                student_logits=student_logits,
+                temperature=temperature,
+            )
+            sdpo_v_loss_val = sdpo_v_loss_val + sdpo_v_sk_loss
+            metrics.update({f"sdpo_v_softkl/{k}": v for k, v in sdpo_v_sk_metrics.items()})
+
+        # ================================================================
+        # STEP 7: Aggregate combined loss
+        # ================================================================
+        lambda_dapo = self.config.lambda_dapo
+        lambda_sdpo_t = self.config.lambda_sdpo_t
+        lambda_sdpo_v = self.config.lambda_sdpo_v
+
+        combined_loss = (
+            lambda_dapo * dapo_loss
+            + lambda_sdpo_t * sdpo_t_loss
+            + lambda_sdpo_v * sdpo_v_loss_val
+        )
+
+        # Logging
+        metrics["combined/total_loss"] = combined_loss.detach().item()
+        metrics["combined/dapo_loss"] = dapo_loss.detach().item()
+        metrics["combined/sdpo_t_loss"] = sdpo_t_loss.detach().item()
+        metrics["combined/sdpo_v_loss"] = sdpo_v_loss_val.detach().item()
+        metrics["combined/lambda_dapo"] = lambda_dapo
+        metrics["combined/lambda_sdpo_t"] = lambda_sdpo_t
+        metrics["combined/lambda_sdpo_v"] = lambda_sdpo_v
+        metrics["combined/sdpo_t_valid_ratio"] = float(sdpo_t_response_mask.any(dim=-1).sum().item()) / max(response_mask.shape[0], 1)
+
+        if self.rank == 0:
+            print(
+                f"[dapo_with_sdpo] L_total={combined_loss.item():.6f} "
+                f"L_dapo={dapo_loss.item():.6f} L_sdpo_t={sdpo_t_loss.item():.6f} "
+                f"L_sdpo_v={sdpo_v_loss_val.item():.6f} "
+                f"λ_dapo={lambda_dapo} λ_sdpo_t={lambda_sdpo_t} λ_sdpo_v={lambda_sdpo_v}"
+            )
+
+        return combined_loss, metrics
+
     def _optimizer_step(self) -> torch.Tensor:
         if isinstance(self.actor_module, FSDP):
             grad_norm = self.actor_module.clip_grad_norm_(self.config.max_grad_norm)
@@ -1516,6 +1697,13 @@ class DataParallelPPOActor(BasePPOActor):
         if self.config.loss_mode == "grpo_on_policy":
             select_keys.extend(["old_log_probs", "advantages"])
         elif self.config.loss_mode == "sdpo_logit":
+            select_keys.extend(["sdpo_valid_mask", "response_token_mask", "sdpo_v_valid_mask"])
+            non_tensor_select_keys.extend(
+                ["raw_prompt_text", "prompt_text", "feedback_text", "teacher_prompt_text", "multi_modal_data", "pad_token_id"]
+            )
+        elif self.config.loss_mode == "dapo_with_sdpo":
+            # Combined mode needs BOTH GRPO fields and SDPO fields
+            select_keys.extend(["old_log_probs", "advantages"])
             select_keys.extend(["sdpo_valid_mask", "response_token_mask", "sdpo_v_valid_mask"])
             non_tensor_select_keys.extend(
                 ["raw_prompt_text", "prompt_text", "feedback_text", "teacher_prompt_text", "multi_modal_data", "pad_token_id"]
@@ -1623,6 +1811,13 @@ class DataParallelPPOActor(BasePPOActor):
                         if _debug_shapes_bwd and self.rank == 0:
                             print(f"[SDPO_T_BACKWARD] step=B_END loss.backward() completed successfully")
                         append_to_dict(metrics, sdpo_metrics)
+                    elif self.config.loss_mode == "dapo_with_sdpo":
+                        loss, combined_metrics = self._compute_dapo_with_sdpo_loss(
+                            model_inputs, temperature=temperature, total_response_tokens=total_response_tokens,
+                        )
+                        loss = loss * torch.sum(response_mask) * self.world_size / total_response_tokens
+                        loss.backward()
+                        append_to_dict(metrics, combined_metrics)
                     else:
                         raise ValueError(f"Unknown actor.loss_mode: {self.config.loss_mode}")
 
