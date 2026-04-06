@@ -76,17 +76,36 @@ def _extract_option_letter(text: str) -> Optional[str]:
 
 
 def format_reward(response: str) -> float:
+    """Validate format: exactly one <thinking>...</thinking> followed by exactly one <answer>...</answer>.
+
+    Requirements:
+    - exactly one <thinking>...</thinking> block
+    - exactly one <answer>...</answer> block
+    - <thinking> must appear before <answer>
+    - no text outside those tags (except optional whitespace)
+    - no text after </answer>
+    - <answer> content must be non-empty
+    """
     response = _normalize_response(response)
 
-    open_count = len(re.findall(r"<answer>", response, flags=re.IGNORECASE))
-    close_count = len(re.findall(r"</answer>", response, flags=re.IGNORECASE))
+    thinking_open = len(re.findall(r"<thinking>", response, flags=re.IGNORECASE))
+    thinking_close = len(re.findall(r"</thinking>", response, flags=re.IGNORECASE))
+    answer_open = len(re.findall(r"<answer>", response, flags=re.IGNORECASE))
+    answer_close = len(re.findall(r"</answer>", response, flags=re.IGNORECASE))
 
-    # 必须恰好一对 answer 标签
-    if open_count != 1 or close_count != 1:
+    # Must have exactly one pair of each tag
+    if thinking_open != 1 or thinking_close != 1:
+        return 0.0
+    if answer_open != 1 or answer_close != 1:
         return 0.0
 
-    # 必须以 <answer>...</answer> 结尾，后面不能再有别的文本
-    match = re.search(r"^(.*)<answer>(.*?)</answer>\s*$", response, re.DOTALL | re.IGNORECASE)
+    # Full structure: optional whitespace, <thinking>...</thinking>, optional whitespace,
+    # <answer>...</answer>, optional trailing whitespace. Nothing else.
+    match = re.search(
+        r"^\s*<thinking>(.*?)</thinking>\s*<answer>(.*?)</answer>\s*$",
+        response,
+        re.DOTALL | re.IGNORECASE,
+    )
     if not match:
         return 0.0
 
@@ -135,12 +154,18 @@ def compute_score(reward_input: dict[str, Any], format_weight: float = 0.3) -> d
         if pred_letter is None:
             pred_letter = _extract_option_letter(response)
 
+        thinking_match = re.search(r"<thinking>(.*?)</thinking>", response, re.DOTALL | re.IGNORECASE)
+        thinking_content = thinking_match.group(1).strip() if thinking_match else None
+
         print("=== R1V DEBUG START ===")
         print("raw_response:", repr(reward_input["response"]))
         print("normalized_response:", repr(response))
         print("ground_truth:", repr(reward_input["ground_truth"]))
+        print("thinking_content:", repr(thinking_content[:200] if thinking_content else None))
         print("answer_open_count:", len(re.findall(r"<answer>", response, flags=re.IGNORECASE)))
         print("answer_close_count:", len(re.findall(r"</answer>", response, flags=re.IGNORECASE)))
+        print("thinking_open_count:", len(re.findall(r"<thinking>", response, flags=re.IGNORECASE)))
+        print("thinking_close_count:", len(re.findall(r"</thinking>", response, flags=re.IGNORECASE)))
         print("all_answer_contents:", repr(all_answers))
         print("final_answer_content:", repr(final_answer))
         print("pred_letter:", repr(pred_letter))

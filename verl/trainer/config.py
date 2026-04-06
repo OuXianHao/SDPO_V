@@ -205,6 +205,11 @@ class TrainerConfig:
     """file to save ray timeline"""
     find_last_checkpoint: bool = True
     """automatically find the last checkpoint in the save checkpoint path to resume training"""
+    allow_tf32: bool = False
+    """Enable TF32 for matmul and cuDNN operations. TF32 uses 19-bit precision
+    (10-bit mantissa) and can significantly speed up training on Ampere+ GPUs
+    with a small precision trade-off. Default False preserves the existing
+    behavior (full fp32 precision for internal matmul accumulations)."""
 
     def post_init(self):
         if self.save_checkpoint_path is None:
@@ -222,6 +227,7 @@ class PPOConfig:
     trainer: TrainerConfig = field(default_factory=TrainerConfig)
 
     def post_init(self):
+        self.worker.allow_tf32 = self.trainer.allow_tf32
         self.worker.rollout.prompt_length = self.data.max_prompt_length
         self.worker.rollout.response_length = self.data.max_response_length
         self.worker.rollout.trust_remote_code = self.worker.actor.model.trust_remote_code

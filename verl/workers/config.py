@@ -50,6 +50,8 @@ class WorkerConfig:
     min_pixels: Optional[int] = None
     max_pixels: Optional[int] = None
     video_fps: float = 2.0
+    allow_tf32: bool = False
+    """Enable TF32 for matmul and cuDNN. Set from trainer.allow_tf32."""
 
     def post_init(self):
         self.ref.micro_batch_size_per_device_for_experience = self.actor.micro_batch_size_per_device_for_experience
