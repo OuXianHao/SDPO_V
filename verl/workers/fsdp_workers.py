@@ -474,7 +474,7 @@ class FSDPWorker(Worker):
         # pattern of `self.actor.teacher_module = self.ref_module_fsdp`.
         if self._has_actor and self._has_ref:
             loss_mode = getattr(self.config.actor, "loss_mode", "")
-            if loss_mode == "sdpo_logit" and hasattr(self, "ref_fsdp_module"):
+            if loss_mode in ("sdpo_logit", "dapo_with_sdpo") and hasattr(self, "ref_fsdp_module"):
                 self.actor.teacher_module = self.ref_fsdp_module
                 if dist.get_rank() == 0:
                     print(
