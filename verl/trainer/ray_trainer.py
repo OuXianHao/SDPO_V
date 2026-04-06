@@ -621,7 +621,7 @@ class RayPPOTrainer:
                     "Correctly solve the original question.\n"
                     "Respond concisely. Your thinking should be brief and focused — "
                     "identify the core logic, skip trivial steps, and avoid verbose or redundant thinking. "
-                    "Keep your thinking within 500 words."
+                    "Place reasoning in <thinking> tags and the final answer in <answer> tags."
                 )
             if format_prompt is None or format_prompt == "":
                 teacher_prompt_text = content_text
@@ -835,10 +835,10 @@ class RayPPOTrainer:
                     f"{uid_guidelines[uid]}\n\n"
                     "Correctly solve the original question.\n"
                     "Respond concisely. Your thinking should be brief and focused — "
-                    "identify the core logic, skip trivial steps, and avoid verbose or redundant thinking. "
-                    "Keep your thinking within 500 words.\n"
-                    "Important: Your final answer must be enclosed in exactly one pair of "
-                    "<answer> and </answer> tags. Do not output any text after </answer>."
+                    "identify the core logic, skip trivial steps, and avoid verbose or redundant thinking.\n"
+                    "Place reasoning in <thinking> tags and the final answer in <answer> tags.\n"
+                    "Do not output any text outside the <thinking> and <answer> tags. "
+                    "Do not output any text after </answer>."
                 )
                 sample_valid_mask[idx] = True
                 guideline_used += 1
@@ -850,7 +850,7 @@ class RayPPOTrainer:
                     "Correctly solve the original question.\n"
                     "Respond concisely. Your thinking should be brief and focused — "
                     "identify the core logic, skip trivial steps, and avoid verbose or redundant thinking. "
-                    "Keep your thinking within 500 words."
+                    "Place reasoning in <thinking> tags and the final answer in <answer> tags."
                 )
                 sample_valid_mask[idx] = True
                 fallback_used += 1

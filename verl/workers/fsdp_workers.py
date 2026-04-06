@@ -91,9 +91,13 @@ class FSDPWorker(Worker):
             self._device = torch.device("cpu")
             self._barrier_device_ids = None
 
-        # improve numerical stability
-        torch.backends.cuda.matmul.allow_tf32 = False
+        # precision backend flags
+        allow_tf32 = getattr(config, "allow_tf32", False)
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+        torch.backends.cudnn.allow_tf32 = allow_tf32
         torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+        if dist.get_rank() == 0:
+            print(f"[precision] allow_tf32={allow_tf32} (matmul + cuDNN)")
 
         self._has_actor = self.role in ["actor", "actor_rollout", "actor_rollout_ref"]
         self._has_critic = self.role == "critic"
