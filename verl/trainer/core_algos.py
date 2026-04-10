@@ -1201,3 +1201,80 @@ def compute_kl(
         return F.kl_div(ref_log_probs, log_probs, log_target=True, reduction="none").sum(-1)
 
     raise NotImplementedError(f"Unknown KL penalty: {kl_penalty}.")
+
+
+def compute_rlsd_token_advantages(
+    advantages: torch.Tensor,
+    teacher_logprobs: torch.Tensor,
+    student_logprobs: torch.Tensor,
+    response_mask: torch.Tensor,
+    rlsd_lambda: float = 0.5,
+    rlsd_eps_w: float = 0.2,
+    delta_clamp: float = 5.0,
+    answer_span_mask: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Token-level advantage reweighting using teacher-student logprob difference.
+
+    Uses the privileged teacher's per-token support to modulate the magnitude
+    of the sequence-level advantage at each token position, without changing
+    the update direction (which is still determined by the sequence-level
+    DAPO/GRPO advantage).
+
+    Formula:
+        delta_t = clamp(logp_teacher(y_t) - logp_student(y_t), -C, C)
+        w_t = exp(sign(A) * delta_t)
+        A_hat_t = A * ((1 - lambda) + lambda * clip(w_t, 1 - eps_w, 1 + eps_w))
+
+    All inputs to delta_t must be detached — no gradient flows through this
+    reweighting path.  The GRPO/DAPO policy loss provides the only gradient
+    through the student log-probs.
+
+    Args:
+        advantages: (bs, resp_len) — uniform sequence-level advantage broadcast to tokens
+        teacher_logprobs: (bs, resp_len) — detached per-token log P_teacher(y_t)
+        student_logprobs: (bs, resp_len) — detached per-token log P_student(y_t)
+        response_mask: (bs, resp_len) — valid response token mask
+        rlsd_lambda: interpolation weight (0 = uniform, 1 = fully reweighted)
+        rlsd_eps_w: clip range for w_t, clipped to [1-eps, 1+eps]
+        delta_clamp: clamp magnitude for delta_t before exponentiation
+        answer_span_mask: (bs, resp_len) optional bool mask, True for answer-span tokens
+            that should be excluded from reweighting (they keep uniform advantage)
+
+    Returns:
+        A_hat_t: (bs, resp_len) — token-level reweighted advantages
+        metrics: diagnostic dict
+    """
+    # delta_t: positive when teacher is more confident than student on this token
+    delta_t = torch.clamp(teacher_logprobs - student_logprobs, -delta_clamp, delta_clamp)
+
+    # w_t > 1 when teacher support aligns with advantage sign:
+    #   A > 0 and teacher more confident → upweight (encourage this token)
+    #   A < 0 and teacher less confident → upweight (penalise this token more)
+    w_t = torch.exp(torch.sign(advantages) * delta_t)
+    w_t = torch.clamp(w_t, 1.0 - rlsd_eps_w, 1.0 + rlsd_eps_w)
+
+    token_weight = (1.0 - rlsd_lambda) + rlsd_lambda * w_t
+
+    # Exclude answer-span tokens from reweighting: keep uniform advantage
+    # to prevent over-concentrating credit on final-answer tokens when the
+    # teacher guideline includes a correct-option hint.
+    if answer_span_mask is not None:
+        token_weight = torch.where(answer_span_mask, torch.ones_like(token_weight), token_weight)
+
+    A_hat_t = advantages * token_weight * response_mask
+
+    # ---- diagnostics ----
+    mask_f = response_mask.float()
+    metrics = {
+        "delta_t_mean": VF.masked_mean(delta_t, mask_f).detach().item(),
+        "delta_t_abs_mean": VF.masked_mean(delta_t.abs(), mask_f).detach().item(),
+        "w_t_mean": VF.masked_mean(w_t, mask_f).detach().item(),
+        "token_weight_mean": VF.masked_mean(token_weight, mask_f).detach().item(),
+        "token_weight_std": (token_weight * mask_f).std().detach().item(),
+    }
+    if answer_span_mask is not None:
+        ans_count = (answer_span_mask & response_mask.bool()).sum().item()
+        total_count = response_mask.sum().item()
+        metrics["answer_span_frac"] = ans_count / max(total_count, 1)
+
+    return A_hat_t, metrics

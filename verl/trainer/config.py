@@ -105,6 +105,23 @@ class AlgorithmConfig:
     sdpo_teacher_update_rate: float = 0.0
     """EMA update rate for teacher weights (0.0=frozen ref teacher, 0.05=original SDPO default)."""
 
+    # ---- Teacher token-level advantage reweighting (experimental) ----
+    teacher_reweight_enabled: bool = False
+    """Enable teacher-guided token-level advantage reweighting.
+    Uses the privileged guideline teacher's token logprobs to modulate
+    per-token advantage magnitude in the DAPO/GRPO objective, without
+    adding a KL/distillation loss.  Only effective in dapo_with_sdpo mode."""
+    teacher_reweight_lambda: float = 0.5
+    """Interpolation between uniform and reweighted advantage.
+    0.0 = fully uniform (no reweighting), 1.0 = fully reweighted."""
+    teacher_reweight_eps_w: float = 0.2
+    """Clip range for the token reweighting factor w_t, clipped to [1 - eps, 1 + eps]."""
+    teacher_reweight_delta_clamp: float = 5.0
+    """Clamp magnitude for teacher-student logprob difference before exponentiation."""
+    teacher_reweight_correct_hint: bool = False
+    """Append the known correct final option to the teacher guideline for MC tasks.
+    Only takes effect when sdpo_feedback_mode is 'guideline_mixed_rollouts'."""
+
     # ---- Combined DAPO+SDPO loss weights (dapo_with_sdpo mode) ----
     lambda_dapo: float = 1.0
     """Weight for the DAPO/GRPO main loss in combined mode."""
@@ -243,6 +260,12 @@ class PPOConfig:
         self.worker.actor.sdpo_feedback_mode = self.algorithm.sdpo_feedback_mode
         self.worker.actor.sdpo_alpha = self.algorithm.sdpo_alpha
         self.worker.actor.sdpo_teacher_update_rate = self.algorithm.sdpo_teacher_update_rate
+        # Teacher token-level reweighting propagation
+        self.worker.actor.teacher_reweight_enabled = self.algorithm.teacher_reweight_enabled
+        self.worker.actor.teacher_reweight_lambda = self.algorithm.teacher_reweight_lambda
+        self.worker.actor.teacher_reweight_eps_w = self.algorithm.teacher_reweight_eps_w
+        self.worker.actor.teacher_reweight_delta_clamp = self.algorithm.teacher_reweight_delta_clamp
+        self.worker.actor.teacher_reweight_correct_hint = self.algorithm.teacher_reweight_correct_hint
         # SDPO-V config propagation
         self.worker.actor.sdpo_v_enabled = self.algorithm.sdpo_v_enabled
         self.worker.actor.sdpo_v_weight = self.algorithm.sdpo_v_weight

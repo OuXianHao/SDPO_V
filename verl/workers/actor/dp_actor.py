@@ -28,7 +28,7 @@ from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from ...protocol import DataProto, batch_collate
-from ...trainer.core_algos import compute_grpo_loss, compute_sdpo_logit_loss, compute_sdpo_v_loss, compute_sdpo_v_calibration_stats, compute_sdpo_v_softkl_loss
+from ...trainer.core_algos import compute_grpo_loss, compute_rlsd_token_advantages, compute_sdpo_logit_loss, compute_sdpo_v_loss, compute_sdpo_v_calibration_stats, compute_sdpo_v_softkl_loss
 from ...utils.bad_video import construct_bad_video_inputs
 from ...utils.dataset import process_image, process_video
 from ...utils import torch_functional as VF
@@ -117,6 +117,13 @@ class DataParallelPPOActor(BasePPOActor):
                         f"use_tail={self.config.sdpo_v_softkl_use_tail}, "
                         f"use_ema_bad_ref={self.config.sdpo_v_softkl_use_ema_bad_ref}"
                     )
+                if self.config.teacher_reweight_enabled:
+                    print(
+                        f"[actor] teacher_reweight ENABLED: lambda={self.config.teacher_reweight_lambda}, "
+                        f"eps_w={self.config.teacher_reweight_eps_w}, "
+                        f"delta_clamp={self.config.teacher_reweight_delta_clamp}, "
+                        f"correct_hint={self.config.teacher_reweight_correct_hint}"
+                    )
 
         self._sdpo_backward_shape_debug = os.getenv("SDPO_BACKWARD_SHAPE_DEBUG", "0").strip().lower() in {
             "1",
@@ -138,11 +145,15 @@ class DataParallelPPOActor(BasePPOActor):
             teacher_param = (1 - rate) * teacher_param + rate * student_param
 
         Only runs when:
-          - loss_mode is sdpo_logit
+          - loss_mode is sdpo_logit, OR dapo_with_sdpo with teacher_reweight_enabled
           - teacher_module is a separate model (not None, not actor_module)
           - sdpo_teacher_update_rate > 0
         """
-        if self.config.loss_mode != "sdpo_logit":
+        _allow_ema = (
+            self.config.loss_mode == "sdpo_logit"
+            or (self.config.loss_mode == "dapo_with_sdpo" and self.config.teacher_reweight_enabled)
+        )
+        if not _allow_ema:
             return
         update_rate = self.config.sdpo_teacher_update_rate
         if update_rate == 0.0:
@@ -165,6 +176,50 @@ class DataParallelPPOActor(BasePPOActor):
         from jinja2 import Template
         template = Template(format_prompt.strip())
         return template.render(content=content_text)
+
+    def _build_answer_span_mask(self, response_ids: torch.Tensor) -> torch.Tensor:
+        """Build a boolean mask marking tokens inside <answer>...</answer> spans.
+
+        Used by teacher_reweight to exclude answer-span tokens from credit
+        reweighting, preventing over-concentration on the final answer when the
+        teacher guideline includes a correct-option hint.
+
+        Scans each response row for the last <answer>...(</answer>) token
+        subsequence and marks those positions True.
+        """
+        # Lazily encode marker token sequences
+        if not hasattr(self, "_answer_open_ids"):
+            tokenizer = getattr(self.processor, "tokenizer", self.processor)
+            self._answer_open_ids = tokenizer.encode("<answer>", add_special_tokens=False)
+            self._answer_close_ids = tokenizer.encode("</answer>", add_special_tokens=False)
+
+        batch_size, seq_len = response_ids.shape
+        mask = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=response_ids.device)
+        open_ids = self._answer_open_ids
+        close_ids = self._answer_close_ids
+        open_len = len(open_ids)
+        close_len = len(close_ids)
+
+        for i in range(batch_size):
+            row = response_ids[i].tolist()
+            # Find last occurrence of <answer> marker
+            open_start = -1
+            for j in range(len(row) - open_len + 1):
+                if row[j : j + open_len] == open_ids:
+                    open_start = j
+            if open_start < 0:
+                continue
+            # Find first </answer> after it
+            close_end = -1
+            for j in range(open_start + open_len, len(row) - close_len + 1):
+                if row[j : j + close_len] == close_ids:
+                    close_end = j + close_len
+                    break
+            if close_end < 0:
+                close_end = len(row)
+            mask[i, open_start:close_end] = True
+
+        return mask
 
     def _forward_micro_batch(self, micro_batch: dict[str, torch.Tensor], temperature: float) -> torch.Tensor:
         """
@@ -1507,6 +1562,31 @@ class DataParallelPPOActor(BasePPOActor):
         old_log_probs = model_inputs["old_log_probs"]
         advantages = model_inputs["advantages"]
 
+        # ================================================================
+        # STEP 4b: Teacher-guided token-level advantage reweighting
+        # When enabled, replace the uniform token advantage with a
+        # token-varying A_hat_t that uses teacher-student logprob
+        # difference to modulate magnitude only (direction unchanged).
+        # ================================================================
+        if self.config.teacher_reweight_enabled:
+            with torch.no_grad():
+                teacher_log_probs = self.log_probs_from_logits(teacher_logits, responses)
+            # Build answer-span mask to exclude <answer>...</answer> from reweighting
+            answer_span_mask = None
+            if self.processor is not None:
+                answer_span_mask = self._build_answer_span_mask(responses)
+            advantages, reweight_metrics = compute_rlsd_token_advantages(
+                advantages=advantages,
+                teacher_logprobs=teacher_log_probs.detach(),
+                student_logprobs=log_probs.detach(),
+                response_mask=response_mask,
+                rlsd_lambda=self.config.teacher_reweight_lambda,
+                rlsd_eps_w=self.config.teacher_reweight_eps_w,
+                delta_clamp=self.config.teacher_reweight_delta_clamp,
+                answer_span_mask=answer_span_mask,
+            )
+            metrics.update({f"reweight/{k}": v for k, v in reweight_metrics.items()})
+
         dapo_loss, grpo_metrics = compute_grpo_loss(
             old_log_probs=old_log_probs,
             log_probs=log_probs,
@@ -1521,47 +1601,52 @@ class DataParallelPPOActor(BasePPOActor):
 
         # ================================================================
         # STEP 5: SDPO-T loss (uses sdpo_valid_mask for mixed-group gating)
+        # Skipped when teacher_reweight_enabled — the teacher signal is used
+        # for token-level advantage reweighting instead of a KL objective.
         # ================================================================
-        sdpo_t_response_mask = (
-            model_inputs["response_mask"].bool()
-            & model_inputs["response_token_mask"].bool()
-            & model_inputs["sdpo_valid_mask"].bool()
-        )
-
-        approx_mode = self.config.sdpo_approx_mode
-        topk_mode = approx_mode in ("topk", "student_topk_tail")
-        topk_k = self.config.sdpo_topk
-
-        if topk_mode:
-            student_topk = self._extract_topk_logps(student_logits, k=topk_k)
-            with torch.no_grad():
-                teacher_topk = self._extract_topk_logps(
-                    teacher_logits, k=topk_k, topk_indices=student_topk["topk_indices"]
-                )
-            sdpo_t_loss, sdpo_t_metrics = compute_sdpo_logit_loss(
-                student_topk_logps=student_topk["topk_logps"],
-                teacher_topk_logps=teacher_topk["topk_logps"],
-                response_mask=sdpo_t_response_mask,
-                topk=topk_k,
-                divergence=self.config.sdpo_divergence,
-                use_tail=self.config.sdpo_use_tail,
-                approx_mode=approx_mode,
-                alpha=self.config.sdpo_alpha,
-                student_logits_for_metrics=student_logits.detach(),
-                teacher_logits_for_metrics=teacher_logits.detach(),
-            )
+        if self.config.teacher_reweight_enabled:
+            sdpo_t_loss = torch.tensor(0.0, device=student_logits.device)
         else:
-            sdpo_t_loss, sdpo_t_metrics = compute_sdpo_logit_loss(
-                student_logits=student_logits,
-                teacher_logits=teacher_logits,
-                response_mask=sdpo_t_response_mask,
-                topk=topk_k,
-                divergence=self.config.sdpo_divergence,
-                use_tail=self.config.sdpo_use_tail,
-                approx_mode=approx_mode,
-                alpha=self.config.sdpo_alpha,
+            sdpo_t_response_mask = (
+                model_inputs["response_mask"].bool()
+                & model_inputs["response_token_mask"].bool()
+                & model_inputs["sdpo_valid_mask"].bool()
             )
-        metrics.update({f"sdpo/{k}": v for k, v in sdpo_t_metrics.items()})
+
+            approx_mode = self.config.sdpo_approx_mode
+            topk_mode = approx_mode in ("topk", "student_topk_tail")
+            topk_k = self.config.sdpo_topk
+
+            if topk_mode:
+                student_topk = self._extract_topk_logps(student_logits, k=topk_k)
+                with torch.no_grad():
+                    teacher_topk = self._extract_topk_logps(
+                        teacher_logits, k=topk_k, topk_indices=student_topk["topk_indices"]
+                    )
+                sdpo_t_loss, sdpo_t_metrics = compute_sdpo_logit_loss(
+                    student_topk_logps=student_topk["topk_logps"],
+                    teacher_topk_logps=teacher_topk["topk_logps"],
+                    response_mask=sdpo_t_response_mask,
+                    topk=topk_k,
+                    divergence=self.config.sdpo_divergence,
+                    use_tail=self.config.sdpo_use_tail,
+                    approx_mode=approx_mode,
+                    alpha=self.config.sdpo_alpha,
+                    student_logits_for_metrics=student_logits.detach(),
+                    teacher_logits_for_metrics=teacher_logits.detach(),
+                )
+            else:
+                sdpo_t_loss, sdpo_t_metrics = compute_sdpo_logit_loss(
+                    student_logits=student_logits,
+                    teacher_logits=teacher_logits,
+                    response_mask=sdpo_t_response_mask,
+                    topk=topk_k,
+                    divergence=self.config.sdpo_divergence,
+                    use_tail=self.config.sdpo_use_tail,
+                    approx_mode=approx_mode,
+                    alpha=self.config.sdpo_alpha,
+                )
+            metrics.update({f"sdpo/{k}": v for k, v in sdpo_t_metrics.items()})
 
         # ================================================================
         # STEP 6: SDPO-V loss (if enabled)
