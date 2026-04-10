@@ -813,26 +813,50 @@ class RayPPOTrainer:
         uid_guidelines: dict[str, Optional[str]],
         successful_sibling_texts: np.ndarray,
         has_successful_sibling: np.ndarray,
+        ground_truths: Optional[np.ndarray] = None,
+        correct_hint: bool = False,
     ) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
-        """Build teacher prompt text using guideline feedback, with fallback to successful rollout."""
+        """Build teacher prompt text using guideline feedback, with fallback to successful rollout.
+
+        When ``correct_hint=True`` and ``ground_truths`` is provided, a
+        lightweight correct-option hint is appended to the guideline/fallback
+        teacher prompts for incorrect rollouts.  This strengthens the
+        privileged teacher's guidance on the correct outcome without serving
+        as a direct supervision target.
+        """
+        import re as _re
+
         format_prompt = self.config.worker.actor.teacher_format_prompt
         teacher_prompt_texts = []
         sample_valid_mask = np.zeros(len(uids), dtype=bool)
         guideline_used = 0
         fallback_used = 0
+        hint_applied = 0
 
         for idx in range(len(uids)):
             uid = uids[idx]
             raw_prompt_text = str(raw_prompt_texts[idx])
             is_correct = bool(np.isclose(float(accuracy_reward[idx]), 1.0))
 
+            # ---- Extract correct-option text (used for hint) ----
+            correct_option_text = None
+            if correct_hint and ground_truths is not None and not is_correct:
+                gt_raw = str(ground_truths[idx])
+                m = _re.search(r"<answer>(.*?)</answer>", gt_raw, _re.DOTALL | _re.IGNORECASE)
+                correct_option_text = m.group(1).strip() if m else gt_raw.strip()
+
             if is_correct:
                 content_text = raw_prompt_text
             elif uid in uid_guidelines and uid_guidelines[uid] is not None:
+                hint_line = ""
+                if correct_option_text:
+                    hint_line = f"The known correct final option is: {correct_option_text}\n"
+                    hint_applied += 1
                 content_text = (
                     f"{raw_prompt_text}\n\n"
                     "Here is some guidance that may help you solve the problem:\n\n"
                     f"{uid_guidelines[uid]}\n\n"
+                    f"{hint_line}"
                     "Correctly solve the original question.\n"
                     "Respond concisely. Your thinking should be brief and focused — "
                     "identify the core logic, skip trivial steps, and avoid verbose or redundant thinking.\n"
@@ -843,10 +867,15 @@ class RayPPOTrainer:
                 sample_valid_mask[idx] = True
                 guideline_used += 1
             elif has_successful_sibling[idx]:
+                hint_line = ""
+                if correct_option_text:
+                    hint_line = f"The known correct final option is: {correct_option_text}\n"
+                    hint_applied += 1
                 content_text = (
                     f"{raw_prompt_text}\n\n"
                     "Correct solution:\n\n"
                     f"{successful_sibling_texts[idx]}\n\n"
+                    f"{hint_line}"
                     "Correctly solve the original question.\n"
                     "Respond concisely. Your thinking should be brief and focused — "
                     "identify the core logic, skip trivial steps, and avoid verbose or redundant thinking. "
@@ -866,6 +895,7 @@ class RayPPOTrainer:
         guideline_metrics = {
             "sdpo/guideline_used_samples": float(guideline_used),
             "sdpo/guideline_fallback_successful_rollout": float(fallback_used),
+            "sdpo/guideline_correct_hint_applied": float(hint_applied),
         }
         return np.array(teacher_prompt_texts, dtype=object), sample_valid_mask, guideline_metrics
 
@@ -987,6 +1017,7 @@ class RayPPOTrainer:
                 uids=uids, accuracy_reward=accuracy_reward, response_texts=response_texts,
             )
 
+            _correct_hint = getattr(self.config.algorithm, "teacher_reweight_correct_hint", False)
             teacher_prompt_texts, sample_valid_mask, guideline_metrics = self._build_teacher_prompt_text_guideline(
                 raw_prompt_texts=batch.non_tensor_batch["raw_prompt_text"],
                 uids=uids,
@@ -994,6 +1025,8 @@ class RayPPOTrainer:
                 uid_guidelines=uid_guidelines,
                 successful_sibling_texts=successful_sibling_texts,
                 has_successful_sibling=has_successful_sibling,
+                ground_truths=batch.non_tensor_batch.get("ground_truth"),
+                correct_hint=_correct_hint,
             )
 
             batch.non_tensor_batch["teacher_prompt_text"] = teacher_prompt_texts
@@ -1432,8 +1465,16 @@ class RayPPOTrainer:
                         metrics["grpo/reward_mean"] = batch.batch["token_level_scores"].sum(dim=-1).float().mean().item()
                         metrics["grpo/adv_mean"] = batch.batch["advantages"].float().mean().item()
                         metrics["grpo/adv_std"] = batch.batch["advantages"].float().std().item()
-                        # 2) SDPO fields (mixed-group gating for SDPO-T, widened masks for SDPO-V)
-                        batch, sdpo_skip_metrics = self._attach_sdpo_fields_combined(batch)
+                        # 2) SDPO fields.
+                        # When teacher_reweight_enabled, use the full _attach_sdpo_fields
+                        # path (which supports guideline_mixed_rollouts feedback mode)
+                        # instead of the combined scalar_text shortcut.
+                        if self.config.algorithm.teacher_reweight_enabled:
+                            batch, sdpo_skip_metrics = self._attach_sdpo_fields(
+                                batch, mode=self.config.algorithm.sdpo_feedback_mode
+                            )
+                        else:
+                            batch, sdpo_skip_metrics = self._attach_sdpo_fields_combined(batch)
                         metrics.update(sdpo_skip_metrics)
                     else:
                         # grpo_on_policy mode
