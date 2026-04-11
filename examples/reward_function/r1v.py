@@ -40,37 +40,47 @@ def _extract_answer_content(response: str) -> str | None:
     return answers[-1]
 
 
-def _extract_option_letter(text: str) -> Optional[str]:
-    """
-    从文本中鲁棒提取选项字母。
-    支持：
-      B
-      b
-      B. eggs
-      (B)
-      Option B
-      Choice B
-      The answer is B
-      answer: B
+def _extract_option_letter_strict(text: str) -> Optional[str]:
+    """Strictly validate that *text* is exactly one option letter A-F.
+
+    After stripping whitespace and upper-casing, the text must be a single
+    character in {A, B, C, D, E, F}.  Anything else (extra words, parentheses,
+    multiple letters, etc.) is rejected as invalid.
     """
     if not text:
         return None
+    ch = str(text).strip().upper()
+    if ch in _VALID_OPTION_SET:
+        return ch
+    return None
 
+
+def _extract_gold_option_letter(text: str) -> Optional[str]:
+    """Parse an option letter from a *gold / ground-truth* string.
+
+    Gold answers in the dataset may appear as:
+      - ``A``
+      - ``<answer>A</answer>``
+      - ``a``  (lowercase)
+
+    This function is intentionally slightly more lenient than the strict
+    prediction parser: it first tries ``<answer>X</answer>`` extraction, then
+    falls back to checking whether the whole string is a single letter.  It
+    does **not** accept multi-letter or free-text gold answers.
+    """
+    if not text:
+        return None
     text = str(text).strip()
 
-    patterns = [
-        r"^\s*\(?([A-Z])\)?(?:[\s\.\:\-\)]|$)",
-        r"^\s*(?:option|choice)\s*\(?([A-Z])\)?(?:[\s\.\:\-\)]|$)",
-        r"^\s*(?:the answer is|answer is|answer)\s*[:\-]?\s*\(?([A-Z])\)?(?:[\s\.\:\-\)]|$)",
-        r"\b([A-Z])\b",
-    ]
+    # Try <answer>X</answer> wrapper first
+    m = re.search(r"<answer>\s*([A-Fa-f])\s*</answer>", text, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
 
-    for p in patterns:
-        match = re.search(p, text, flags=re.IGNORECASE)
-        if match:
-            ch = match.group(1).upper()
-            if ch in _VALID_OPTION_SET:
-                return ch
+    # Bare single letter
+    ch = text.strip().upper()
+    if ch in _VALID_OPTION_SET:
+        return ch
 
     return None
 
@@ -113,6 +123,10 @@ def format_reward(response: str) -> float:
     if not answer_content:
         return 0.0
 
+    # Answer content must be exactly one valid option letter A-F
+    if _extract_option_letter_strict(answer_content) is None:
+        return 0.0
+
     return 1.0
 
 
@@ -124,16 +138,12 @@ def accuracy_reward(response: str, ground_truth: str) -> float:
     if format_reward(response) == 0.0:
         return 0.0
 
-    # 解析 prediction
+    # Parse prediction (strict: must be exactly one letter A-F)
     given_answer = _extract_answer_content(response)
-    pred = _extract_option_letter(given_answer) if given_answer is not None else None
+    pred = _extract_option_letter_strict(given_answer) if given_answer is not None else None
 
-    # 解析 ground truth
-    gt_answer = _extract_answer_content(gt_raw)
-    if gt_answer is not None:
-        gt = _extract_option_letter(gt_answer)
-    else:
-        gt = _extract_option_letter(gt_raw)
+    # Parse ground truth (slightly more lenient to handle dataset formats)
+    gt = _extract_gold_option_letter(gt_raw)
 
     if gt not in _VALID_OPTION_SET:
         return 0.0
@@ -150,9 +160,7 @@ def compute_score(reward_input: dict[str, Any], format_weight: float = 0.3) -> d
     if str(os.environ.get("R1V_DEBUG", "0")) == "1":
         all_answers = _extract_all_answer_contents(response)
         final_answer = _extract_answer_content(response)
-        pred_letter = _extract_option_letter(final_answer) if final_answer is not None else None
-        if pred_letter is None:
-            pred_letter = _extract_option_letter(response)
+        pred_letter = _extract_option_letter_strict(final_answer) if final_answer is not None else None
 
         thinking_match = re.search(r"<thinking>(.*?)</thinking>", response, re.DOTALL | re.IGNORECASE)
         thinking_content = thinking_match.group(1).strip() if thinking_match else None
