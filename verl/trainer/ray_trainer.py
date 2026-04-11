@@ -638,8 +638,15 @@ class RayPPOTrainer:
         uids: np.ndarray,
         accuracy_reward: np.ndarray,
         response_texts: np.ndarray,
+        max_rollouts: int = 5,
     ) -> dict[str, list[tuple[str, bool]]]:
-        """Select up to 5 mixed (correct+incorrect) rollouts per uid for guideline generation."""
+        """Select up to ``max_rollouts`` mixed (correct+incorrect) rollouts per uid for guideline generation.
+
+        Args:
+            max_rollouts: maximum number of rollouts to include per uid.
+                Default 5 preserves the original behaviour.  The teacher-
+                reweight path passes 3 to keep guideline prompts compact.
+        """
         uid2rollouts: dict[str, list[tuple[str, bool]]] = defaultdict(list)
         for idx, uid in enumerate(uids):
             is_correct = bool(np.isclose(float(accuracy_reward[idx]), 1.0))
@@ -651,7 +658,7 @@ class RayPPOTrainer:
             incorrect = [r for r in rollouts if not r[1]]
             if not correct or not incorrect:
                 continue
-            n_target = min(5, len(correct) + len(incorrect))
+            n_target = min(max_rollouts, len(correct) + len(incorrect))
             n_correct = max(1, min(len(correct), n_target // 2))
             n_incorrect = n_target - n_correct
             if n_incorrect > len(incorrect):
@@ -1002,8 +1009,14 @@ class RayPPOTrainer:
         if mode == "guideline_mixed_rollouts":
             response_texts = self._decode_response_texts(batch)
 
-            # Try guideline generation for uid groups with mixed correct/incorrect rollouts
-            uid_mixed_rollouts = self._select_mixed_rollouts_per_uid(uids, accuracy_reward, response_texts)
+            # Try guideline generation for uid groups with mixed correct/incorrect rollouts.
+            # When teacher_reweight is active, use a smaller mixed set (3) to keep
+            # guideline prompts compact — the teacher signal is used for token-level
+            # credit reweighting, not for detailed distillation.
+            _max_rollouts = 3 if getattr(self.config.algorithm, "teacher_reweight_enabled", False) else 5
+            uid_mixed_rollouts = self._select_mixed_rollouts_per_uid(
+                uids, accuracy_reward, response_texts, max_rollouts=_max_rollouts,
+            )
             uid_guidelines: dict[str, Optional[str]] = {}
             if uid_mixed_rollouts:
                 try:
