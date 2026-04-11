@@ -75,7 +75,7 @@ Instructions:
 - Do NOT say which option is correct.
 - Avoid vague advice such as "reason carefully" or "pay attention to the video".
 - Make each guidance point concrete and operational.
-- If any incorrect rollout has format issues (missing <answer> tags, extra text after </answer>, multiple answer blocks), include a guidance point about strict output format compliance.
+- If any incorrect rollout has format issues (missing <answer> tags, extra text after </answer>, multiple answer blocks, or non-single-letter answer content), include a guidance point about strict output format compliance: the <answer> tag must contain exactly one uppercase letter (A-F).
 - The final "Actionable guidance" section should be the most important part, because it will be reused as guiding feedback for later reasoning.
 - Provide a concise guideline within 5 sentences that captures only the core reasoning strategy.
 
@@ -620,8 +620,12 @@ class RayPPOTrainer:
                     f"{successful_sibling_text}\n\n"
                     "Correctly solve the original question.\n"
                     "Respond concisely. Your thinking should be brief and focused — "
-                    "identify the core logic, skip trivial steps, and avoid verbose or redundant thinking. "
-                    "Place reasoning in <thinking> tags and the final answer in <answer> tags."
+                    "identify the core logic, skip trivial steps, and avoid verbose or redundant thinking.\n"
+                    "Place reasoning in <thinking> tags and the final answer in <answer> tags.\n"
+                    "Inside the <answer> tag, output only one uppercase letter corresponding to the correct option, "
+                    "for example A, B, C, D, E, or F.\n"
+                    "Do not output any text outside the <thinking> and <answer> tags. "
+                    "Do not output any text after </answer>."
                 )
             if format_prompt is None or format_prompt == "":
                 teacher_prompt_text = content_text
@@ -868,6 +872,8 @@ class RayPPOTrainer:
                     "Respond concisely. Your thinking should be brief and focused — "
                     "identify the core logic, skip trivial steps, and avoid verbose or redundant thinking.\n"
                     "Place reasoning in <thinking> tags and the final answer in <answer> tags.\n"
+                    "Inside the <answer> tag, output only one uppercase letter corresponding to the correct option, "
+                    "for example A, B, C, D, E, or F.\n"
                     "Do not output any text outside the <thinking> and <answer> tags. "
                     "Do not output any text after </answer>."
                 )
@@ -885,8 +891,12 @@ class RayPPOTrainer:
                     f"{hint_line}"
                     "Correctly solve the original question.\n"
                     "Respond concisely. Your thinking should be brief and focused — "
-                    "identify the core logic, skip trivial steps, and avoid verbose or redundant thinking. "
-                    "Place reasoning in <thinking> tags and the final answer in <answer> tags."
+                    "identify the core logic, skip trivial steps, and avoid verbose or redundant thinking.\n"
+                    "Place reasoning in <thinking> tags and the final answer in <answer> tags.\n"
+                    "Inside the <answer> tag, output only one uppercase letter corresponding to the correct option, "
+                    "for example A, B, C, D, E, or F.\n"
+                    "Do not output any text outside the <thinking> and <answer> tags. "
+                    "Do not output any text after </answer>."
                 )
                 sample_valid_mask[idx] = True
                 fallback_used += 1

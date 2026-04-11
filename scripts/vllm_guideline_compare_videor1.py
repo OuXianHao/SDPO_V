@@ -23,9 +23,11 @@ BASE_PROMPT_TEMPLATE = """A conversation between User and Assistant. The user as
 Before giving the final answer, the Assistant should reason about how the answer is obtained from the video.
 The reasoning should be grounded in the visual evidence, especially temporal order, repeated actions, object motion, state changes, and outcome differences.
 Respond concisely. Your thinking should be brief and focused — identify the core logic, skip trivial steps, and avoid verbose or redundant thinking. Keep your thinking within 500 words.
-Place the reasoning before the final answer.
+Place the reasoning before the final answer, enclosed in <thinking> and </thinking> tags.
 
 The final answer must be enclosed in exactly one pair of <answer> and </answer> tags.
+Inside the <answer> tag, output only one uppercase letter corresponding to the correct option, for example A, B, C, D, E, or F.
+Do not output any text outside the <thinking> and <answer> tags.
 Do not output any text after </answer>.
 
 User: {content}
@@ -83,7 +85,7 @@ CORRECT_ROLLOUT_FEEDBACK_TEMPLATE = """A conversation between User and Assistant
 Before giving the final answer, the Assistant should reason about how the answer is obtained from the video.
 The reasoning should be grounded in the visual evidence, especially temporal order, repeated actions, object motion, state changes, and outcome differences.
 Respond concisely. Your thinking should be brief and focused — identify the core logic, skip trivial steps, and avoid verbose or redundant thinking. Keep your thinking within 500 words.
-Place the reasoning before the final answer.
+Place the reasoning before the final answer, enclosed in <thinking> and </thinking> tags.
 
 Below is one rollout that is known to be a correct solution for this same sample. Use it as reference feedback to guide your reasoning, but still ground your answer in the video.
 
@@ -92,6 +94,8 @@ Below is one rollout that is known to be a correct solution for this same sample
 </correct_rollout_feedback>
 
 The final answer must be enclosed in exactly one pair of <answer> and </answer> tags.
+Inside the <answer> tag, output only one uppercase letter corresponding to the correct option, for example A, B, C, D, E, or F.
+Do not output any text outside the <thinking> and <answer> tags.
 Do not output any text after </answer>.
 
 User: {content}
@@ -102,7 +106,7 @@ GUIDELINE_FEEDBACK_TEMPLATE = """A conversation between User and Assistant. The 
 Before giving the final answer, the Assistant should reason about how the answer is obtained from the video.
 The reasoning should be grounded in the visual evidence, especially temporal order, repeated actions, object motion, state changes, and outcome differences.
 Respond concisely. Your thinking should be brief and focused — identify the core logic, skip trivial steps, and avoid verbose or redundant thinking. Keep your thinking within 500 words.
-Place the reasoning before the final answer.
+Place the reasoning before the final answer, enclosed in <thinking> and </thinking> tags.
 
 Below is feedback distilled from multiple candidate rollouts for this same sample. Use it to guide your reasoning, but still ground your answer in the video.
 
@@ -111,6 +115,8 @@ Below is feedback distilled from multiple candidate rollouts for this same sampl
 </feedback_guideline>
 
 The final answer must be enclosed in exactly one pair of <answer> and </answer> tags.
+Inside the <answer> tag, output only one uppercase letter corresponding to the correct option, for example A, B, C, D, E, or F.
+Do not output any text outside the <thinking> and <answer> tags.
 Do not output any text after </answer>.
 
 User: {content}
@@ -281,24 +287,27 @@ def _extract_answer_content(response: str) -> Optional[str]:
     return answers[-1]
 
 
-def _extract_option_letter_robust(text: str) -> Optional[str]:
+def _extract_option_letter_strict(text: str) -> Optional[str]:
+    """Strictly validate that *text* is exactly one option letter A-F."""
     if not text:
         return None
+    ch = str(text).strip().upper()
+    if ch in _VALID_OPTION_SET:
+        return ch
+    return None
 
+
+def _extract_gold_option_letter(text: str) -> Optional[str]:
+    """Parse an option letter from a gold / ground-truth string."""
+    if not text:
+        return None
     text = str(text).strip()
-    patterns = [
-        r"^\s*\(?([A-Z])\)?(?:[\s\.\:\-\)]|$)",
-        r"^\s*(?:option|choice)\s*\(?([A-Z])\)?(?:[\s\.\:\-\)]|$)",
-        r"^\s*(?:the answer is|answer is|answer)\s*[:\-]?\s*\(?([A-Z])\)?(?:[\s\.\:\-\)]|$)",
-        r"\b([A-Z])\b",
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if match:
-            ch = match.group(1).upper()
-            if ch in _VALID_OPTION_SET:
-                return ch
+    m = re.search(r"<answer>\s*([A-Fa-f])\s*</answer>", text, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+    ch = text.strip().upper()
+    if ch in _VALID_OPTION_SET:
+        return ch
     return None
 
 
@@ -318,6 +327,10 @@ def format_reward_eval(response: str) -> float:
     if not answer_content:
         return 0.0
 
+    # Answer content must be exactly one valid option letter A-F
+    if _extract_option_letter_strict(answer_content) is None:
+        return 0.0
+
     return 1.0
 
 
@@ -328,14 +341,12 @@ def accuracy_reward_eval(response: str, ground_truth: str) -> float:
     if format_reward_eval(response) == 0.0:
         return 0.0
 
+    # Parse prediction (strict: must be exactly one letter A-F)
     given_answer = _extract_answer_content(response)
-    pred = _extract_option_letter_robust(given_answer) if given_answer is not None else None
+    pred = _extract_option_letter_strict(given_answer) if given_answer is not None else None
 
-    gt_answer = _extract_answer_content(gt_raw)
-    if gt_answer is not None:
-        gt = _extract_option_letter_robust(gt_answer)
-    else:
-        gt = _extract_option_letter_robust(gt_raw)
+    # Parse ground truth (slightly more lenient for dataset formats)
+    gt = _extract_gold_option_letter(gt_raw)
 
     if gt not in _VALID_OPTION_SET:
         return 0.0
@@ -356,7 +367,7 @@ def compute_score_eval(response: str, ground_truth: str, format_weight: float = 
 
 def extract_answer_letter(text: str) -> str:
     final_answer_content = _extract_answer_content(text)
-    pred = _extract_option_letter_robust(final_answer_content) if final_answer_content is not None else None
+    pred = _extract_option_letter_strict(final_answer_content) if final_answer_content is not None else None
     return pred or ""
 
 
@@ -374,14 +385,9 @@ def get_gold_answer(item: Dict[str, Any]) -> str:
             value = str(item[key]).strip()
             if not value:
                 continue
-            answer_block = _extract_answer_content(value)
-            if answer_block is not None:
-                pred = _extract_option_letter_robust(answer_block)
-                if pred:
-                    return pred
-            pred = _extract_option_letter_robust(value)
-            if pred:
-                return pred
+            parsed = _extract_gold_option_letter(value)
+            if parsed:
+                return parsed
     return ""
 
 
