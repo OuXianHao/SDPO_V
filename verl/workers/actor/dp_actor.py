@@ -1704,7 +1704,7 @@ class DataParallelPPOActor(BasePPOActor):
         metrics["combined/lambda_dapo"] = lambda_dapo
         metrics["combined/lambda_sdpo_t"] = lambda_sdpo_t
         metrics["combined/lambda_sdpo_v"] = lambda_sdpo_v
-        metrics["combined/sdpo_t_valid_ratio"] = float(sdpo_t_response_mask.any(dim=-1).sum().item()) / max(response_mask.shape[0], 1)
+        metrics["combined/sdpo_t_valid_ratio"] = float(sdpo_t_response_mask.any(dim=-1).sum().item()) / max(response_mask.shape[0], 1) if not self.config.teacher_reweight_enabled else 0.0
 
         if self.rank == 0:
             print(
