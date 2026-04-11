@@ -1209,7 +1209,8 @@ def compute_rlsd_token_advantages(
     student_logprobs: torch.Tensor,
     response_mask: torch.Tensor,
     rlsd_lambda: float = 0.5,
-    rlsd_eps_w: float = 0.2,
+    rlsd_eps_w_low: float = 0.2,
+    rlsd_eps_w_high: float = 0.2,
     delta_clamp: float = 5.0,
     answer_span_mask: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
@@ -1223,7 +1224,7 @@ def compute_rlsd_token_advantages(
     Formula:
         delta_t = clamp(logp_teacher(y_t) - logp_student(y_t), -C, C)
         w_t = exp(sign(A) * delta_t)
-        A_hat_t = A * ((1 - lambda) + lambda * clip(w_t, 1 - eps_w, 1 + eps_w))
+        A_hat_t = A * ((1 - lambda) + lambda * clip(w_t, 1 - eps_low, 1 + eps_high))
 
     All inputs to delta_t must be detached — no gradient flows through this
     reweighting path.  The GRPO/DAPO policy loss provides the only gradient
@@ -1235,7 +1236,8 @@ def compute_rlsd_token_advantages(
         student_logprobs: (bs, resp_len) — detached per-token log P_student(y_t)
         response_mask: (bs, resp_len) — valid response token mask
         rlsd_lambda: interpolation weight (0 = uniform, 1 = fully reweighted)
-        rlsd_eps_w: clip range for w_t, clipped to [1-eps, 1+eps]
+        rlsd_eps_w_low: lower clip for w_t, clipped to [1 - eps_low, ...]
+        rlsd_eps_w_high: upper clip for w_t, clipped to [..., 1 + eps_high]
         delta_clamp: clamp magnitude for delta_t before exponentiation
         answer_span_mask: (bs, resp_len) optional bool mask, True for answer-span tokens
             that should be excluded from reweighting (they keep uniform advantage)
@@ -1251,7 +1253,7 @@ def compute_rlsd_token_advantages(
     #   A > 0 and teacher more confident → upweight (encourage this token)
     #   A < 0 and teacher less confident → upweight (penalise this token more)
     w_t = torch.exp(torch.sign(advantages) * delta_t)
-    w_t = torch.clamp(w_t, 1.0 - rlsd_eps_w, 1.0 + rlsd_eps_w)
+    w_t = torch.clamp(w_t, 1.0 - rlsd_eps_w_low, 1.0 + rlsd_eps_w_high)
 
     token_weight = (1.0 - rlsd_lambda) + rlsd_lambda * w_t
 

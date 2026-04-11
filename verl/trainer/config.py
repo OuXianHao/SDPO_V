@@ -114,8 +114,11 @@ class AlgorithmConfig:
     teacher_reweight_lambda: float = 0.5
     """Interpolation between uniform and reweighted advantage.
     0.0 = fully uniform (no reweighting), 1.0 = fully reweighted."""
-    teacher_reweight_eps_w: float = 0.2
-    """Clip range for the token reweighting factor w_t, clipped to [1 - eps, 1 + eps]."""
+    teacher_reweight_eps_w_low: float = 0.2
+    """Lower clip for the token reweighting factor w_t.  w_t is clipped to
+    [1 - eps_w_low, 1 + eps_w_high], allowing asymmetric clipping."""
+    teacher_reweight_eps_w_high: float = 0.2
+    """Upper clip for the token reweighting factor w_t."""
     teacher_reweight_delta_clamp: float = 5.0
     """Clamp magnitude for teacher-student logprob difference before exponentiation."""
     teacher_reweight_correct_hint: bool = False
@@ -267,7 +270,8 @@ class PPOConfig:
         # Teacher token-level reweighting propagation
         self.worker.actor.teacher_reweight_enabled = self.algorithm.teacher_reweight_enabled
         self.worker.actor.teacher_reweight_lambda = self.algorithm.teacher_reweight_lambda
-        self.worker.actor.teacher_reweight_eps_w = self.algorithm.teacher_reweight_eps_w
+        self.worker.actor.teacher_reweight_eps_w_low = self.algorithm.teacher_reweight_eps_w_low
+        self.worker.actor.teacher_reweight_eps_w_high = self.algorithm.teacher_reweight_eps_w_high
         self.worker.actor.teacher_reweight_delta_clamp = self.algorithm.teacher_reweight_delta_clamp
         self.worker.actor.teacher_reweight_correct_hint = self.algorithm.teacher_reweight_correct_hint
         self.worker.actor.teacher_reweight_lambda_decay_to_zero_step = self.algorithm.teacher_reweight_lambda_decay_to_zero_step

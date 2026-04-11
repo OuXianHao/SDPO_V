@@ -120,7 +120,8 @@ class DataParallelPPOActor(BasePPOActor):
                 if self.config.teacher_reweight_enabled:
                     print(
                         f"[actor] teacher_reweight ENABLED: lambda={self.config.teacher_reweight_lambda}, "
-                        f"eps_w={self.config.teacher_reweight_eps_w}, "
+                        f"eps_w_low={self.config.teacher_reweight_eps_w_low}, "
+                        f"eps_w_high={self.config.teacher_reweight_eps_w_high}, "
                         f"delta_clamp={self.config.teacher_reweight_delta_clamp}, "
                         f"correct_hint={self.config.teacher_reweight_correct_hint}"
                     )
@@ -1591,7 +1592,8 @@ class DataParallelPPOActor(BasePPOActor):
                 student_logprobs=log_probs.detach(),
                 response_mask=response_mask,
                 rlsd_lambda=effective_lambda,
-                rlsd_eps_w=self.config.teacher_reweight_eps_w,
+                rlsd_eps_w_low=self.config.teacher_reweight_eps_w_low,
+                rlsd_eps_w_high=self.config.teacher_reweight_eps_w_high,
                 delta_clamp=self.config.teacher_reweight_delta_clamp,
                 answer_span_mask=answer_span_mask,
             )
