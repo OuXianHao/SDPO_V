@@ -1503,6 +1503,7 @@ class DataParallelPPOActor(BasePPOActor):
         model_inputs: dict[str, Any],
         temperature: float,
         total_response_tokens: torch.Tensor,
+        global_step: int = 0,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Combined DAPO + SDPO-T + SDPO-V loss for dapo_with_sdpo mode.
 
@@ -1569,6 +1570,15 @@ class DataParallelPPOActor(BasePPOActor):
         # difference to modulate magnitude only (direction unchanged).
         # ================================================================
         if self.config.teacher_reweight_enabled:
+            # Effective lambda: optionally decay linearly to 0 over training.
+            # If decay_to_zero_step <= 0, lambda is constant (no decay).
+            init_lambda = self.config.teacher_reweight_lambda
+            decay_step = self.config.teacher_reweight_lambda_decay_to_zero_step
+            if decay_step > 0:
+                effective_lambda = init_lambda * max(0.0, 1.0 - global_step / decay_step)
+            else:
+                effective_lambda = init_lambda
+
             with torch.no_grad():
                 teacher_log_probs = self.log_probs_from_logits(teacher_logits, responses)
             # Build answer-span mask to exclude <answer>...</answer> from reweighting
@@ -1580,11 +1590,12 @@ class DataParallelPPOActor(BasePPOActor):
                 teacher_logprobs=teacher_log_probs.detach(),
                 student_logprobs=log_probs.detach(),
                 response_mask=response_mask,
-                rlsd_lambda=self.config.teacher_reweight_lambda,
+                rlsd_lambda=effective_lambda,
                 rlsd_eps_w=self.config.teacher_reweight_eps_w,
                 delta_clamp=self.config.teacher_reweight_delta_clamp,
                 answer_span_mask=answer_span_mask,
             )
+            reweight_metrics["effective_lambda"] = effective_lambda
             metrics.update({f"reweight/{k}": v for k, v in reweight_metrics.items()})
 
         dapo_loss, grpo_metrics = compute_grpo_loss(
@@ -1899,6 +1910,7 @@ class DataParallelPPOActor(BasePPOActor):
                     elif self.config.loss_mode == "dapo_with_sdpo":
                         loss, combined_metrics = self._compute_dapo_with_sdpo_loss(
                             model_inputs, temperature=temperature, total_response_tokens=total_response_tokens,
+                            global_step=data.meta_info.get("global_step", 0),
                         )
                         loss = loss * torch.sum(response_mask) * self.world_size / total_response_tokens
                         loss.backward()
