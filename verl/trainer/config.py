@@ -121,6 +121,10 @@ class AlgorithmConfig:
     teacher_reweight_correct_hint: bool = False
     """Append the known correct final option to the teacher guideline for MC tasks.
     Only takes effect when sdpo_feedback_mode is 'guideline_mixed_rollouts'."""
+    teacher_reweight_lambda_decay_to_zero_step: int = 0
+    """If > 0, linearly decay teacher_reweight_lambda from its initial value to 0
+    over this many training steps.  At step >= this value, lambda is 0 (no
+    reweighting).  If <= 0, lambda is constant (no decay)."""
 
     # ---- Combined DAPO+SDPO loss weights (dapo_with_sdpo mode) ----
     lambda_dapo: float = 1.0
@@ -266,6 +270,7 @@ class PPOConfig:
         self.worker.actor.teacher_reweight_eps_w = self.algorithm.teacher_reweight_eps_w
         self.worker.actor.teacher_reweight_delta_clamp = self.algorithm.teacher_reweight_delta_clamp
         self.worker.actor.teacher_reweight_correct_hint = self.algorithm.teacher_reweight_correct_hint
+        self.worker.actor.teacher_reweight_lambda_decay_to_zero_step = self.algorithm.teacher_reweight_lambda_decay_to_zero_step
         # SDPO-V config propagation
         self.worker.actor.sdpo_v_enabled = self.algorithm.sdpo_v_enabled
         self.worker.actor.sdpo_v_weight = self.algorithm.sdpo_v_weight
