@@ -179,6 +179,10 @@ class ActorConfig:
     teacher_reweight_delta_clamp: float = field(default=5.0, init=False)
     teacher_reweight_correct_hint: bool = field(default=False, init=False)
     teacher_reweight_lambda_decay_to_zero_step: int = field(default=0, init=False)
+    # ---- Teacher reweight dump auto-keys (set from AlgorithmConfig) ----
+    teacher_reweight_dump_enabled: bool = field(default=False, init=False)
+    teacher_reweight_dump_path: str = field(default="", init=False)
+    teacher_reweight_dump_max_samples: int = field(default=100, init=False)
     # ---- Combined DAPO+SDPO lambda weights (set from AlgorithmConfig) ----
     lambda_dapo: float = field(default=1.0, init=False)
     lambda_sdpo_t: float = field(default=0.1, init=False)

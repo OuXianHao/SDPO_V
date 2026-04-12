@@ -128,6 +128,14 @@ class AlgorithmConfig:
     """If > 0, linearly decay teacher_reweight_lambda from its initial value to 0
     over this many training steps.  At step >= this value, lambda is 0 (no
     reweighting).  If <= 0, lambda is constant (no decay)."""
+    # ---- Teacher reweight token-level dump (debug/analysis) ----
+    teacher_reweight_dump_enabled: bool = False
+    """Dump per-sample token-level teacher-reweight analysis to JSONL for
+    external visualization.  Only active in teacher_reweight_enabled mode."""
+    teacher_reweight_dump_path: str = ""
+    """File path for the JSONL dump.  Required when dump_enabled is True."""
+    teacher_reweight_dump_max_samples: int = 100
+    """Maximum total number of sample records to write across the entire run."""
 
     # ---- Combined DAPO+SDPO loss weights (dapo_with_sdpo mode) ----
     lambda_dapo: float = 1.0
@@ -275,6 +283,10 @@ class PPOConfig:
         self.worker.actor.teacher_reweight_delta_clamp = self.algorithm.teacher_reweight_delta_clamp
         self.worker.actor.teacher_reweight_correct_hint = self.algorithm.teacher_reweight_correct_hint
         self.worker.actor.teacher_reweight_lambda_decay_to_zero_step = self.algorithm.teacher_reweight_lambda_decay_to_zero_step
+        # Teacher reweight dump propagation
+        self.worker.actor.teacher_reweight_dump_enabled = self.algorithm.teacher_reweight_dump_enabled
+        self.worker.actor.teacher_reweight_dump_path = self.algorithm.teacher_reweight_dump_path
+        self.worker.actor.teacher_reweight_dump_max_samples = self.algorithm.teacher_reweight_dump_max_samples
         # SDPO-V config propagation
         self.worker.actor.sdpo_v_enabled = self.algorithm.sdpo_v_enabled
         self.worker.actor.sdpo_v_weight = self.algorithm.sdpo_v_weight
