@@ -15,6 +15,7 @@
 Implement Actor
 """
 
+import json
 import os
 import time
 from collections import defaultdict
@@ -138,6 +139,8 @@ class DataParallelPPOActor(BasePPOActor):
             "yes",
             "on",
         }
+        # Counter for teacher-reweight token dump (gated debug feature)
+        self._reweight_dump_count = 0
 
     def _update_teacher(self) -> None:
         """EMA update of teacher model weights from actor weights.
@@ -221,6 +224,112 @@ class DataParallelPPOActor(BasePPOActor):
             mask[i, open_start:close_end] = True
 
         return mask
+
+    def _dump_reweight_tokens(
+        self,
+        responses: torch.Tensor,
+        teacher_log_probs: torch.Tensor,
+        student_log_probs: torch.Tensor,
+        response_mask: torch.Tensor,
+        advantages_orig: torch.Tensor,
+        answer_span_mask: Optional[torch.Tensor],
+        global_step: int,
+        effective_lambda: float,
+        raw_prompt_texts=None,
+    ) -> None:
+        """Append per-sample token-level reweight analysis records to JSONL.
+
+        Gated by teacher_reweight_dump_enabled.  Only called from rank 0.
+        Each record contains summary stats and a per-token list with both
+        raw and clamped delta, plus pre-clip and post-clip w_t.
+        """
+        tokenizer = getattr(self.processor, "tokenizer", self.processor)
+        dump_path = self.config.teacher_reweight_dump_path
+        max_samples = self.config.teacher_reweight_dump_max_samples
+        delta_clamp = self.config.teacher_reweight_delta_clamp
+        eps_w_low = self.config.teacher_reweight_eps_w_low
+        eps_w_high = self.config.teacher_reweight_eps_w_high
+
+        # Move to CPU once for the whole batch
+        t_lp = teacher_log_probs.detach().cpu()
+        s_lp = student_log_probs.detach().cpu()
+        mask = response_mask.detach().cpu()
+        resp = responses.detach().cpu()
+        adv = advantages_orig.detach().cpu()
+        ans_mask = answer_span_mask.detach().cpu() if answer_span_mask is not None else None
+
+        bs = resp.shape[0]
+        remaining = max_samples - self._reweight_dump_count
+        n_dump = min(bs, remaining)
+
+        records: list[dict] = []
+        for i in range(n_dump):
+            n_tok = int(mask[i].sum().item())
+            if n_tok == 0:
+                continue
+
+            # Slice to valid response tokens
+            s_i = s_lp[i, :n_tok]
+            t_i = t_lp[i, :n_tok]
+            adv_i = adv[i, :n_tok]
+            resp_i = resp[i, :n_tok]
+
+            # Recompute intermediates (mirrors compute_rlsd_token_advantages)
+            delta_raw = t_i - s_i
+            delta_used = torch.clamp(delta_raw, -delta_clamp, delta_clamp)
+            w_raw = torch.exp(torch.sign(adv_i) * delta_used)
+            w_used = torch.clamp(w_raw, 1.0 - eps_w_low, 1.0 + eps_w_high)
+
+            ans_mask_i = ans_mask[i, :n_tok] if ans_mask is not None else None
+
+            tokens_list: list[dict] = []
+            for j in range(n_tok):
+                tok_id = int(resp_i[j].item())
+                try:
+                    tok_str = tokenizer.decode([tok_id])
+                except Exception:
+                    tok_str = f"<id={tok_id}>"
+
+                entry: dict[str, Any] = {
+                    "idx": j,
+                    "token": tok_str,
+                    "token_id": tok_id,
+                    "logp_s": round(float(s_i[j]), 6),
+                    "logp_t": round(float(t_i[j]), 6),
+                    "delta_raw": round(float(delta_raw[j]), 6),
+                    "delta_used": round(float(delta_used[j]), 6),
+                    "w_raw": round(float(w_raw[j]), 6),
+                    "w_used": round(float(w_used[j]), 6),
+                }
+                if ans_mask_i is not None:
+                    entry["answer_mask"] = bool(ans_mask_i[j])
+                tokens_list.append(entry)
+
+            delta_raw_list = delta_raw.tolist()
+            abs_delta_list = delta_raw.abs().tolist()
+            record: dict[str, Any] = {
+                "global_step": global_step,
+                "sample_idx": self._reweight_dump_count + len(records),
+                "effective_lambda": round(effective_lambda, 6),
+                "num_tokens": n_tok,
+                "mean_delta": round(sum(delta_raw_list) / n_tok, 6),
+                "mean_abs_delta": round(sum(abs_delta_list) / n_tok, 6),
+                "min_delta": round(min(delta_raw_list), 6),
+                "max_delta": round(max(delta_raw_list), 6),
+                "tokens": tokens_list,
+            }
+            if raw_prompt_texts is not None:
+                try:
+                    record["prompt"] = str(raw_prompt_texts[i])[:500]
+                except Exception:
+                    pass
+            records.append(record)
+
+        if records:
+            with open(dump_path, "a") as f:
+                for rec in records:
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            self._reweight_dump_count += len(records)
 
     def _forward_micro_batch(self, micro_batch: dict[str, torch.Tensor], temperature: float) -> torch.Tensor:
         """
@@ -1599,6 +1708,22 @@ class DataParallelPPOActor(BasePPOActor):
             )
             reweight_metrics["effective_lambda"] = effective_lambda
             metrics.update({f"reweight/{k}": v for k, v in reweight_metrics.items()})
+
+            # ---- Optional token-level dump for external visualization ----
+            if (self.config.teacher_reweight_dump_enabled
+                    and self.rank == 0
+                    and self._reweight_dump_count < self.config.teacher_reweight_dump_max_samples):
+                self._dump_reweight_tokens(
+                    responses=responses,
+                    teacher_log_probs=teacher_log_probs,
+                    student_log_probs=log_probs,
+                    response_mask=response_mask,
+                    advantages_orig=model_inputs["advantages"],
+                    answer_span_mask=answer_span_mask,
+                    global_step=global_step,
+                    effective_lambda=effective_lambda,
+                    raw_prompt_texts=model_inputs.get("raw_prompt_text", None),
+                )
 
         dapo_loss, grpo_metrics = compute_grpo_loss(
             old_log_probs=old_log_probs,
