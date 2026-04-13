@@ -21,6 +21,7 @@ import time
 from collections import defaultdict
 from typing import Any, Optional
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from einops import rearrange
@@ -139,8 +140,10 @@ class DataParallelPPOActor(BasePPOActor):
             "yes",
             "on",
         }
-        # Counter for teacher-reweight token dump (gated debug feature)
+        # Counters for teacher-reweight token dump (gated debug feature)
         self._reweight_dump_count = 0
+        self._reweight_dump_correct_count = 0
+        self._reweight_dump_incorrect_count = 0
 
     def _update_teacher(self) -> None:
         """EMA update of teacher model weights from actor weights.
@@ -236,16 +239,28 @@ class DataParallelPPOActor(BasePPOActor):
         global_step: int,
         effective_lambda: float,
         raw_prompt_texts=None,
+        accuracy_rewards=None,
+        feedback_texts=None,
+        teacher_prompt_texts=None,
+        ground_truths=None,
+        batch_multi_modal_data=None,
     ) -> None:
         """Append per-sample token-level reweight analysis records to JSONL.
 
         Gated by teacher_reweight_dump_enabled.  Only called from rank 0.
         Each record contains summary stats and a per-token list with both
         raw and clamped delta, plus pre-clip and post-clip w_t.
+
+        Balanced sampling: collects up to ``dump_max_correct`` correct and
+        ``dump_max_incorrect`` incorrect samples (based on accuracy_reward).
+        Falls back to the global ``dump_max_samples`` cap when correctness
+        is unavailable.
         """
         tokenizer = getattr(self.processor, "tokenizer", self.processor)
         dump_path = self.config.teacher_reweight_dump_path
         max_samples = self.config.teacher_reweight_dump_max_samples
+        max_correct = self.config.teacher_reweight_dump_max_correct
+        max_incorrect = self.config.teacher_reweight_dump_max_incorrect
         delta_clamp = self.config.teacher_reweight_delta_clamp
         eps_w_low = self.config.teacher_reweight_eps_w_low
         eps_w_high = self.config.teacher_reweight_eps_w_high
@@ -259,14 +274,33 @@ class DataParallelPPOActor(BasePPOActor):
         ans_mask = answer_span_mask.detach().cpu() if answer_span_mask is not None else None
 
         bs = resp.shape[0]
-        remaining = max_samples - self._reweight_dump_count
-        n_dump = min(bs, remaining)
 
         records: list[dict] = []
-        for i in range(n_dump):
+        for i in range(bs):
+            # ---- Global cap check ----
+            if self._reweight_dump_count + len(records) >= max_samples:
+                break
+
             n_tok = int(mask[i].sum().item())
             if n_tok == 0:
                 continue
+
+            # ---- Determine correctness for balanced sampling ----
+            is_correct: Optional[bool] = None
+            if accuracy_rewards is not None:
+                try:
+                    is_correct = bool(np.isclose(float(accuracy_rewards[i]), 1.0))
+                except Exception:
+                    pass
+
+            # Balanced budget check: skip if this category is already full
+            if is_correct is True:
+                if self._reweight_dump_correct_count >= max_correct:
+                    continue
+            elif is_correct is False:
+                if self._reweight_dump_incorrect_count >= max_incorrect:
+                    continue
+            # is_correct is None → correctness unknown, use global cap only
 
             # Slice to valid response tokens
             s_i = s_lp[i, :n_tok]
@@ -311,6 +345,7 @@ class DataParallelPPOActor(BasePPOActor):
                 "global_step": global_step,
                 "sample_idx": self._reweight_dump_count + len(records),
                 "effective_lambda": round(effective_lambda, 6),
+                "is_correct": is_correct,
                 "num_tokens": n_tok,
                 "mean_delta": round(sum(delta_raw_list) / n_tok, 6),
                 "mean_abs_delta": round(sum(abs_delta_list) / n_tok, 6),
@@ -318,12 +353,42 @@ class DataParallelPPOActor(BasePPOActor):
                 "max_delta": round(max(delta_raw_list), 6),
                 "tokens": tokens_list,
             }
+            # ---- Extended debug fields (include when available) ----
             if raw_prompt_texts is not None:
                 try:
                     record["prompt"] = str(raw_prompt_texts[i])[:500]
                 except Exception:
                     pass
+            if feedback_texts is not None:
+                try:
+                    record["feedback_text"] = str(feedback_texts[i])[:1000]
+                except Exception:
+                    pass
+            if teacher_prompt_texts is not None:
+                try:
+                    record["teacher_prompt"] = str(teacher_prompt_texts[i])[:2000]
+                except Exception:
+                    pass
+            if ground_truths is not None:
+                try:
+                    record["ground_truth_answer"] = str(ground_truths[i])[:500]
+                except Exception:
+                    pass
+            # Video path: extract from multi_modal_data if available
+            if batch_multi_modal_data is not None:
+                try:
+                    mmd = batch_multi_modal_data[i]
+                    if mmd is not None and isinstance(mmd, dict) and "videos" in mmd:
+                        record["video_path"] = [str(v) for v in mmd["videos"]]
+                except Exception:
+                    pass
+
             records.append(record)
+            # Update balanced counters
+            if is_correct is True:
+                self._reweight_dump_correct_count += 1
+            elif is_correct is False:
+                self._reweight_dump_incorrect_count += 1
 
         if records:
             with open(dump_path, "a") as f:
@@ -1723,6 +1788,11 @@ class DataParallelPPOActor(BasePPOActor):
                     global_step=global_step,
                     effective_lambda=effective_lambda,
                     raw_prompt_texts=model_inputs.get("raw_prompt_text", None),
+                    accuracy_rewards=model_inputs.get("accuracy_reward", None),
+                    feedback_texts=model_inputs.get("feedback_text", None),
+                    teacher_prompt_texts=model_inputs.get("teacher_prompt_text", None),
+                    ground_truths=model_inputs.get("ground_truth", None),
+                    batch_multi_modal_data=model_inputs.get("multi_modal_data", None),
                 )
 
         dapo_loss, grpo_metrics = compute_grpo_loss(
@@ -1736,6 +1806,9 @@ class DataParallelPPOActor(BasePPOActor):
             loss_avg_mode=self.config.loss_avg_mode,
         )
         metrics.update({f"grpo/{k}": v for k, v in grpo_metrics.items()})
+        # Expose actor entropy as a top-level metric for wandb
+        if "entropy_loss" in grpo_metrics:
+            metrics["actor/entropy_loss"] = grpo_metrics["entropy_loss"]
 
         # ================================================================
         # STEP 5: SDPO-T loss (uses sdpo_valid_mask for mixed-group gating)
@@ -1931,6 +2004,8 @@ class DataParallelPPOActor(BasePPOActor):
             non_tensor_select_keys.extend(
                 ["raw_prompt_text", "prompt_text", "feedback_text", "teacher_prompt_text", "multi_modal_data", "pad_token_id"]
             )
+            # Extra fields for teacher-reweight debug dump (safe to include; no-op when dump disabled)
+            non_tensor_select_keys.extend(["accuracy_reward", "ground_truth"])
         else:
             raise ValueError(f"Unknown actor.loss_mode: {self.config.loss_mode}")
 

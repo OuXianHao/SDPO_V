@@ -183,6 +183,8 @@ class ActorConfig:
     teacher_reweight_dump_enabled: bool = field(default=False, init=False)
     teacher_reweight_dump_path: str = field(default="", init=False)
     teacher_reweight_dump_max_samples: int = field(default=100, init=False)
+    teacher_reweight_dump_max_correct: int = field(default=10, init=False)
+    teacher_reweight_dump_max_incorrect: int = field(default=10, init=False)
     # ---- Combined DAPO+SDPO lambda weights (set from AlgorithmConfig) ----
     lambda_dapo: float = field(default=1.0, init=False)
     lambda_sdpo_t: float = field(default=0.1, init=False)
