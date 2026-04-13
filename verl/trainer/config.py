@@ -136,6 +136,10 @@ class AlgorithmConfig:
     """File path for the JSONL dump.  Required when dump_enabled is True."""
     teacher_reweight_dump_max_samples: int = 100
     """Maximum total number of sample records to write across the entire run."""
+    teacher_reweight_dump_max_correct: int = 10
+    """Maximum number of *correct* rollout records to dump (balanced sampling)."""
+    teacher_reweight_dump_max_incorrect: int = 10
+    """Maximum number of *incorrect* rollout records to dump (balanced sampling)."""
 
     # ---- Combined DAPO+SDPO loss weights (dapo_with_sdpo mode) ----
     lambda_dapo: float = 1.0
@@ -287,6 +291,8 @@ class PPOConfig:
         self.worker.actor.teacher_reweight_dump_enabled = self.algorithm.teacher_reweight_dump_enabled
         self.worker.actor.teacher_reweight_dump_path = self.algorithm.teacher_reweight_dump_path
         self.worker.actor.teacher_reweight_dump_max_samples = self.algorithm.teacher_reweight_dump_max_samples
+        self.worker.actor.teacher_reweight_dump_max_correct = self.algorithm.teacher_reweight_dump_max_correct
+        self.worker.actor.teacher_reweight_dump_max_incorrect = self.algorithm.teacher_reweight_dump_max_incorrect
         # SDPO-V config propagation
         self.worker.actor.sdpo_v_enabled = self.algorithm.sdpo_v_enabled
         self.worker.actor.sdpo_v_weight = self.algorithm.sdpo_v_weight

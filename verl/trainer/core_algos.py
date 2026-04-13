@@ -539,6 +539,7 @@ def compute_grpo_loss(
         "loss": loss.detach().item(),
         "ratio_mean": VF.masked_mean(ratio, response_mask).detach().item(),
         "clipfrac": metrics["pg_clipfrac_higher"],
+        "entropy_loss": metrics["entropy_loss"],
     }
     return loss, metrics
 
