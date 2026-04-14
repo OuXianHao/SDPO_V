@@ -9,6 +9,8 @@ ray stop --force
 echo "Starting isolated Ray cluster..."
 RAY_HEAD_PORT="${RAY_HEAD_PORT:-7388}"
 RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-7866}"
+echo "[INFO] RAY_HEAD_PORT=${RAY_HEAD_PORT}"
+echo "[INFO] RAY_DASHBOARD_PORT=${RAY_DASHBOARD_PORT}"
 ray start --head --port="${RAY_HEAD_PORT}" --dashboard-port="${RAY_DASHBOARD_PORT}"
 
 # 2. 环境变量设置
