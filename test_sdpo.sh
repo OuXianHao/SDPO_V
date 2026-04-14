@@ -7,7 +7,9 @@ sleep 2
 ray stop --force
 
 echo "Starting isolated Ray cluster..."
-ray start --head --port=6388 --dashboard-port=8266
+RAY_HEAD_PORT="${RAY_HEAD_PORT:-7388}"
+RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-7866}"
+ray start --head --port="${RAY_HEAD_PORT}" --dashboard-port="${RAY_DASHBOARD_PORT}"
 
 # 2. 环境变量设置
 export PYTHONPATH=$PWD:$PYTHONPATH

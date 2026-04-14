@@ -32,7 +32,9 @@ sleep 2
 ray stop --force || true
 
 echo "[INFO] Starting Ray head..."
-ray start --head --port=6388 --dashboard-port=8266
+RAY_HEAD_PORT="${RAY_HEAD_PORT:-7388}"
+RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-7866}"
+ray start --head --port="${RAY_HEAD_PORT}" --dashboard-port="${RAY_DASHBOARD_PORT}"
 
 # ---------- Runtime ----------
 export PYTHONPATH="$PWD:${PYTHONPATH:-}"
