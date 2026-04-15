@@ -494,7 +494,8 @@ class RayPPOTrainer:
                 non_tensor_batch_keys=["raw_prompt_ids", "multi_modal_data"],
             )
             repeat_times = self.config.worker.rollout.val_override_config.get("n", 1)
-            test_gen_batch.meta_info = self.config.worker.rollout.val_override_config
+            test_gen_batch.meta_info = dict(self.config.worker.rollout.val_override_config)
+            test_gen_batch.meta_info["n"] = repeat_times
             test_gen_batch.meta_info["min_pixels"] = self.config.data.min_pixels
             test_gen_batch.meta_info["max_pixels"] = self.config.data.max_pixels
             test_gen_batch.meta_info["video_fps"] = self.config.data.video_fps
@@ -1308,6 +1309,7 @@ class RayPPOTrainer:
                 "min_pixels": self.config.data.min_pixels,
                 "max_pixels": self.config.data.max_pixels,
                 "video_fps": self.config.data.video_fps,
+                "n": self.config.worker.rollout.n,
             }
             new_batch: DataProto = DataProto.from_single_dict(batch_dict, meta_info=meta_info)
             new_batch.non_tensor_batch["uid"] = np.array(
@@ -1353,21 +1355,13 @@ class RayPPOTrainer:
             generated_batch_size = len(gen_batch_output)
             expected_generated_batch_size = prompt_batch_size * repeat_times
             if generated_batch_size != expected_generated_batch_size:
-                if prompt_batch_size > 0 and generated_batch_size % prompt_batch_size == 0:
-                    inferred_repeat_times = generated_batch_size // prompt_batch_size
-                    print(
-                        "[_make_batch_data][WARN] rollout batch size mismatch before repeat: "
-                        f"prompt_batch={prompt_batch_size}, generated_batch={generated_batch_size}, "
-                        f"configured_rollout_n={repeat_times}. "
-                        f"Using inferred repeat_times={inferred_repeat_times}."
-                    )
-                    repeat_times = inferred_repeat_times
-                else:
-                    raise ValueError(
-                        "Rollout generation batch size is incompatible with prompt batch size. "
-                        f"prompt_batch={prompt_batch_size}, generated_batch={generated_batch_size}, "
-                        f"configured_rollout_n={self.config.worker.rollout.n}"
-                    )
+                raise ValueError(
+                    "Rollout generation batch size mismatch. "
+                    f"prompt_batch={prompt_batch_size}, generated_batch={generated_batch_size}, "
+                    f"configured_rollout_n={self.config.worker.rollout.n}, "
+                    f"expected_generated_batch={expected_generated_batch_size}. "
+                    "Training rollout must respect per-call meta_info['n']."
+                )
 
             new_batch = new_batch.repeat(repeat_times=repeat_times, interleave=True)
             if self.config.algorithm.loss_mode in ("sdpo_logit", "dapo_with_sdpo") and "raw_prompt_ids" in gen_batch.non_tensor_batch:

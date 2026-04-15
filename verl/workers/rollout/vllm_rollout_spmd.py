@@ -230,6 +230,7 @@ class vLLMRollout(BaseRollout):
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**prompts.meta_info):
+            effective_n = self.sampling_params.n
             completions: list[RequestOutput] = self.inference_engine.generate(
                 prompts=vllm_inputs,
                 sampling_params=self.sampling_params,
@@ -237,17 +238,24 @@ class vLLMRollout(BaseRollout):
                 use_tqdm=self.use_tqdm,
             )
             response_ids = [output.token_ids for completion in completions for output in completion.outputs]
+            expected_response_num = len(vllm_inputs) * effective_n
+            if len(response_ids) != expected_response_num:
+                raise RuntimeError(
+                    "vLLM rollout returned unexpected number of responses. "
+                    f"effective_n={effective_n}, prompts={len(vllm_inputs)}, "
+                    f"expected_responses={expected_response_num}, actual_responses={len(response_ids)}"
+                )
             response_ids = VF.pad_2d_list_to_length(
                 response_ids, self.pad_token_id, max_length=self.config.response_length
             ).to(input_ids.device)
 
-            if self.sampling_params.n > 1:
-                batch_size = batch_size * self.sampling_params.n
-                input_ids = _repeat_interleave(input_ids, self.sampling_params.n)
-                attention_mask = _repeat_interleave(attention_mask, self.sampling_params.n)
-                position_ids = _repeat_interleave(position_ids, self.sampling_params.n)
+            if effective_n > 1:
+                batch_size = batch_size * effective_n
+                input_ids = _repeat_interleave(input_ids, effective_n)
+                attention_mask = _repeat_interleave(attention_mask, effective_n)
+                position_ids = _repeat_interleave(position_ids, effective_n)
                 if batch_multi_modal_data is not None:
-                    batch_multi_modal_data = _repeat_interleave(batch_multi_modal_data, self.sampling_params.n)
+                    batch_multi_modal_data = _repeat_interleave(batch_multi_modal_data, effective_n)
 
         sequence_ids = torch.cat([input_ids, response_ids], dim=-1)
         response_length = response_ids.size(1)
