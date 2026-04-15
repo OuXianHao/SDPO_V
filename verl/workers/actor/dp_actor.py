@@ -313,6 +313,10 @@ class DataParallelPPOActor(BasePPOActor):
             delta_used = torch.clamp(delta_raw, -delta_clamp, delta_clamp)
             w_raw = torch.exp(torch.sign(adv_i) * delta_used)
             w_used = torch.clamp(w_raw, 1.0 - eps_w_low, 1.0 + eps_w_high)
+            # Gate: mirror compute_rlsd_token_advantages — no reweight for A >= 0
+            neg_mask = adv_i < 0
+            w_raw = torch.where(neg_mask, w_raw, torch.ones_like(w_raw))
+            w_used = torch.where(neg_mask, w_used, torch.ones_like(w_used))
 
             ans_mask_i = ans_mask[i, :n_tok] if ans_mask is not None else None
 
