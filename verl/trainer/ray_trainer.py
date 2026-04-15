@@ -1278,6 +1278,20 @@ class RayPPOTrainer:
         metrics.update(global_balance_stats)
 
     def _make_batch_data(self, metrics: dict[str, Any]) -> DataProto:
+        def _describe_dataproto(dp: DataProto) -> dict[str, Any]:
+            tensor_shapes = {}
+            if dp.batch is not None:
+                for k, v in dp.batch.items():
+                    tensor_shapes[k] = tuple(v.shape)
+            non_tensor_shapes = {k: tuple(v.shape) for k, v in dp.non_tensor_batch.items()}
+            return {
+                "batch_size": None if dp.batch is None else tuple(dp.batch.batch_size),
+                "tensor_keys": sorted(list(tensor_shapes.keys())),
+                "tensor_shapes": tensor_shapes,
+                "non_tensor_keys": sorted(list(non_tensor_shapes.keys())),
+                "non_tensor_shapes": non_tensor_shapes,
+            }
+
         batch = None
         all_metrics = defaultdict(list)
         num_try_make_batch = 0
@@ -1313,6 +1327,11 @@ class RayPPOTrainer:
 
             # generate a batch
             gen_batch_output = self.actor_rollout_ref_wg.generate_sequences(gen_batch)
+            print(
+                "[_make_batch_data] generated rollout batch: "
+                f"prompt_batch={len(gen_batch)}, generated_batch={len(gen_batch_output)}, "
+                f"configured_rollout_n={self.config.worker.rollout.n}"
+            )
 
             if self.config.algorithm.adv_estimator == "remax":
                 gen_baseline_batch = deepcopy(gen_batch)
@@ -1329,11 +1348,34 @@ class RayPPOTrainer:
                 del gen_baseline_batch, gen_baseline_output
 
             # repeat to align with repeated responses in rollout
-            new_batch = new_batch.repeat(repeat_times=self.config.worker.rollout.n, interleave=True)
+            repeat_times = self.config.worker.rollout.n
+            prompt_batch_size = len(new_batch)
+            generated_batch_size = len(gen_batch_output)
+            expected_generated_batch_size = prompt_batch_size * repeat_times
+            if generated_batch_size != expected_generated_batch_size:
+                if prompt_batch_size > 0 and generated_batch_size % prompt_batch_size == 0:
+                    inferred_repeat_times = generated_batch_size // prompt_batch_size
+                    print(
+                        "[_make_batch_data][WARN] rollout batch size mismatch before repeat: "
+                        f"prompt_batch={prompt_batch_size}, generated_batch={generated_batch_size}, "
+                        f"configured_rollout_n={repeat_times}. "
+                        f"Using inferred repeat_times={inferred_repeat_times}."
+                    )
+                    repeat_times = inferred_repeat_times
+                else:
+                    raise ValueError(
+                        "Rollout generation batch size is incompatible with prompt batch size. "
+                        f"prompt_batch={prompt_batch_size}, generated_batch={generated_batch_size}, "
+                        f"configured_rollout_n={self.config.worker.rollout.n}"
+                    )
+
+            new_batch = new_batch.repeat(repeat_times=repeat_times, interleave=True)
             if self.config.algorithm.loss_mode in ("sdpo_logit", "dapo_with_sdpo") and "raw_prompt_ids" in gen_batch.non_tensor_batch:
                 new_batch.non_tensor_batch["raw_prompt_ids"] = np.repeat(
-                    gen_batch.non_tensor_batch["raw_prompt_ids"], self.config.worker.rollout.n
+                    gen_batch.non_tensor_batch["raw_prompt_ids"], repeat_times
                 )
+            print("[_make_batch_data] pre-union new_batch:", _describe_dataproto(new_batch))
+            print("[_make_batch_data] pre-union gen_batch_output:", _describe_dataproto(gen_batch_output))
             new_batch = new_batch.union(gen_batch_output)
 
             # filter group
