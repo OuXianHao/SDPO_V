@@ -1256,6 +1256,10 @@ def compute_rlsd_token_advantages(
     w_t = torch.exp(torch.sign(advantages) * delta_t)
     w_t = torch.clamp(w_t, 1.0 - rlsd_eps_w_low, 1.0 + rlsd_eps_w_high)
 
+    # Gate: only reweight negative-advantage tokens; non-negative → w_t = 1
+    # (degenerates to plain DAPO for positively-rewarded rollouts)
+    w_t = torch.where(advantages < 0, w_t, torch.ones_like(w_t))
+
     token_weight = (1.0 - rlsd_lambda) + rlsd_lambda * w_t
 
     # Exclude answer-span tokens from reweighting: keep uniform advantage
