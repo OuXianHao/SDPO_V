@@ -710,6 +710,7 @@ class RayPPOTrainer:
         for uid, rollouts in uid_mixed_rollouts.items():
             first_idx = uid2first_idx[uid]
             raw_prompt_text = str(raw_prompt_texts[first_idx])
+            sample_multi_modal_data = multi_modal_data_all[first_idx] if multi_modal_data_all is not None else None
 
             # Build rollout blocks (truncate each rollout to prevent
             # progressive prompt bloat as student outputs get longer/messier)
@@ -728,15 +729,29 @@ class RayPPOTrainer:
                 rollout_blocks=rollout_blocks_text,
             )
 
-            # Prepend video marker if the original prompt uses video
-            content = f"<video>\n{guideline_body}" if "<video>" in raw_prompt_text else guideline_body
-            messages = [{"role": "user", "content": content}]
+            # Build multimodal messages with the same semantics as dataset path:
+            # use structured {"type":"video"} blocks instead of string heuristics.
+            num_videos = 0
+            if isinstance(sample_multi_modal_data, dict):
+                videos = sample_multi_modal_data.get("videos", None)
+                if isinstance(videos, (list, tuple)):
+                    num_videos = len(videos)
+
+            if num_videos > 0 and self.processor is not None:
+                content_list = [{"type": "video"} for _ in range(num_videos)]
+                content_list.append({"type": "text", "text": guideline_body})
+                messages = [{"role": "user", "content": content_list}]
+            else:
+                content = guideline_body
+                if num_videos > 0:
+                    content = ("<video>\n" * num_videos) + guideline_body
+                messages = [{"role": "user", "content": content}]
             prompt_str = apply_template(messages, add_generation_prompt=True, tokenize=False)
             raw_ids = self.tokenizer.encode(prompt_str, add_special_tokens=False)
 
             uid_order.append(uid)
             raw_prompt_ids_list.append(raw_ids)
-            gen_multi_modal_data.append(multi_modal_data_all[first_idx] if multi_modal_data_all is not None else None)
+            gen_multi_modal_data.append(sample_multi_modal_data)
 
         if not uid_order:
             return {}
