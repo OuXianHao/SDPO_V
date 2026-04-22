@@ -1540,10 +1540,20 @@ class RayPPOTrainer:
                         metrics["grpo/adv_mean"] = batch.batch["advantages"].float().mean().item()
                         metrics["grpo/adv_std"] = batch.batch["advantages"].float().std().item()
                         # 2) SDPO fields.
-                        # When teacher_reweight_enabled, use the full _attach_sdpo_fields
-                        # path (which supports guideline_mixed_rollouts feedback mode)
-                        # instead of the combined scalar_text shortcut.
-                        if self.config.algorithm.teacher_reweight_enabled:
+                        # Use a decay-aware teacher-reweight gate so that once lambda
+                        # decays to 0, we no longer force the teacher-reweight-specific
+                        # attach path in dapo_with_sdpo mode.
+                        init_lambda = self.config.algorithm.teacher_reweight_lambda
+                        decay_step = self.config.algorithm.teacher_reweight_lambda_decay_to_zero_step
+                        if decay_step > 0:
+                            effective_lambda = init_lambda * max(0.0, 1.0 - self.global_step / decay_step)
+                        else:
+                            effective_lambda = init_lambda
+                        teacher_reweight_active = (
+                            self.config.algorithm.teacher_reweight_enabled
+                            and effective_lambda > 0.0
+                        )
+                        if teacher_reweight_active:
                             batch, sdpo_skip_metrics = self._attach_sdpo_fields(
                                 batch, mode=self.config.algorithm.sdpo_feedback_mode
                             )

@@ -145,7 +145,15 @@ class DataParallelPPOActor(BasePPOActor):
         self._reweight_dump_correct_count = 0
         self._reweight_dump_incorrect_count = 0
 
-    def _update_teacher(self) -> None:
+    def _compute_effective_teacher_reweight_lambda(self, global_step: int) -> float:
+        """Compute decay-aware effective teacher reweight lambda."""
+        init_lambda = self.config.teacher_reweight_lambda
+        decay_step = self.config.teacher_reweight_lambda_decay_to_zero_step
+        if decay_step > 0:
+            return init_lambda * max(0.0, 1.0 - global_step / decay_step)
+        return init_lambda
+
+    def _update_teacher(self, global_step: int = 0) -> bool:
         """EMA update of teacher model weights from actor weights.
 
         Matches original SDPO's _update_teacher (dp_actor.py:132-151):
@@ -156,17 +164,21 @@ class DataParallelPPOActor(BasePPOActor):
           - teacher_module is a separate model (not None, not actor_module)
           - sdpo_teacher_update_rate > 0
         """
+        teacher_reweight_active = (
+            self.config.teacher_reweight_enabled
+            and self._compute_effective_teacher_reweight_lambda(global_step=global_step) > 0.0
+        )
         _allow_ema = (
             self.config.loss_mode == "sdpo_logit"
-            or (self.config.loss_mode == "dapo_with_sdpo" and self.config.teacher_reweight_enabled)
+            or (self.config.loss_mode == "dapo_with_sdpo" and teacher_reweight_active)
         )
         if not _allow_ema:
-            return
+            return False
         update_rate = self.config.sdpo_teacher_update_rate
         if update_rate == 0.0:
-            return
+            return False
         if self.teacher_module is None or self.teacher_module is self.actor_module:
-            return
+            return False
         with torch.no_grad():
             for teacher_param, student_param in zip(
                 self.teacher_module.parameters(),
@@ -174,6 +186,7 @@ class DataParallelPPOActor(BasePPOActor):
             ):
                 student_data = student_param.data.to(device=teacher_param.device)
                 teacher_param.data.mul_(1.0 - update_rate).add_(student_data, alpha=update_rate)
+        return True
 
     def _render_teacher_prompt_text(self, content_text: str) -> str:
         format_prompt = self.config.teacher_format_prompt
@@ -1834,6 +1847,59 @@ class DataParallelPPOActor(BasePPOActor):
         metrics: dict[str, float] = {}
         responses = model_inputs["responses"]
         response_mask = model_inputs["response_mask"]  # used by DAPO (unmasked)
+        effective_lambda = self._compute_effective_teacher_reweight_lambda(global_step=global_step)
+        teacher_reweight_active = (
+            self.config.teacher_reweight_enabled and effective_lambda > 0.0
+        )
+        should_short_circuit_to_pure_dapo = (
+            (not teacher_reweight_active)
+            and self.config.lambda_sdpo_t == 0.0
+            and (not self.config.sdpo_v_enabled)
+            and self.config.lambda_sdpo_v == 0.0
+        )
+        metrics["reweight/effective_lambda"] = effective_lambda
+        metrics["reweight/teacher_reweight_active"] = float(teacher_reweight_active)
+        metrics["reweight/short_circuit_to_pure_dapo"] = float(should_short_circuit_to_pure_dapo)
+        metrics["reweight/teacher_forward_executed"] = 0.0
+
+        if should_short_circuit_to_pure_dapo:
+            old_log_probs = model_inputs["old_log_probs"]
+            advantages = model_inputs["advantages"]
+            log_probs = self._forward_micro_batch(model_inputs, temperature=temperature)
+
+            dapo_loss, grpo_metrics = compute_grpo_loss(
+                old_log_probs=old_log_probs,
+                log_probs=log_probs,
+                advantages=advantages,
+                response_mask=response_mask,
+                clip_ratio_low=self.config.clip_ratio_low,
+                clip_ratio_high=self.config.clip_ratio_high,
+                clip_ratio_dual=self.config.clip_ratio_dual,
+                loss_avg_mode=self.config.loss_avg_mode,
+            )
+            metrics.update({f"grpo/{k}": v for k, v in grpo_metrics.items()})
+            if "entropy_loss" in grpo_metrics:
+                metrics["actor/entropy_loss"] = grpo_metrics["entropy_loss"]
+
+            sdpo_t_loss = torch.tensor(0.0, device=log_probs.device)
+            sdpo_v_loss_val = torch.tensor(0.0, device=log_probs.device)
+            lambda_dapo = self.config.lambda_dapo
+            lambda_sdpo_t = self.config.lambda_sdpo_t
+            lambda_sdpo_v = self.config.lambda_sdpo_v
+            combined_loss = (
+                lambda_dapo * dapo_loss
+                + lambda_sdpo_t * sdpo_t_loss
+                + lambda_sdpo_v * sdpo_v_loss_val
+            )
+            metrics["combined/total_loss"] = combined_loss.detach().item()
+            metrics["combined/dapo_loss"] = dapo_loss.detach().item()
+            metrics["combined/sdpo_t_loss"] = sdpo_t_loss.detach().item()
+            metrics["combined/sdpo_v_loss"] = sdpo_v_loss_val.detach().item()
+            metrics["combined/lambda_dapo"] = lambda_dapo
+            metrics["combined/lambda_sdpo_t"] = lambda_sdpo_t
+            metrics["combined/lambda_sdpo_v"] = lambda_sdpo_v
+            metrics["combined/sdpo_t_valid_ratio"] = 0.0
+            return combined_loss, metrics
 
         # ================================================================
         # STEP 1: Build teacher inputs (needed for SDPO-T)
@@ -1856,6 +1922,7 @@ class DataParallelPPOActor(BasePPOActor):
                 multi_modal_inputs=teacher_multi_modal_inputs,
                 module=teacher_model,
             )
+        metrics["reweight/teacher_forward_executed"] = 1.0
 
         # ================================================================
         # STEP 3: Student forward (with grad) — shared for DAPO + SDPO-T + SDPO-V
@@ -1883,16 +1950,7 @@ class DataParallelPPOActor(BasePPOActor):
         # token-varying A_hat_t that uses teacher-student logprob
         # difference to modulate magnitude only (direction unchanged).
         # ================================================================
-        if self.config.teacher_reweight_enabled:
-            # Effective lambda: optionally decay linearly to 0 over training.
-            # If decay_to_zero_step <= 0, lambda is constant (no decay).
-            init_lambda = self.config.teacher_reweight_lambda
-            decay_step = self.config.teacher_reweight_lambda_decay_to_zero_step
-            if decay_step > 0:
-                effective_lambda = init_lambda * max(0.0, 1.0 - global_step / decay_step)
-            else:
-                effective_lambda = init_lambda
-
+        if teacher_reweight_active:
             with torch.no_grad():
                 teacher_log_probs = self.log_probs_from_logits(teacher_logits, responses)
             # Build answer-span mask to exclude <answer>...</answer> from reweighting
@@ -1944,7 +2002,6 @@ class DataParallelPPOActor(BasePPOActor):
                     delta_clamp=self.config.teacher_reweight_delta_clamp,
                     answer_span_mask=answer_span_mask,
                 )
-            reweight_metrics["effective_lambda"] = effective_lambda
             metrics.update({f"reweight/{k}": v for k, v in reweight_metrics.items()})
 
             # ---- Optional token-level dump for external visualization ----
@@ -2294,8 +2351,10 @@ class DataParallelPPOActor(BasePPOActor):
                         raise ValueError(f"Unknown actor.loss_mode: {self.config.loss_mode}")
 
                 grad_norm = self._optimizer_step()
+                ema_teacher_updated = False
                 if torch.isfinite(grad_norm):
-                    self._update_teacher()
+                    ema_teacher_updated = self._update_teacher(global_step=data.meta_info.get("global_step", 0))
+                append_to_dict(metrics, {"reweight/ema_teacher_updated": float(ema_teacher_updated)})
                 append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})
 
         return metrics
