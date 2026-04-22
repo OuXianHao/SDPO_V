@@ -198,6 +198,36 @@ class AlgorithmConfig:
     preventing the mode-seeking KL-maximization objective from pushing
     logits to extremes.  Set to 0 to disable the ceiling."""
 
+    # ---- Visual counterfactual branch for RLSD token reweighting ----
+    visual_cf_enabled: bool = False
+    """Enable visual counterfactual emphasis in RLSD token reweight path (dapo_with_sdpo + teacher_reweight only)."""
+    visual_cf_base_gate_mode: str = "existing_rlsd_only"
+    """Base gate mode: 'existing_rlsd_only', 'entropy_or_tsdelta', 'existing_rlsd_and_informative'."""
+    visual_cf_base_gate_entropy_threshold: float = 0.0
+    """Entropy threshold for informative-token base gate modes."""
+    visual_cf_base_gate_tsdelta_threshold: float = 0.0
+    """Teacher-student delta threshold for informative-token base gate modes."""
+    visual_cf_visual_gate_threshold: float = 0.0
+    """Hard visual gate threshold on visual_delta_t."""
+    visual_cf_visual_weight: float = 0.0
+    """Visual emphasis weight used in visual_factor_t = 1 + weight * gate * strength."""
+    visual_cf_visual_delta_clip: float = 5.0
+    """Clamp max for visual_strength_t."""
+    visual_cf_visual_factor_clip_low: float = 1.0
+    """Lower clip bound for visual_factor_t (v1 keeps it >= 1.0 by default)."""
+    visual_cf_visual_factor_clip_high: float = 2.0
+    """Upper clip bound for visual_factor_t."""
+    visual_cf_final_weight_clip_enabled: bool = False
+    """Enable final clip on composed token weight in visual_cf path."""
+    visual_cf_final_weight_clip_low: float = 0.0
+    """Lower clip bound for final token weight when final clip is enabled."""
+    visual_cf_final_weight_clip_high: float = 10.0
+    """Upper clip bound for final token weight when final clip is enabled."""
+    visual_cf_bad_video_mode: str = "reuse_existing"
+    """Bad-video mode for visual_cf: 'reuse_existing' or explicit mode supported by bad_video utility."""
+    visual_cf_debug: bool = False
+    """Enable extra debug metrics/logging for visual_cf path."""
+
 
 @dataclass
 class TrainerConfig:
@@ -316,6 +346,21 @@ class PPOConfig:
         self.worker.actor.sdpo_v_softkl_debug = self.algorithm.sdpo_v_softkl_debug
         self.worker.actor.sdpo_v_softkl_use_ema_bad_ref = self.algorithm.sdpo_v_softkl_use_ema_bad_ref
         self.worker.actor.sdpo_v_softkl_kl_max = self.algorithm.sdpo_v_softkl_kl_max
+        # visual_cf propagation
+        self.worker.actor.visual_cf_enabled = self.algorithm.visual_cf_enabled
+        self.worker.actor.visual_cf_base_gate_mode = self.algorithm.visual_cf_base_gate_mode
+        self.worker.actor.visual_cf_base_gate_entropy_threshold = self.algorithm.visual_cf_base_gate_entropy_threshold
+        self.worker.actor.visual_cf_base_gate_tsdelta_threshold = self.algorithm.visual_cf_base_gate_tsdelta_threshold
+        self.worker.actor.visual_cf_visual_gate_threshold = self.algorithm.visual_cf_visual_gate_threshold
+        self.worker.actor.visual_cf_visual_weight = self.algorithm.visual_cf_visual_weight
+        self.worker.actor.visual_cf_visual_delta_clip = self.algorithm.visual_cf_visual_delta_clip
+        self.worker.actor.visual_cf_visual_factor_clip_low = self.algorithm.visual_cf_visual_factor_clip_low
+        self.worker.actor.visual_cf_visual_factor_clip_high = self.algorithm.visual_cf_visual_factor_clip_high
+        self.worker.actor.visual_cf_final_weight_clip_enabled = self.algorithm.visual_cf_final_weight_clip_enabled
+        self.worker.actor.visual_cf_final_weight_clip_low = self.algorithm.visual_cf_final_weight_clip_low
+        self.worker.actor.visual_cf_final_weight_clip_high = self.algorithm.visual_cf_final_weight_clip_high
+        self.worker.actor.visual_cf_bad_video_mode = self.algorithm.visual_cf_bad_video_mode
+        self.worker.actor.visual_cf_debug = self.algorithm.visual_cf_debug
         # Combined DAPO+SDPO lambda propagation
         self.worker.actor.lambda_dapo = self.algorithm.lambda_dapo
         self.worker.actor.lambda_sdpo_t = self.algorithm.lambda_sdpo_t

@@ -1214,6 +1214,12 @@ def compute_rlsd_token_advantages(
     rlsd_eps_w_high: float = 0.2,
     delta_clamp: float = 5.0,
     answer_span_mask: Optional[torch.Tensor] = None,
+    visual_cf_enabled: bool = False,
+    base_gate: Optional[torch.Tensor] = None,
+    visual_factor: Optional[torch.Tensor] = None,
+    final_weight_clip_enabled: bool = False,
+    final_weight_clip_low: float = 0.0,
+    final_weight_clip_high: float = 10.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Token-level advantage reweighting using teacher-student logprob difference.
 
@@ -1256,17 +1262,32 @@ def compute_rlsd_token_advantages(
     w_t = torch.exp(torch.sign(advantages) * delta_t)
     w_t = torch.clamp(w_t, 1.0 - rlsd_eps_w_low, 1.0 + rlsd_eps_w_high)
 
-    # Gate: only reweight negative-advantage tokens; non-negative → w_t = 1
+    # Existing RLSD gate: only reweight negative-advantage tokens; non-negative → w_t = 1
     # (degenerates to plain DAPO for positively-rewarded rollouts)
-    w_t = torch.where(advantages < 0, w_t, torch.ones_like(w_t))
+    existing_rlsd_gate = advantages < 0
+    w_t = torch.where(existing_rlsd_gate, w_t, torch.ones_like(w_t))
 
-    token_weight = (1.0 - rlsd_lambda) + rlsd_lambda * w_t
+    token_weight_rlsd = (1.0 - rlsd_lambda) + rlsd_lambda * w_t
 
     # Exclude answer-span tokens from reweighting: keep uniform advantage
     # to prevent over-concentrating credit on final-answer tokens when the
     # teacher guideline includes a correct-option hint.
     if answer_span_mask is not None:
-        token_weight = torch.where(answer_span_mask, torch.ones_like(token_weight), token_weight)
+        token_weight_rlsd = torch.where(answer_span_mask, torch.ones_like(token_weight_rlsd), token_weight_rlsd)
+
+    if visual_cf_enabled:
+        if base_gate is None:
+            base_gate = existing_rlsd_gate
+        base_gate = base_gate.bool()
+        if visual_factor is None:
+            visual_factor = torch.ones_like(token_weight_rlsd)
+        if visual_factor.shape != token_weight_rlsd.shape:
+            raise ValueError("visual_factor must align with token_weight shape.")
+        token_weight = 1.0 + base_gate.float() * (token_weight_rlsd - 1.0) * visual_factor
+        if final_weight_clip_enabled:
+            token_weight = torch.clamp(token_weight, final_weight_clip_low, final_weight_clip_high)
+    else:
+        token_weight = token_weight_rlsd
 
     A_hat_t = advantages * token_weight * response_mask
 
@@ -1278,7 +1299,14 @@ def compute_rlsd_token_advantages(
         "w_t_mean": VF.masked_mean(w_t, mask_f).detach().item(),
         "token_weight_mean": VF.masked_mean(token_weight, mask_f).detach().item(),
         "token_weight_std": (token_weight * mask_f).std().detach().item(),
+        "existing_rlsd_gate_frac": VF.masked_mean(existing_rlsd_gate.float(), mask_f).detach().item(),
     }
+    if visual_cf_enabled:
+        metrics["visual_cf_enabled"] = 1.0
+        metrics["base_gate_frac"] = VF.masked_mean(base_gate.float(), mask_f).detach().item()
+        metrics["visual_factor_mean"] = VF.masked_mean(visual_factor, mask_f).detach().item()
+    else:
+        metrics["visual_cf_enabled"] = 0.0
     if answer_span_mask is not None:
         ans_count = (answer_span_mask & response_mask.bool()).sum().item()
         total_count = response_mask.sum().item()

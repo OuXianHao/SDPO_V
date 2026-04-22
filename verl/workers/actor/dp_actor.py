@@ -1677,6 +1677,141 @@ class DataParallelPPOActor(BasePPOActor):
 
         return sk_loss, sk_metrics
 
+    def _resolve_visual_cf_bad_video_mode(self) -> str:
+        mode = getattr(self.config, "visual_cf_bad_video_mode", "reuse_existing")
+        if mode == "reuse_existing":
+            return self.config.sdpo_v_bad_video_mode
+        return mode
+
+    def _compute_visual_cf_signals(
+        self,
+        model_inputs: dict[str, Any],
+        responses: torch.Tensor,
+        response_mask: torch.Tensor,
+        teacher_logits: torch.Tensor,
+        teacher_input_ids: torch.Tensor,
+        teacher_attention_mask: torch.Tensor,
+        teacher_position_ids: torch.Tensor,
+        teacher_multi_modal_inputs: dict[str, torch.Tensor],
+        student_log_probs_detached: torch.Tensor,
+        student_logits_detached: torch.Tensor,
+        temperature: float,
+        answer_span_mask: Optional[torch.Tensor],
+    ) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
+        with torch.no_grad():
+            teacher_good_log_probs = self.log_probs_from_logits(teacher_logits, responses)
+
+            _vcfg = getattr(getattr(self.actor_module, "config", None), "vision_config", None)
+            _patch_size = getattr(_vcfg, "patch_size", 14)
+            _temporal_patch_size = getattr(_vcfg, "temporal_patch_size", 2)
+            _in_channels = getattr(_vcfg, "in_channels", 3)
+
+            bad_mode = self._resolve_visual_cf_bad_video_mode()
+            teacher_bad_mm_inputs = construct_bad_video_inputs(
+                multi_modal_inputs=teacher_multi_modal_inputs,
+                video_grid_thw=teacher_multi_modal_inputs.get("video_grid_thw", None),
+                mode=bad_mode,
+                blur_sigma=self.config.sdpo_v_blur_sigma,
+                blur_fraction=self.config.sdpo_v_blur_fraction,
+                drop_fraction=self.config.sdpo_v_drop_fraction,
+                shuffle_fraction=self.config.sdpo_v_shuffle_fraction,
+                patch_size=_patch_size,
+                temporal_patch_size=_temporal_patch_size,
+                in_channels=_in_channels,
+            )
+
+            teacher_bad_logits = self._forward_response_logits(
+                model_inputs,
+                temperature=temperature,
+                input_ids=teacher_input_ids,
+                attention_mask=teacher_attention_mask,
+                position_ids=teacher_position_ids,
+                multi_modal_inputs=teacher_bad_mm_inputs,
+                module=self.teacher_module,
+            )
+            teacher_bad_log_probs = self.log_probs_from_logits(teacher_bad_logits, responses)
+
+            if teacher_good_log_probs.shape != teacher_bad_log_probs.shape:
+                raise ValueError("visual_cf teacher_good and teacher_bad token logprobs must have the same shape.")
+            if teacher_good_log_probs.shape != response_mask.shape:
+                raise ValueError("visual_cf token logprobs must align with response_mask.")
+
+            teacher_student_delta = teacher_good_log_probs - student_log_probs_detached
+
+            student_logp_full = torch.log_softmax(student_logits_detached, dim=-1)
+            student_probs_full = student_logp_full.exp()
+            student_entropy = -(student_probs_full * student_logp_full).sum(dim=-1)
+
+            visual_delta = torch.relu(teacher_good_log_probs - teacher_bad_log_probs)
+            visual_strength = torch.clamp(visual_delta, min=0.0, max=self.config.visual_cf_visual_delta_clip)
+
+            g_vis = (visual_delta > self.config.visual_cf_visual_gate_threshold).float()
+            visual_factor = 1.0 + self.config.visual_cf_visual_weight * g_vis * visual_strength
+            visual_factor = torch.clamp(
+                visual_factor,
+                min=self.config.visual_cf_visual_factor_clip_low,
+                max=self.config.visual_cf_visual_factor_clip_high,
+            )
+
+            existing_rlsd_gate = (model_inputs["advantages"] < 0)
+            informative_gate = (
+                (student_entropy > self.config.visual_cf_base_gate_entropy_threshold)
+                | (teacher_student_delta > self.config.visual_cf_base_gate_tsdelta_threshold)
+            )
+            mode = self.config.visual_cf_base_gate_mode
+            if mode == "existing_rlsd_only":
+                base_gate = existing_rlsd_gate
+            elif mode == "entropy_or_tsdelta":
+                base_gate = informative_gate
+            elif mode == "existing_rlsd_and_informative":
+                base_gate = existing_rlsd_gate & informative_gate
+            else:
+                raise ValueError(f"Unknown visual_cf_base_gate_mode: {mode}")
+
+            base_gate = base_gate & response_mask.bool()
+
+            if not torch.isfinite(visual_factor).all():
+                raise ValueError("visual_cf visual_factor contains non-finite values.")
+
+            valid_tokens = response_mask.bool()
+            valid_count = int(valid_tokens.sum().item())
+            metrics: dict[str, float] = {
+                "visual_delta_mean": 0.0,
+                "visual_delta_p90": 0.0,
+                "base_gate_frac": 0.0,
+                "visual_gate_frac": 0.0,
+                "visual_applied_frac": 0.0,
+                "num_valid_visual_tokens": float(valid_count),
+                "corruption_mode_used": 0.0,
+            }
+            mode_map = {"blur": 1.0, "drop": 2.0, "blur_and_drop": 3.0, "shuffle": 4.0}
+            metrics["corruption_mode_used"] = mode_map.get(bad_mode, 0.0)
+
+            if valid_count > 0:
+                vd_valid = visual_delta[valid_tokens]
+                metrics["visual_delta_mean"] = vd_valid.mean().item()
+                metrics["visual_delta_p90"] = torch.quantile(vd_valid.float(), 0.9).item()
+                metrics["base_gate_frac"] = base_gate[valid_tokens].float().mean().item()
+                metrics["visual_gate_frac"] = g_vis[valid_tokens].float().mean().item()
+                metrics["visual_applied_frac"] = (base_gate.float() * g_vis)[valid_tokens].mean().item()
+                if answer_span_mask is not None:
+                    ans_valid = (answer_span_mask & valid_tokens)
+                    if ans_valid.any():
+                        metrics["answer_span_visual_delta_mean"] = visual_delta[ans_valid].mean().item()
+                    else:
+                        metrics["answer_span_visual_delta_mean"] = 0.0
+            elif answer_span_mask is not None:
+                metrics["answer_span_visual_delta_mean"] = 0.0
+
+        return {
+            "base_gate": base_gate,
+            "visual_factor": visual_factor,
+            "visual_delta": visual_delta,
+            "g_vis": g_vis,
+            "teacher_good_log_probs": teacher_good_log_probs,
+            "teacher_bad_log_probs": teacher_bad_log_probs,
+        }, metrics
+
     def _compute_dapo_with_sdpo_loss(
         self,
         model_inputs: dict[str, Any],
@@ -1764,17 +1899,51 @@ class DataParallelPPOActor(BasePPOActor):
             answer_span_mask = None
             if self.processor is not None:
                 answer_span_mask = self._build_answer_span_mask(responses)
-            advantages, reweight_metrics = compute_rlsd_token_advantages(
-                advantages=advantages,
-                teacher_logprobs=teacher_log_probs.detach(),
-                student_logprobs=log_probs.detach(),
-                response_mask=response_mask,
-                rlsd_lambda=effective_lambda,
-                rlsd_eps_w_low=self.config.teacher_reweight_eps_w_low,
-                rlsd_eps_w_high=self.config.teacher_reweight_eps_w_high,
-                delta_clamp=self.config.teacher_reweight_delta_clamp,
-                answer_span_mask=answer_span_mask,
-            )
+            if self.config.visual_cf_enabled:
+                visual_cf_tensors, visual_cf_metrics = self._compute_visual_cf_signals(
+                    model_inputs=model_inputs,
+                    responses=responses,
+                    response_mask=response_mask,
+                    teacher_logits=teacher_logits.detach(),
+                    teacher_input_ids=teacher_input_ids,
+                    teacher_attention_mask=teacher_attention_mask,
+                    teacher_position_ids=teacher_position_ids,
+                    teacher_multi_modal_inputs=teacher_multi_modal_inputs,
+                    student_log_probs_detached=log_probs.detach(),
+                    student_logits_detached=student_logits.detach(),
+                    temperature=temperature,
+                    answer_span_mask=answer_span_mask,
+                )
+                advantages, reweight_metrics = compute_rlsd_token_advantages(
+                    advantages=advantages,
+                    teacher_logprobs=teacher_log_probs.detach(),
+                    student_logprobs=log_probs.detach(),
+                    response_mask=response_mask,
+                    rlsd_lambda=effective_lambda,
+                    rlsd_eps_w_low=self.config.teacher_reweight_eps_w_low,
+                    rlsd_eps_w_high=self.config.teacher_reweight_eps_w_high,
+                    delta_clamp=self.config.teacher_reweight_delta_clamp,
+                    answer_span_mask=answer_span_mask,
+                    visual_cf_enabled=True,
+                    base_gate=visual_cf_tensors["base_gate"],
+                    visual_factor=visual_cf_tensors["visual_factor"],
+                    final_weight_clip_enabled=self.config.visual_cf_final_weight_clip_enabled,
+                    final_weight_clip_low=self.config.visual_cf_final_weight_clip_low,
+                    final_weight_clip_high=self.config.visual_cf_final_weight_clip_high,
+                )
+                metrics.update({f"visual_cf/{k}": v for k, v in visual_cf_metrics.items()})
+            else:
+                advantages, reweight_metrics = compute_rlsd_token_advantages(
+                    advantages=advantages,
+                    teacher_logprobs=teacher_log_probs.detach(),
+                    student_logprobs=log_probs.detach(),
+                    response_mask=response_mask,
+                    rlsd_lambda=effective_lambda,
+                    rlsd_eps_w_low=self.config.teacher_reweight_eps_w_low,
+                    rlsd_eps_w_high=self.config.teacher_reweight_eps_w_high,
+                    delta_clamp=self.config.teacher_reweight_delta_clamp,
+                    answer_span_mask=answer_span_mask,
+                )
             reweight_metrics["effective_lambda"] = effective_lambda
             metrics.update({f"reweight/{k}": v for k, v in reweight_metrics.items()})
 
