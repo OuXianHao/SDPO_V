@@ -207,9 +207,10 @@ class DataParallelPPOActor(BasePPOActor):
         Scans each response row for the last <answer>...(</answer>) token
         subsequence and marks those positions True.
         """
-        # Lazily encode marker token sequences
+        # Lazily cache tokenizer + marker token sequences
         if not hasattr(self, "_answer_open_ids"):
             tokenizer = getattr(self.processor, "tokenizer", self.processor)
+            self._answer_span_tokenizer = tokenizer
             self._answer_open_ids = tokenizer.encode("<answer>", add_special_tokens=False)
             self._answer_close_ids = tokenizer.encode("</answer>", add_special_tokens=False)
 
@@ -219,25 +220,66 @@ class DataParallelPPOActor(BasePPOActor):
         close_ids = self._answer_close_ids
         open_len = len(open_ids)
         close_len = len(close_ids)
+        tokenizer = self._answer_span_tokenizer
 
-        for i in range(batch_size):
-            row = response_ids[i].tolist()
-            # Find last occurrence of <answer> marker
+        def _find_subseq_bounds(row_ids: list[int]) -> tuple[int, int]:
+            """Fast path: exact token-subsequence match."""
             open_start = -1
-            for j in range(len(row) - open_len + 1):
-                if row[j : j + open_len] == open_ids:
+            for j in range(len(row_ids) - open_len + 1):
+                if row_ids[j : j + open_len] == open_ids:
                     open_start = j
             if open_start < 0:
-                continue
-            # Find first </answer> after it
+                return -1, -1
+
             close_end = -1
-            for j in range(open_start + open_len, len(row) - close_len + 1):
-                if row[j : j + close_len] == close_ids:
+            for j in range(open_start + open_len, len(row_ids) - close_len + 1):
+                if row_ids[j : j + close_len] == close_ids:
                     close_end = j + close_len
                     break
             if close_end < 0:
-                close_end = len(row)
-            mask[i, open_start:close_end] = True
+                close_end = len(row_ids)
+            return open_start, close_end
+
+        for i in range(batch_size):
+            row = response_ids[i].tolist()
+            open_start, close_end = _find_subseq_bounds(row)
+
+            if open_start < 0:
+                # Slow but robust fallback:
+                # decode full text, locate char span, then re-tokenize prefixes
+                # to project char boundaries back to token boundaries.
+                row_text = tokenizer.decode(
+                    row,
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )
+                open_char = row_text.rfind("<answer>")
+                if open_char >= 0:
+                    close_char = row_text.find("</answer>", open_char + len("<answer>"))
+                    if close_char < 0:
+                        close_char = len(row_text)
+                    else:
+                        close_char += len("</answer>")
+
+                    prefix_open = row_text[:open_char]
+                    prefix_close = row_text[:close_char]
+                    open_start = len(
+                        tokenizer.encode(
+                            prefix_open,
+                            add_special_tokens=False,
+                        )
+                    )
+                    close_end = len(
+                        tokenizer.encode(
+                            prefix_close,
+                            add_special_tokens=False,
+                        )
+                    )
+
+            if open_start >= 0:
+                open_start = max(0, min(open_start, seq_len))
+                close_end = max(open_start, min(close_end, seq_len))
+                mask[i, open_start:close_end] = True
 
         return mask
 
