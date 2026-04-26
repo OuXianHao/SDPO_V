@@ -946,6 +946,19 @@ class RayPPOTrainer:
 
         response_mask = batch.batch["response_mask"].clone().bool()
         batch.batch["response_token_mask"] = response_mask
+        uid2indices_all = defaultdict(list)
+        for idx, uid in enumerate(uids):
+            uid2indices_all[uid].append(idx)
+        group_has_correct = np.zeros(len(batch), dtype=bool)
+        group_has_incorrect = np.zeros(len(batch), dtype=bool)
+        for indices in uid2indices_all.values():
+            group_acc = accuracy_reward[indices]
+            has_correct = bool(np.any(np.isclose(group_acc, 1.0)))
+            has_incorrect = bool(np.any(~np.isclose(group_acc, 1.0)))
+            group_has_correct[indices] = has_correct
+            group_has_incorrect[indices] = has_incorrect
+        batch.non_tensor_batch["group_has_correct"] = group_has_correct
+        batch.non_tensor_batch["group_has_incorrect"] = group_has_incorrect
 
         if mode == "scalar_text":
             # token-level mask consumed by sdpo_logit loss
@@ -1123,6 +1136,19 @@ class RayPPOTrainer:
 
         response_mask = batch.batch["response_mask"].clone().bool()
         batch.batch["response_token_mask"] = response_mask
+        uid2indices_all = defaultdict(list)
+        for idx, uid in enumerate(uids):
+            uid2indices_all[uid].append(idx)
+        group_has_correct = np.zeros(len(batch), dtype=bool)
+        group_has_incorrect = np.zeros(len(batch), dtype=bool)
+        for indices in uid2indices_all.values():
+            group_acc = accuracy_reward[indices]
+            has_correct = bool(np.any(np.isclose(group_acc, 1.0)))
+            has_incorrect = bool(np.any(~np.isclose(group_acc, 1.0)))
+            group_has_correct[indices] = has_correct
+            group_has_incorrect[indices] = has_incorrect
+        batch.non_tensor_batch["group_has_correct"] = group_has_correct
+        batch.non_tensor_batch["group_has_incorrect"] = group_has_incorrect
 
         # ---- SDPO-T valid mask: mixed-group gating, all rollouts in mixed groups ----
         sdpo_valid_mask = torch.ones_like(response_mask, dtype=torch.bool)
@@ -1514,6 +1540,14 @@ class RayPPOTrainer:
                             batch.non_tensor_batch["accuracy_reward"] = np.asarray(
                                 reward_metrics["accuracy"], dtype=np.float32
                             )
+                            if "format" in reward_metrics:
+                                batch.non_tensor_batch["format_score"] = np.asarray(
+                                    reward_metrics["format"], dtype=np.float32
+                                )
+                            if "overall" in reward_metrics:
+                                batch.non_tensor_batch["overall_reward"] = np.asarray(
+                                    reward_metrics["overall"], dtype=np.float32
+                                )
                         reward_metrics = {f"reward/{k}": v for k, v in reduce_metrics(reward_metrics).items()}
                         metrics.update(reward_metrics)
 

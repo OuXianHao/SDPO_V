@@ -288,16 +288,31 @@ class DataParallelPPOActor(BasePPOActor):
         responses: torch.Tensor,
         teacher_log_probs: torch.Tensor,
         student_log_probs: torch.Tensor,
+        old_log_probs: Optional[torch.Tensor],
         response_mask: torch.Tensor,
         advantages_orig: torch.Tensor,
+        advantages_after: torch.Tensor,
         answer_span_mask: Optional[torch.Tensor],
+        reweight_debug_tensors: Optional[dict[str, torch.Tensor]],
         global_step: int,
         effective_lambda: float,
+        teacher_reweight_enabled: bool,
+        teacher_reweight_active: bool,
+        teacher_forward_executed: bool,
+        short_circuit_to_pure_dapo: bool,
+        max_response_length: Optional[int],
         raw_prompt_texts=None,
+        prompt_texts=None,
+        uid_values=None,
+        question_ids=None,
         accuracy_rewards=None,
+        format_scores=None,
+        overall_rewards=None,
         feedback_texts=None,
         teacher_prompt_texts=None,
         ground_truths=None,
+        group_has_correct=None,
+        group_has_incorrect=None,
         batch_multi_modal_data=None,
     ) -> None:
         """Append per-sample token-level reweight analysis records to JSONL.
@@ -311,22 +326,24 @@ class DataParallelPPOActor(BasePPOActor):
         Falls back to the global ``dump_max_samples`` cap when correctness
         is unavailable.
         """
+        import re
+
         tokenizer = getattr(self.processor, "tokenizer", self.processor)
         dump_path = self.config.teacher_reweight_dump_path
         max_samples = self.config.teacher_reweight_dump_max_samples
         max_correct = self.config.teacher_reweight_dump_max_correct
         max_incorrect = self.config.teacher_reweight_dump_max_incorrect
-        delta_clamp = self.config.teacher_reweight_delta_clamp
-        eps_w_low = self.config.teacher_reweight_eps_w_low
-        eps_w_high = self.config.teacher_reweight_eps_w_high
 
         # Move to CPU once for the whole batch
         t_lp = teacher_log_probs.detach().cpu()
         s_lp = student_log_probs.detach().cpu()
+        o_lp = old_log_probs.detach().cpu() if old_log_probs is not None else None
         mask = response_mask.detach().cpu()
         resp = responses.detach().cpu()
         adv = advantages_orig.detach().cpu()
+        adv_after = advantages_after.detach().cpu()
         ans_mask = answer_span_mask.detach().cpu() if answer_span_mask is not None else None
+        dbg = {k: v.detach().cpu() for k, v in (reweight_debug_tensors or {}).items()}
 
         bs = resp.shape[0]
 
@@ -361,19 +378,88 @@ class DataParallelPPOActor(BasePPOActor):
             s_i = s_lp[i, :n_tok]
             t_i = t_lp[i, :n_tok]
             adv_i = adv[i, :n_tok]
+            adv_after_i = adv_after[i, :n_tok]
             resp_i = resp[i, :n_tok]
+            old_i = o_lp[i, :n_tok] if o_lp is not None else None
 
-            # Recompute intermediates (mirrors compute_rlsd_token_advantages)
-            delta_raw = t_i - s_i
-            delta_used = torch.clamp(delta_raw, -delta_clamp, delta_clamp)
-            w_raw = torch.exp(torch.sign(adv_i) * delta_used)
-            w_used = torch.clamp(w_raw, 1.0 - eps_w_low, 1.0 + eps_w_high)
-            # Gate: mirror compute_rlsd_token_advantages — no reweight for A >= 0
-            neg_mask = adv_i < 0
-            w_raw = torch.where(neg_mask, w_raw, torch.ones_like(w_raw))
-            w_used = torch.where(neg_mask, w_used, torch.ones_like(w_used))
+            # Prefer debug tensors from compute_rlsd_token_advantages (exact training-path intermediates)
+            delta_raw = dbg.get("delta_raw", t_lp - s_lp)[i, :n_tok]
+            delta_used = dbg.get("delta_used", delta_raw)[i, :n_tok]
+            w_raw = dbg.get("w_raw", torch.ones_like(delta_raw))[i, :n_tok]
+            w_after_clip = dbg.get("w_after_clip", torch.ones_like(delta_raw))[i, :n_tok]
+            w_after_adv_gate = dbg.get("w_after_advantage_gate", torch.ones_like(delta_raw))[i, :n_tok]
+            w_after_answer_mask = dbg.get("w_after_answer_mask", w_after_adv_gate)[i, :n_tok]
+            final_token_weight = dbg.get("final_token_weight_for_loss", torch.ones_like(delta_raw))[i, :n_tok]
 
             ans_mask_i = ans_mask[i, :n_tok] if ans_mask is not None else None
+
+            # Decoded response and parse info
+            try:
+                response_text = tokenizer.decode(
+                    resp_i.tolist(),
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )
+            except Exception:
+                response_text = "".join([tokenizer.decode([int(t.item())]) for t in resp_i])
+
+            answer_match = re.search(r"<answer>(.*?)</answer>", response_text, flags=re.IGNORECASE | re.DOTALL)
+            parsed_prediction = None
+            if answer_match:
+                parsed_prediction = answer_match.group(1).strip()
+                m2 = re.search(r"[A-F]", parsed_prediction)
+                parsed_prediction = m2.group(0) if m2 else parsed_prediction
+            has_complete_answer_tag = ("<answer>" in response_text.lower()) and ("</answer>" in response_text.lower())
+
+            # simple repetition_4gram_ratio on token-id stream
+            rep_4gram_ratio = 0.0
+            if n_tok >= 4:
+                grams = [tuple(resp_i[j : j + 4].tolist()) for j in range(n_tok - 3)]
+                total_grams = len(grams)
+                unique_grams = len(set(grams))
+                rep_4gram_ratio = float((total_grams - unique_grams) / max(total_grams, 1))
+
+            num_action_tokens = int(n_tok)
+            num_answer_mask_tokens = int(ans_mask_i.sum().item()) if ans_mask_i is not None else 0
+            num_reweighted_before = int((w_after_adv_gate != 1.0).sum().item())
+            num_reweighted_after = int((w_after_answer_mask != 1.0).sum().item())
+            hit_max_response_len = bool(max_response_length is not None and n_tok >= int(max_response_length))
+            has_feedback_text = bool(
+                feedback_texts is not None
+                and i < len(feedback_texts)
+                and str(feedback_texts[i]).strip() != ""
+            )
+            teacher_prompt_i = (
+                str(teacher_prompt_texts[i])
+                if teacher_prompt_texts is not None and i < len(teacher_prompt_texts)
+                else ""
+            )
+            has_correct_hint = "known correct final option" in teacher_prompt_i.lower()
+            has_guideline = "here is some guidance" in teacher_prompt_i.lower()
+
+            sample_has_negative_adv = bool((adv_i < 0).any().item())
+            sample_has_nontrivial_delta = bool((delta_used.abs() > 1e-6).any().item())
+            sample_has_reweighted_tokens = bool(num_reweighted_after > 0)
+            all_tokens_answer_masked = bool(num_answer_mask_tokens == num_action_tokens and num_action_tokens > 0)
+
+            if not teacher_reweight_enabled:
+                inactive_reason = "teacher_reweight_disabled"
+            elif effective_lambda <= 0.0:
+                inactive_reason = "effective_lambda_zero"
+            elif short_circuit_to_pure_dapo:
+                inactive_reason = "short_circuit_to_pure_dapo"
+            elif num_action_tokens == 0:
+                inactive_reason = "no_action_tokens"
+            elif not sample_has_negative_adv:
+                inactive_reason = "no_negative_advantage_tokens"
+            elif not sample_has_nontrivial_delta:
+                inactive_reason = "all_delta_near_zero"
+            elif all_tokens_answer_masked:
+                inactive_reason = "all_tokens_answer_masked"
+            elif not sample_has_reweighted_tokens:
+                inactive_reason = "unknown"
+            else:
+                inactive_reason = ""
 
             tokens_list: list[dict] = []
             for j in range(n_tok):
@@ -389,13 +475,28 @@ class DataParallelPPOActor(BasePPOActor):
                     "token_id": tok_id,
                     "logp_s": round(float(s_i[j]), 6),
                     "logp_t": round(float(t_i[j]), 6),
+                    "old_logp": round(float(old_i[j]), 6) if old_i is not None else None,
                     "delta_raw": round(float(delta_raw[j]), 6),
                     "delta_used": round(float(delta_used[j]), 6),
+                    "advantage_before": round(float(adv_i[j]), 6),
+                    "advantage_sign": int(torch.sign(adv_i[j]).item()),
+                    "action_mask": True,
                     "w_raw": round(float(w_raw[j]), 6),
-                    "w_used": round(float(w_used[j]), 6),
+                    "w_after_clip": round(float(w_after_clip[j]), 6),
+                    "w_after_advantage_gate": round(float(w_after_adv_gate[j]), 6),
+                    "w_after_answer_mask": round(float(w_after_answer_mask[j]), 6),
+                    "final_token_weight_for_loss": round(float(final_token_weight[j]), 6),
+                    "advantage_after_reweight": round(float(adv_after_i[j]), 6),
+                    "loss_weighted_advantage": round(float(adv_after_i[j]), 6),
+                    "is_reweighted_before_answer_mask": bool(abs(float(w_after_adv_gate[j]) - 1.0) > 1e-8),
+                    "is_reweighted_after_answer_mask": bool(abs(float(w_after_answer_mask[j]) - 1.0) > 1e-8),
+                    # backward-compatible legacy alias
+                    "w_used": round(float(w_after_adv_gate[j]), 6),
                 }
                 if ans_mask_i is not None:
                     entry["answer_mask"] = bool(ans_mask_i[j])
+                else:
+                    entry["answer_mask"] = False
                 tokens_list.append(entry)
 
             delta_raw_list = delta_raw.tolist()
@@ -404,18 +505,56 @@ class DataParallelPPOActor(BasePPOActor):
                 "global_step": global_step,
                 "sample_idx": self._reweight_dump_count + len(records),
                 "effective_lambda": round(effective_lambda, 6),
+                "teacher_reweight_enabled": bool(teacher_reweight_enabled),
+                "teacher_reweight_active": bool(teacher_reweight_active),
+                "teacher_forward_executed": bool(teacher_forward_executed),
+                "batch_teacher_reweight_active": bool(teacher_reweight_active),
+                "inactive_reason": inactive_reason,
                 "is_correct": is_correct,
+                "response_len": n_tok,
+                "max_response_length": int(max_response_length) if max_response_length is not None else None,
+                "hit_max_response_len": hit_max_response_len,
+                "has_complete_answer_tag": has_complete_answer_tag,
                 "num_tokens": n_tok,
+                "num_action_tokens": num_action_tokens,
+                "num_answer_mask_tokens": num_answer_mask_tokens,
+                "num_reweighted_tokens_before_answer_mask": num_reweighted_before,
+                "num_reweighted_tokens_after_answer_mask": num_reweighted_after,
+                "advantage_mean": round(float(adv_i.mean().item()), 6),
+                "advantage_min": round(float(adv_i.min().item()), 6),
+                "advantage_max": round(float(adv_i.max().item()), 6),
+                "advantage_negative_frac": round(float((adv_i < 0).float().mean().item()), 6),
+                "sample_has_negative_advantage": sample_has_negative_adv,
+                "sample_has_nontrivial_delta": sample_has_nontrivial_delta,
+                "sample_has_reweighted_tokens": sample_has_reweighted_tokens,
+                "repetition_4gram_ratio": round(rep_4gram_ratio, 6),
                 "mean_delta": round(sum(delta_raw_list) / n_tok, 6),
                 "mean_abs_delta": round(sum(abs_delta_list) / n_tok, 6),
                 "min_delta": round(min(delta_raw_list), 6),
                 "max_delta": round(max(delta_raw_list), 6),
+                "response_text": response_text,
+                "parsed_prediction": parsed_prediction,
                 "tokens": tokens_list,
             }
             # ---- Extended debug fields (include when available) ----
+            if uid_values is not None:
+                try:
+                    record["uid"] = str(uid_values[i])
+                except Exception:
+                    pass
+            if question_ids is not None:
+                try:
+                    record["question_id"] = str(question_ids[i])
+                except Exception:
+                    pass
             if raw_prompt_texts is not None:
                 try:
                     record["prompt"] = str(raw_prompt_texts[i])[:500]
+                except Exception:
+                    pass
+            if prompt_texts is not None:
+                try:
+                    record["prompt_text"] = str(prompt_texts[i])[:500]
                 except Exception:
                     pass
             if feedback_texts is not None:
@@ -423,14 +562,42 @@ class DataParallelPPOActor(BasePPOActor):
                     record["feedback_text"] = str(feedback_texts[i])[:1000]
                 except Exception:
                     pass
+            record["has_feedback_text"] = has_feedback_text
             if teacher_prompt_texts is not None:
                 try:
                     record["teacher_prompt"] = str(teacher_prompt_texts[i])[:2000]
                 except Exception:
                     pass
+            record["has_correct_hint"] = has_correct_hint
+            record["has_guideline"] = has_guideline
             if ground_truths is not None:
                 try:
                     record["ground_truth_answer"] = str(ground_truths[i])[:500]
+                except Exception:
+                    pass
+            if format_scores is not None:
+                try:
+                    record["format_score"] = float(format_scores[i])
+                except Exception:
+                    pass
+            if accuracy_rewards is not None:
+                try:
+                    record["accuracy_score"] = float(accuracy_rewards[i])
+                except Exception:
+                    pass
+            if overall_rewards is not None:
+                try:
+                    record["overall_reward"] = float(overall_rewards[i])
+                except Exception:
+                    pass
+            if group_has_correct is not None:
+                try:
+                    record["group_has_correct"] = bool(group_has_correct[i])
+                except Exception:
+                    pass
+            if group_has_incorrect is not None:
+                try:
+                    record["group_has_incorrect"] = bool(group_has_incorrect[i])
                 except Exception:
                     pass
             # Video path: extract from multi_modal_data if available
@@ -1999,6 +2166,7 @@ class DataParallelPPOActor(BasePPOActor):
             answer_span_mask = None
             if self.processor is not None:
                 answer_span_mask = self._build_answer_span_mask(responses)
+            reweight_debug_tensors = None
             if self.config.visual_cf_enabled:
                 visual_cf_tensors, visual_cf_metrics = self._compute_visual_cf_signals(
                     model_inputs=model_inputs,
@@ -2014,7 +2182,7 @@ class DataParallelPPOActor(BasePPOActor):
                     temperature=temperature,
                     answer_span_mask=answer_span_mask,
                 )
-                advantages, reweight_metrics = compute_rlsd_token_advantages(
+                advantages, reweight_metrics, reweight_debug_tensors = compute_rlsd_token_advantages(
                     advantages=advantages,
                     teacher_logprobs=teacher_log_probs.detach(),
                     student_logprobs=log_probs.detach(),
@@ -2030,10 +2198,11 @@ class DataParallelPPOActor(BasePPOActor):
                     final_weight_clip_enabled=self.config.visual_cf_final_weight_clip_enabled,
                     final_weight_clip_low=self.config.visual_cf_final_weight_clip_low,
                     final_weight_clip_high=self.config.visual_cf_final_weight_clip_high,
+                    return_debug_tensors=True,
                 )
                 metrics.update({f"visual_cf/{k}": v for k, v in visual_cf_metrics.items()})
             else:
-                advantages, reweight_metrics = compute_rlsd_token_advantages(
+                advantages, reweight_metrics, reweight_debug_tensors = compute_rlsd_token_advantages(
                     advantages=advantages,
                     teacher_logprobs=teacher_log_probs.detach(),
                     student_logprobs=log_probs.detach(),
@@ -2043,6 +2212,7 @@ class DataParallelPPOActor(BasePPOActor):
                     rlsd_eps_w_high=self.config.teacher_reweight_eps_w_high,
                     delta_clamp=self.config.teacher_reweight_delta_clamp,
                     answer_span_mask=answer_span_mask,
+                    return_debug_tensors=True,
                 )
             metrics.update({f"reweight/{k}": v for k, v in reweight_metrics.items()})
 
@@ -2054,16 +2224,31 @@ class DataParallelPPOActor(BasePPOActor):
                     responses=responses,
                     teacher_log_probs=teacher_log_probs,
                     student_log_probs=log_probs,
+                    old_log_probs=old_log_probs,
                     response_mask=response_mask,
                     advantages_orig=model_inputs["advantages"],
+                    advantages_after=advantages,
                     answer_span_mask=answer_span_mask,
+                    reweight_debug_tensors=reweight_debug_tensors,
                     global_step=global_step,
                     effective_lambda=effective_lambda,
+                    teacher_reweight_enabled=self.config.teacher_reweight_enabled,
+                    teacher_reweight_active=teacher_reweight_active,
+                    teacher_forward_executed=bool(metrics.get("reweight/teacher_forward_executed", 0.0) > 0.5),
+                    short_circuit_to_pure_dapo=should_short_circuit_to_pure_dapo,
+                    max_response_length=int(responses.size(-1)),
                     raw_prompt_texts=model_inputs.get("raw_prompt_text", None),
+                    prompt_texts=model_inputs.get("prompt_text", None),
+                    uid_values=model_inputs.get("uid", None),
+                    question_ids=model_inputs.get("problem_id", None),
                     accuracy_rewards=model_inputs.get("accuracy_reward", None),
+                    format_scores=model_inputs.get("format_score", None),
+                    overall_rewards=model_inputs.get("overall_reward", None),
                     feedback_texts=model_inputs.get("feedback_text", None),
                     teacher_prompt_texts=model_inputs.get("teacher_prompt_text", None),
                     ground_truths=model_inputs.get("ground_truth", None),
+                    group_has_correct=model_inputs.get("group_has_correct", None),
+                    group_has_incorrect=model_inputs.get("group_has_incorrect", None),
                     batch_multi_modal_data=model_inputs.get("multi_modal_data", None),
                 )
 
@@ -2277,7 +2462,18 @@ class DataParallelPPOActor(BasePPOActor):
                 ["raw_prompt_text", "prompt_text", "feedback_text", "teacher_prompt_text", "multi_modal_data", "pad_token_id"]
             )
             # Extra fields for teacher-reweight debug dump (safe to include; no-op when dump disabled)
-            non_tensor_select_keys.extend(["accuracy_reward", "ground_truth"])
+            non_tensor_select_keys.extend(
+                [
+                    "accuracy_reward",
+                    "format_score",
+                    "overall_reward",
+                    "ground_truth",
+                    "uid",
+                    "problem_id",
+                    "group_has_correct",
+                    "group_has_incorrect",
+                ]
+            )
         else:
             raise ValueError(f"Unknown actor.loss_mode: {self.config.loss_mode}")
 
