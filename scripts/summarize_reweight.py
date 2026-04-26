@@ -32,6 +32,12 @@ def main():
     after_sum = sum(int(r.get("num_reweighted_tokens_after_answer_mask", 0)) for r in records)
     print(f"num_reweighted_tokens_before_answer_mask (sum): {before_sum}")
     print(f"num_reweighted_tokens_after_answer_mask  (sum): {after_sum}")
+    print(f"num_reweighted_tokens_after_long_response_skip (sum): {after_sum}")
+
+    skipped_long = [r for r in records if r.get("skip_reweight_due_to_long_response") is True]
+    print(f"skip_reweight_due_to_long_response samples: {len(skipped_long)}")
+    if skipped_long:
+        print("  sample_idx:", [r.get("sample_idx") for r in skipped_long])
 
     hit_max = [r for r in records if r.get("hit_max_response_len")]
     print(f"hit_max_response_len samples: {len(hit_max)}")

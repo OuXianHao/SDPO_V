@@ -125,7 +125,9 @@ class DataParallelPPOActor(BasePPOActor):
                         f"eps_w_low={self.config.teacher_reweight_eps_w_low}, "
                         f"eps_w_high={self.config.teacher_reweight_eps_w_high}, "
                         f"delta_clamp={self.config.teacher_reweight_delta_clamp}, "
-                        f"correct_hint={self.config.teacher_reweight_correct_hint}"
+                        f"correct_hint={self.config.teacher_reweight_correct_hint}, "
+                        f"skip_long_response={self.config.teacher_reweight_skip_long_response}, "
+                        f"skip_min_response_len={self.config.teacher_reweight_skip_min_response_len}"
                     )
 
         self._sdpo_backward_shape_debug = os.getenv("SDPO_BACKWARD_SHAPE_DEBUG", "0").strip().lower() in {
@@ -300,6 +302,9 @@ class DataParallelPPOActor(BasePPOActor):
         teacher_reweight_active: bool,
         teacher_forward_executed: bool,
         short_circuit_to_pure_dapo: bool,
+        teacher_reweight_skip_long_response: bool,
+        teacher_reweight_skip_min_response_len: int,
+        skip_reweight_due_to_long_response_mask: Optional[torch.Tensor],
         max_response_length: Optional[int],
         raw_prompt_texts=None,
         prompt_texts=None,
@@ -344,6 +349,11 @@ class DataParallelPPOActor(BasePPOActor):
         adv_after = advantages_after.detach().cpu()
         ans_mask = answer_span_mask.detach().cpu() if answer_span_mask is not None else None
         dbg = {k: v.detach().cpu() for k, v in (reweight_debug_tensors or {}).items()}
+        skip_long_mask = (
+            skip_reweight_due_to_long_response_mask.detach().cpu().bool()
+            if skip_reweight_due_to_long_response_mask is not None
+            else torch.zeros(resp.shape[0], dtype=torch.bool)
+        )
 
         bs = resp.shape[0]
 
@@ -441,6 +451,7 @@ class DataParallelPPOActor(BasePPOActor):
             sample_has_nontrivial_delta = bool((delta_used.abs() > 1e-6).any().item())
             sample_has_reweighted_tokens = bool(num_reweighted_after > 0)
             all_tokens_answer_masked = bool(num_answer_mask_tokens == num_action_tokens and num_action_tokens > 0)
+            skip_long_response_i = bool(skip_long_mask[i].item())
 
             if not teacher_reweight_enabled:
                 inactive_reason = "teacher_reweight_disabled"
@@ -448,6 +459,8 @@ class DataParallelPPOActor(BasePPOActor):
                 inactive_reason = "effective_lambda_zero"
             elif short_circuit_to_pure_dapo:
                 inactive_reason = "short_circuit_to_pure_dapo"
+            elif skip_long_response_i:
+                inactive_reason = "long_response_hit_max_len" if hit_max_response_len else "long_response"
             elif num_action_tokens == 0:
                 inactive_reason = "no_action_tokens"
             elif not sample_has_negative_adv:
@@ -507,6 +520,9 @@ class DataParallelPPOActor(BasePPOActor):
                 "effective_lambda": round(effective_lambda, 6),
                 "teacher_reweight_enabled": bool(teacher_reweight_enabled),
                 "teacher_reweight_active": bool(teacher_reweight_active),
+                "teacher_reweight_skip_long_response": bool(teacher_reweight_skip_long_response),
+                "teacher_reweight_skip_min_response_len": int(teacher_reweight_skip_min_response_len),
+                "skip_reweight_due_to_long_response": skip_long_response_i,
                 "teacher_forward_executed": bool(teacher_forward_executed),
                 "batch_teacher_reweight_active": bool(teacher_reweight_active),
                 "inactive_reason": inactive_reason,
@@ -2162,6 +2178,16 @@ class DataParallelPPOActor(BasePPOActor):
         if teacher_reweight_active:
             with torch.no_grad():
                 teacher_log_probs = self.log_probs_from_logits(teacher_logits, responses)
+            response_len_per_sample = response_mask.sum(dim=-1).long()
+            skip_reweight_due_to_long_response_mask = torch.zeros_like(response_len_per_sample, dtype=torch.bool)
+            if (
+                self.config.teacher_reweight_skip_long_response
+                and self.config.teacher_reweight_skip_min_response_len > 0
+            ):
+                skip_reweight_due_to_long_response_mask = (
+                    response_len_per_sample >= int(self.config.teacher_reweight_skip_min_response_len)
+                )
+            metrics["reweight/skip_long_response_frac"] = skip_reweight_due_to_long_response_mask.float().mean().item()
             # Build answer-span mask to exclude <answer>...</answer> from reweighting
             answer_span_mask = None
             if self.processor is not None:
@@ -2192,6 +2218,7 @@ class DataParallelPPOActor(BasePPOActor):
                     rlsd_eps_w_high=self.config.teacher_reweight_eps_w_high,
                     delta_clamp=self.config.teacher_reweight_delta_clamp,
                     answer_span_mask=answer_span_mask,
+                    skip_rlsd_reweight_mask=skip_reweight_due_to_long_response_mask,
                     visual_cf_enabled=True,
                     base_gate=visual_cf_tensors["base_gate"],
                     visual_factor=visual_cf_tensors["visual_factor"],
@@ -2212,6 +2239,7 @@ class DataParallelPPOActor(BasePPOActor):
                     rlsd_eps_w_high=self.config.teacher_reweight_eps_w_high,
                     delta_clamp=self.config.teacher_reweight_delta_clamp,
                     answer_span_mask=answer_span_mask,
+                    skip_rlsd_reweight_mask=skip_reweight_due_to_long_response_mask,
                     return_debug_tensors=True,
                 )
             metrics.update({f"reweight/{k}": v for k, v in reweight_metrics.items()})
@@ -2236,6 +2264,9 @@ class DataParallelPPOActor(BasePPOActor):
                     teacher_reweight_active=teacher_reweight_active,
                     teacher_forward_executed=bool(metrics.get("reweight/teacher_forward_executed", 0.0) > 0.5),
                     short_circuit_to_pure_dapo=should_short_circuit_to_pure_dapo,
+                    teacher_reweight_skip_long_response=self.config.teacher_reweight_skip_long_response,
+                    teacher_reweight_skip_min_response_len=self.config.teacher_reweight_skip_min_response_len,
+                    skip_reweight_due_to_long_response_mask=skip_reweight_due_to_long_response_mask,
                     max_response_length=int(responses.size(-1)),
                     raw_prompt_texts=model_inputs.get("raw_prompt_text", None),
                     prompt_texts=model_inputs.get("prompt_text", None),

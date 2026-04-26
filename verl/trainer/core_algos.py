@@ -1214,6 +1214,7 @@ def compute_rlsd_token_advantages(
     rlsd_eps_w_high: float = 0.2,
     delta_clamp: float = 5.0,
     answer_span_mask: Optional[torch.Tensor] = None,
+    skip_rlsd_reweight_mask: Optional[torch.Tensor] = None,
     visual_cf_enabled: bool = False,
     base_gate: Optional[torch.Tensor] = None,
     visual_factor: Optional[torch.Tensor] = None,
@@ -1281,6 +1282,12 @@ def compute_rlsd_token_advantages(
             w_t_after_answer_mask,
         )
 
+    # Optional sample-level hard gate: disable RLSD reweight for selected samples.
+    # Gate is applied only to RLSD weights (not to base DAPO inputs).
+    if skip_rlsd_reweight_mask is not None:
+        skip_mask = skip_rlsd_reweight_mask.bool().unsqueeze(-1).expand_as(w_t_after_answer_mask)
+        w_t_after_answer_mask = torch.where(skip_mask, torch.ones_like(w_t_after_answer_mask), w_t_after_answer_mask)
+
     token_weight_rlsd = (1.0 - rlsd_lambda) + rlsd_lambda * w_t_after_answer_mask
 
     if visual_cf_enabled:
@@ -1333,6 +1340,8 @@ def compute_rlsd_token_advantages(
             "advantage_after_reweight": A_hat_t,
             "existing_rlsd_gate": existing_rlsd_gate,
         }
+        if skip_rlsd_reweight_mask is not None:
+            debug_tensors["skip_rlsd_reweight_mask"] = skip_rlsd_reweight_mask.bool()
         return A_hat_t, metrics, debug_tensors
 
     return A_hat_t, metrics
