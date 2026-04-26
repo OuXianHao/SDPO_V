@@ -1220,7 +1220,8 @@ def compute_rlsd_token_advantages(
     final_weight_clip_enabled: bool = False,
     final_weight_clip_low: float = 0.0,
     final_weight_clip_high: float = 10.0,
-) -> tuple[torch.Tensor, dict[str, float]]:
+    return_debug_tensors: bool = False,
+) -> tuple[torch.Tensor, dict[str, float]] | tuple[torch.Tensor, dict[str, float], dict[str, torch.Tensor]]:
     """Token-level advantage reweighting using teacher-student logprob difference.
 
     Uses the privileged teacher's per-token support to modulate the magnitude
@@ -1253,27 +1254,34 @@ def compute_rlsd_token_advantages(
         A_hat_t: (bs, resp_len) — token-level reweighted advantages
         metrics: diagnostic dict
     """
-    # delta_t: positive when teacher is more confident than student on this token
-    delta_t = torch.clamp(teacher_logprobs - student_logprobs, -delta_clamp, delta_clamp)
+    # delta_t_raw: positive when teacher is more confident than student on this token
+    delta_t_raw = teacher_logprobs - student_logprobs
+    delta_t = torch.clamp(delta_t_raw, -delta_clamp, delta_clamp)
 
-    # w_t > 1 when teacher support aligns with advantage sign:
+    # w_t_raw > 1 when teacher support aligns with advantage sign:
     #   A > 0 and teacher more confident → upweight (encourage this token)
     #   A < 0 and teacher less confident → upweight (penalise this token more)
-    w_t = torch.exp(torch.sign(advantages) * delta_t)
-    w_t = torch.clamp(w_t, 1.0 - rlsd_eps_w_low, 1.0 + rlsd_eps_w_high)
+    w_t_raw = torch.exp(torch.sign(advantages) * delta_t)
+    w_t_after_clip = torch.clamp(w_t_raw, 1.0 - rlsd_eps_w_low, 1.0 + rlsd_eps_w_high)
 
     # Existing RLSD gate: only reweight negative-advantage tokens; non-negative → w_t = 1
     # (degenerates to plain DAPO for positively-rewarded rollouts)
     existing_rlsd_gate = advantages < 0
-    w_t = torch.where(existing_rlsd_gate, w_t, torch.ones_like(w_t))
+    w_t_after_advantage_gate = torch.where(existing_rlsd_gate, w_t_after_clip, torch.ones_like(w_t_after_clip))
 
-    token_weight_rlsd = (1.0 - rlsd_lambda) + rlsd_lambda * w_t
+    w_t_after_answer_mask = w_t_after_advantage_gate
 
     # Exclude answer-span tokens from reweighting: keep uniform advantage
     # to prevent over-concentrating credit on final-answer tokens when the
     # teacher guideline includes a correct-option hint.
     if answer_span_mask is not None:
-        token_weight_rlsd = torch.where(answer_span_mask, torch.ones_like(token_weight_rlsd), token_weight_rlsd)
+        w_t_after_answer_mask = torch.where(
+            answer_span_mask,
+            torch.ones_like(w_t_after_answer_mask),
+            w_t_after_answer_mask,
+        )
+
+    token_weight_rlsd = (1.0 - rlsd_lambda) + rlsd_lambda * w_t_after_answer_mask
 
     if visual_cf_enabled:
         if base_gate is None:
@@ -1296,7 +1304,7 @@ def compute_rlsd_token_advantages(
     metrics = {
         "delta_t_mean": VF.masked_mean(delta_t, mask_f).detach().item(),
         "delta_t_abs_mean": VF.masked_mean(delta_t.abs(), mask_f).detach().item(),
-        "w_t_mean": VF.masked_mean(w_t, mask_f).detach().item(),
+        "w_t_mean": VF.masked_mean(w_t_after_advantage_gate, mask_f).detach().item(),
         "token_weight_mean": VF.masked_mean(token_weight, mask_f).detach().item(),
         "token_weight_std": (token_weight * mask_f).std().detach().item(),
         "existing_rlsd_gate_frac": VF.masked_mean(existing_rlsd_gate.float(), mask_f).detach().item(),
@@ -1311,5 +1319,20 @@ def compute_rlsd_token_advantages(
         ans_count = (answer_span_mask & response_mask.bool()).sum().item()
         total_count = response_mask.sum().item()
         metrics["answer_span_frac"] = ans_count / max(total_count, 1)
+
+    if return_debug_tensors:
+        debug_tensors = {
+            "delta_raw": delta_t_raw,
+            "delta_used": delta_t,
+            "w_raw": w_t_raw,
+            "w_after_clip": w_t_after_clip,
+            "w_after_advantage_gate": w_t_after_advantage_gate,
+            "w_after_answer_mask": w_t_after_answer_mask,
+            "final_token_weight_for_loss": token_weight,
+            "advantage_before": advantages,
+            "advantage_after_reweight": A_hat_t,
+            "existing_rlsd_gate": existing_rlsd_gate,
+        }
+        return A_hat_t, metrics, debug_tensors
 
     return A_hat_t, metrics
