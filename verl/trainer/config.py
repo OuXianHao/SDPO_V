@@ -128,6 +128,13 @@ class AlgorithmConfig:
     """If > 0, linearly decay teacher_reweight_lambda from its initial value to 0
     over this many training steps.  At step >= this value, lambda is 0 (no
     reweighting).  If <= 0, lambda is constant (no decay)."""
+    teacher_reweight_skip_long_response: bool = False
+    """Disable RLSD teacher_reweight for long responses at sample level.
+    When enabled together with a positive min length threshold, matching
+    samples keep uniform DAPO advantages (RLSD multiplier forced to 1)."""
+    teacher_reweight_skip_min_response_len: int = 0
+    """Minimum response length to skip RLSD teacher_reweight for a sample.
+    Gate is disabled when <= 0."""
     # ---- Teacher reweight token-level dump (debug/analysis) ----
     teacher_reweight_dump_enabled: bool = False
     """Dump per-sample token-level teacher-reweight analysis to JSONL for
@@ -317,6 +324,8 @@ class PPOConfig:
         self.worker.actor.teacher_reweight_delta_clamp = self.algorithm.teacher_reweight_delta_clamp
         self.worker.actor.teacher_reweight_correct_hint = self.algorithm.teacher_reweight_correct_hint
         self.worker.actor.teacher_reweight_lambda_decay_to_zero_step = self.algorithm.teacher_reweight_lambda_decay_to_zero_step
+        self.worker.actor.teacher_reweight_skip_long_response = self.algorithm.teacher_reweight_skip_long_response
+        self.worker.actor.teacher_reweight_skip_min_response_len = self.algorithm.teacher_reweight_skip_min_response_len
         # Teacher reweight dump propagation
         self.worker.actor.teacher_reweight_dump_enabled = self.algorithm.teacher_reweight_dump_enabled
         self.worker.actor.teacher_reweight_dump_path = self.algorithm.teacher_reweight_dump_path
