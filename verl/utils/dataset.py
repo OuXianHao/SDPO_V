@@ -476,6 +476,14 @@ class RLHFDataset(Dataset):
         return len(prompt_ids)
 
     def _filter_overlong_prompts(self, example: dict[str, Any]) -> bool:
+        if self.dataset_mode == "rlsd_v_frames32_jsonl":
+            _prompt_body, wrapped_prompt = self._build_rlsd_v_frames32_prompt_body(example)
+            tmp = dict(example)
+            tmp[self.prompt_key] = wrapped_prompt
+            tmp[self.video_key] = tmp.get(self.frame_key, [])
+            messages, _ = self._build_messages(tmp)
+            prompt_len = self._estimate_prompt_length_text_only(messages, use_processor_template=True)
+            return prompt_len <= self.max_prompt_length
         messages, _ = self._build_messages(example)
         if self.image_key in example:
             prompt_len = self._estimate_prompt_length_text_only(messages, use_processor_template=True)
@@ -583,14 +591,7 @@ class RLHFDataset(Dataset):
             left_pad=True,
             truncation=self.truncation,
         )
-        raw_prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
-        if len(raw_prompt_ids) > self.max_prompt_length:
-            if self.truncation == "left":
-                raw_prompt_ids = raw_prompt_ids[-self.max_prompt_length :]
-            elif self.truncation == "right":
-                raw_prompt_ids = raw_prompt_ids[: self.max_prompt_length]
-            elif self.truncation == "error":
-                raise RuntimeError(f"Prompt length {len(raw_prompt_ids)} is longer than {self.max_prompt_length}.")
+        raw_prompt_ids = self._encode_raw_prompt_ids(prompt)
 
         example["input_ids"] = input_ids
         example["attention_mask"] = attention_mask
