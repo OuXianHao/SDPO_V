@@ -1014,26 +1014,40 @@ class DataParallelPPOActor(BasePPOActor):
 
             processor_inputs: dict[str, Any]
             if multi_modal_data is not None and "videos" in multi_modal_data:
-                processed_videos = []
-                video_fps_list = []
-                for video in multi_modal_data["videos"]:
-                    processed_video, video_sample_fps = process_video(
-                        video,
-                        self.min_pixels,
-                        self.max_pixels,
-                        self.video_fps,
-                        return_fps=True,
+                if bool(multi_modal_data.get("video_is_frame_paths", False)):
+                    frame_paths = list(multi_modal_data["videos"])
+                    processed_frames = [process_image(frame_path, self.min_pixels, self.max_pixels) for frame_path in frame_paths]
+                    processor_inputs = dict(
+                        self.processor(
+                            videos=[processed_frames],
+                            text=[teacher_prompt],
+                            add_special_tokens=False,
+                            return_tensors="pt",
+                        )
                     )
-                    processed_videos.append(processed_video)
-                    video_fps_list.append(video_sample_fps)
-                processor_inputs = dict(
-                    self.processor(videos=processed_videos, text=[teacher_prompt], add_special_tokens=False, return_tensors="pt")
-                )
-                if "second_per_grid_ts" in self.processor.model_input_names and len(video_fps_list) > 0:
-                    processor_inputs["second_per_grid_ts"] = torch.tensor(
-                        [2.0 / max(float(video_sample_fps), 1e-6) for video_sample_fps in video_fps_list],
-                        dtype=torch.float32,
+                    if "second_per_grid_ts" in self.processor.model_input_names:
+                        processor_inputs["second_per_grid_ts"] = torch.tensor([1.0], dtype=torch.float32)
+                else:
+                    processed_videos = []
+                    video_fps_list = []
+                    for video in multi_modal_data["videos"]:
+                        processed_video, video_sample_fps = process_video(
+                            video,
+                            self.min_pixels,
+                            self.max_pixels,
+                            self.video_fps,
+                            return_fps=True,
+                        )
+                        processed_videos.append(processed_video)
+                        video_fps_list.append(video_sample_fps)
+                    processor_inputs = dict(
+                        self.processor(videos=processed_videos, text=[teacher_prompt], add_special_tokens=False, return_tensors="pt")
                     )
+                    if "second_per_grid_ts" in self.processor.model_input_names and len(video_fps_list) > 0:
+                        processor_inputs["second_per_grid_ts"] = torch.tensor(
+                            [2.0 / max(float(video_sample_fps), 1e-6) for video_sample_fps in video_fps_list],
+                            dtype=torch.float32,
+                        )
             elif multi_modal_data is not None and "images" in multi_modal_data:
                 processed_images = [process_image(image, self.min_pixels, self.max_pixels) for image in multi_modal_data["images"]]
                 processor_inputs = dict(
@@ -1667,6 +1681,23 @@ class DataParallelPPOActor(BasePPOActor):
 
         # Get video_grid_thw for frame-level degradation
         video_grid_thw = mm_inputs.get("video_grid_thw", None)
+        if _debug and self.rank == 0:
+            gfi = model_inputs.get("ground_frame_indices", None)
+            qids = model_inputs.get("question_id", None)
+            pv = mm_inputs.get("pixel_values_videos", None)
+            print(
+                "[sdpo_v] metadata_alignment "
+                f"len_ground_frame_indices={len(gfi) if gfi is not None else 'None'} "
+                f"len_question_id={len(qids) if qids is not None else 'None'} "
+                f"video_grid_thw_shape={tuple(video_grid_thw.shape) if video_grid_thw is not None else 'None'} "
+                f"pixel_values_videos_shape={tuple(pv.shape) if pv is not None else 'None'} "
+                f"response_batch_size={model_inputs['responses'].shape[0]}"
+            )
+            if video_grid_thw is not None and gfi is not None and len(gfi) != int(video_grid_thw.shape[0]):
+                print(
+                    "[sdpo_v][warn] metadata/video count mismatch: "
+                    f"len_ground_frame_indices={len(gfi)} vs num_videos={int(video_grid_thw.shape[0])}"
+                )
 
         # Extract vision config for proper spatial blur reconstruction.
         _vcfg = getattr(getattr(self.actor_module, "config", None), "vision_config", None)
@@ -1685,6 +1716,10 @@ class DataParallelPPOActor(BasePPOActor):
             patch_size=_patch_size,
             temporal_patch_size=_temporal_patch_size,
             in_channels=_in_channels,
+            keyframe_indices=model_inputs.get("ground_frame_indices", None),
+            use_keyframe_mask=self.config.sdpo_v_use_keyframe_mask,
+            debug=self.config.sdpo_v_debug,
+            sample_ids=model_inputs.get("question_id", None),
         )
 
         if _debug and self.rank == 0:
@@ -1843,6 +1878,10 @@ class DataParallelPPOActor(BasePPOActor):
                 patch_size=_patch_size,
                 temporal_patch_size=_temporal_patch_size,
                 in_channels=_in_channels,
+                keyframe_indices=model_inputs.get("ground_frame_indices", None),
+                use_keyframe_mask=self.config.sdpo_v_use_keyframe_mask,
+                debug=self.config.sdpo_v_debug,
+                sample_ids=model_inputs.get("question_id", None),
             )
 
         # ---- Bad-video EMA reference forward (no_grad) ----

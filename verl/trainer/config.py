@@ -34,6 +34,7 @@ def recursive_post_init(dataclass_obj):
 
 @dataclass
 class DataConfig:
+    dataset_mode: str = "default"
     train_files: str = ""
     val_files: str = ""
     prompt_key: str = "prompt"
@@ -55,6 +56,9 @@ class DataConfig:
     max_pixels: Optional[int] = 4194304
     filter_overlong_prompts: bool = True
     filter_overlong_prompts_workers: int = 16
+    target_num_frames: int = 32
+    frame_key: str = "frame_paths"
+    ground_frame_key: str = "ground_frame_indices"
 
     def post_init(self):
         self.image_dir = get_abs_path(self.image_dir, prompt="Image directory")
@@ -170,7 +174,9 @@ class AlgorithmConfig:
     sdpo_v_margin_mode: str = "constant"
     """Margin mode for SDPO-V. Currently only 'constant' is supported."""
     sdpo_v_bad_video_mode: str = "blur"
-    """Bad-video construction strategy: 'blur', 'drop', 'blur_and_drop', 'shuffle'."""
+    """Bad-video construction strategy: 'blur', 'drop', 'blur_and_drop', 'shuffle', 'keyframe_blackout'."""
+    sdpo_v_use_keyframe_mask: bool = False
+    """Use deterministic keyframe masking from dataset metadata for bad-video construction."""
     sdpo_v_blur_sigma: float = 5.0
     """Gaussian blur sigma for bad-video blur mode."""
     sdpo_v_blur_fraction: float = 0.5
@@ -340,6 +346,7 @@ class PPOConfig:
         self.worker.actor.sdpo_v_margin = self.algorithm.sdpo_v_margin
         self.worker.actor.sdpo_v_margin_mode = self.algorithm.sdpo_v_margin_mode
         self.worker.actor.sdpo_v_bad_video_mode = self.algorithm.sdpo_v_bad_video_mode
+        self.worker.actor.sdpo_v_use_keyframe_mask = self.algorithm.sdpo_v_use_keyframe_mask
         self.worker.actor.sdpo_v_blur_sigma = self.algorithm.sdpo_v_blur_sigma
         self.worker.actor.sdpo_v_blur_fraction = self.algorithm.sdpo_v_blur_fraction
         self.worker.actor.sdpo_v_drop_fraction = self.algorithm.sdpo_v_drop_fraction
