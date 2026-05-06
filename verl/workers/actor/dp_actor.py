@@ -1685,6 +1685,10 @@ class DataParallelPPOActor(BasePPOActor):
             patch_size=_patch_size,
             temporal_patch_size=_temporal_patch_size,
             in_channels=_in_channels,
+            keyframe_indices=model_inputs.get("ground_frame_indices", None),
+            use_keyframe_mask=self.config.sdpo_v_use_keyframe_mask,
+            debug=self.config.sdpo_v_debug,
+            sample_ids=model_inputs.get("question_id", None),
         )
 
         if _debug and self.rank == 0:
@@ -1843,6 +1847,10 @@ class DataParallelPPOActor(BasePPOActor):
                 patch_size=_patch_size,
                 temporal_patch_size=_temporal_patch_size,
                 in_channels=_in_channels,
+                keyframe_indices=model_inputs.get("ground_frame_indices", None),
+                use_keyframe_mask=self.config.sdpo_v_use_keyframe_mask,
+                debug=self.config.sdpo_v_debug,
+                sample_ids=model_inputs.get("question_id", None),
             )
 
         # ---- Bad-video EMA reference forward (no_grad) ----

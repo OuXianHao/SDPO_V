@@ -156,6 +156,7 @@ class ActorConfig:
     sdpo_v_margin: float = field(default=0.1, init=False)
     sdpo_v_margin_mode: str = field(default="constant", init=False)
     sdpo_v_bad_video_mode: str = field(default="blur", init=False)
+    sdpo_v_use_keyframe_mask: bool = field(default=False, init=False)
     sdpo_v_blur_sigma: float = field(default=5.0, init=False)
     sdpo_v_blur_fraction: float = field(default=0.5, init=False)
     sdpo_v_drop_fraction: float = field(default=0.5, init=False)

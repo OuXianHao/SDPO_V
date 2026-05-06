@@ -41,6 +41,10 @@ def create_dataloader(config: DataConfig, tokenizer: PreTrainedTokenizer, proces
         max_pixels=config.max_pixels,
         filter_overlong_prompts=config.filter_overlong_prompts,
         filter_overlong_prompts_workers=config.filter_overlong_prompts_workers,
+        dataset_mode=config.dataset_mode,
+        target_num_frames=config.target_num_frames,
+        frame_key=config.frame_key,
+        ground_frame_key=config.ground_frame_key,
     )
     # use sampler for better ckpt resume
     if config.shuffle:
@@ -81,6 +85,10 @@ def create_dataloader(config: DataConfig, tokenizer: PreTrainedTokenizer, proces
         min_pixels=config.min_pixels,
         max_pixels=config.max_pixels,
         filter_overlong_prompts=config.filter_overlong_prompts,
+        dataset_mode=config.dataset_mode,
+        target_num_frames=config.target_num_frames,
+        frame_key=config.frame_key,
+        ground_frame_key=config.ground_frame_key,
     )
 
     if config.val_batch_size == -1:

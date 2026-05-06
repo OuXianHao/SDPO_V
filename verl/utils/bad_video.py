@@ -132,6 +132,10 @@ def construct_bad_video_inputs(
     patch_size: int = 14,
     temporal_patch_size: int = 2,
     in_channels: int = 3,
+    keyframe_indices: Optional[list[list[int]]] = None,
+    use_keyframe_mask: bool = False,
+    debug: bool = False,
+    sample_ids: Optional[list[str]] = None,
 ) -> dict[str, torch.Tensor]:
     """Construct bad-video multimodal inputs by degrading pixel_values_videos.
 
@@ -195,8 +199,22 @@ def construct_bad_video_inputs(
         if total_tokens == 0 or t_frames == 0:
             continue
 
-        # Select which frames to degrade
-        if mode == "blur":
+        # Deterministic keyframe masking path (drop/blackout selected frames only).
+        if use_keyframe_mask:
+            raw_indices = keyframe_indices[vid_idx] if (keyframe_indices is not None and vid_idx < len(keyframe_indices)) else []
+            valid_indices = sorted({int(fi) for fi in raw_indices if 0 <= int(fi) < t_frames})
+            if debug:
+                sid = sample_ids[vid_idx] if sample_ids is not None and vid_idx < len(sample_ids) else str(vid_idx)
+                print(
+                    f"[sdpo_v_keyframe_mask] sample={sid} mode={mode} "
+                    f"ground_frame_indices={list(raw_indices)} valid_corrupted_frame_indices={valid_indices} "
+                    f"t_frames={t_frames} tokens_per_frame={tokens_per_frame}"
+                )
+            for fi in valid_indices:
+                start = offset + fi * tokens_per_frame
+                end = start + tokens_per_frame
+                pixel_values[start:end] = 0.0
+        elif mode == "blur":
             num_blur = max(1, int(t_frames * blur_fraction))
             blur_indices = torch.randperm(t_frames, device=pixel_values.device)[:num_blur]
             for fi in blur_indices:
