@@ -107,8 +107,8 @@ def parse_args() -> argparse.Namespace:
         help="Number of video cases per batch (each case usually has 3 questions).",
     )
     parser.add_argument("--max_tokens", type=int, default=128)
-    parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--top_p", type=float, default=1.0)
+    parser.add_argument("--temperature", type=float, default=0.6)
+    parser.add_argument("--top_p", type=float, default=0.9)
     parser.add_argument("--tensor_parallel_size", type=int, default=2)
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.90)
     parser.add_argument("--max_model_len", type=int, default=32768)
