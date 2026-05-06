@@ -14,6 +14,7 @@
 
 import math
 import os
+import re
 from collections import defaultdict
 from io import BytesIO
 from typing import Any, Optional, Union
@@ -347,6 +348,10 @@ class RLHFDataset(Dataset):
         max_pixels: Optional[int] = None,
         filter_overlong_prompts: bool = True,
         filter_overlong_prompts_workers: int = 16,
+        dataset_mode: str = "default",
+        target_num_frames: int = 32,
+        frame_key: str = "frame_paths",
+        ground_frame_key: str = "ground_frame_indices",
     ):
         self.tokenizer = tokenizer
         self.processor = processor
@@ -360,6 +365,10 @@ class RLHFDataset(Dataset):
         self.truncation = truncation
         self.min_pixels = min_pixels
         self.max_pixels = max_pixels
+        self.dataset_mode = dataset_mode
+        self.target_num_frames = target_num_frames
+        self.frame_key = frame_key
+        self.ground_frame_key = ground_frame_key
 
         if "@" in data_path:
             data_path, data_split = data_path.split("@")
@@ -483,6 +492,8 @@ class RLHFDataset(Dataset):
 
     def __getitem__(self, index):
         example: dict = self.dataset[index]
+        if self.dataset_mode == "rlsd_v_frames32_jsonl":
+            return self._getitem_rlsd_v_frames32_jsonl(example)
         raw_prompt_text = example[self.prompt_key]
         messages, prompt_text = self._build_messages(example)
         example.pop(self.prompt_key, None)
@@ -589,3 +600,70 @@ class RLHFDataset(Dataset):
             example["student_prompt_text"] = prompt
         example["ground_truth"] = example.pop(self.answer_key)
         return example
+
+    def _getitem_rlsd_v_frames32_jsonl(self, example: dict[str, Any]) -> dict[str, Any]:
+        question = str(example.get("question", "")).strip()
+        options = example.get("options", [])
+        if not isinstance(options, list):
+            raise TypeError(f"options must be list, got {type(options)}")
+        options_text = "\n".join(str(opt) for opt in options)
+        prompt_body = (
+            f"Question:\n{question}\n\n"
+            f"Options:\n{options_text}\n\n"
+            "Please reason about the video and answer the question.\n"
+            "You must output exactly in this format:\n"
+            "<thinking>your reasoning</thinking>\n"
+            "<answer>one uppercase letter from A to F</answer>\n\n"
+            "Do not output anything else."
+        )
+        wrapped_prompt = f"<video>\n{prompt_body}"
+        example[self.prompt_key] = wrapped_prompt
+        example[self.video_key] = example.get(self.frame_key, [])
+        messages, prompt_text = self._build_messages(example)
+        prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+        frame_paths = self._normalize_video_paths(example.get(self.frame_key))
+        if len(frame_paths) != self.target_num_frames:
+            raise ValueError(f"Expected {self.target_num_frames} frames, got {len(frame_paths)}")
+        processed_videos = [[process_image(p, self.min_pixels, self.max_pixels) for p in frame_paths]]
+        model_inputs = self.processor(videos=processed_videos, text=[prompt], add_special_tokens=False, return_tensors="pt")
+        input_ids = model_inputs.pop("input_ids")[0]
+        attention_mask = model_inputs.pop("attention_mask")[0]
+        if "second_per_grid_ts" in self.processor.model_input_names:
+            model_inputs["second_per_grid_ts"] = [1.0]  # pre-extracted fixed frames
+        if self.processor is not None and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__:
+            from ..models.transformers.qwen3_vl import get_rope_index
+            vision_position_ids = get_rope_index(
+                self.processor,
+                input_ids=input_ids,
+                image_grid_thw=model_inputs.get("image_grid_thw", None),
+                video_grid_thw=model_inputs.get("video_grid_thw", None),
+                second_per_grid_ts=model_inputs.get("second_per_grid_ts", None),
+                attention_mask=attention_mask,
+            )
+            text_position_ids = torch.arange(len(input_ids)).unsqueeze(0)
+            position_ids = torch.cat((text_position_ids, vision_position_ids), dim=0)
+        else:
+            position_ids = torch.clip(attention_mask.cumsum(dim=0) - 1, min=0, max=None)
+        input_ids, attention_mask, position_ids = VF.postprocess_data(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            max_length=self.max_prompt_length,
+            pad_token_id=self.tokenizer.pad_token_id,
+            left_pad=True,
+            truncation=self.truncation,
+        )
+        gt = str(example.get("answer", "")).strip().upper()
+        if re.fullmatch(r"[A-F]", gt) is None:
+            raise ValueError(f"Invalid ground truth answer for rlsd_v_frames32_jsonl: {gt!r}")
+        out = dict(example)
+        out["input_ids"] = input_ids
+        out["attention_mask"] = attention_mask
+        out["position_ids"] = position_ids
+        out["raw_prompt_ids"] = self.tokenizer.encode(prompt, add_special_tokens=False)
+        out["raw_prompt_text"] = prompt_body
+        out["prompt_text"] = wrapped_prompt
+        out["multi_modal_data"] = {"videos": frame_paths}
+        out["ground_truth"] = gt
+        out["ground_frame_indices"] = example.get(self.ground_frame_key, [])
+        return out
