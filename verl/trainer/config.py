@@ -174,7 +174,7 @@ class AlgorithmConfig:
     sdpo_v_margin_mode: str = "constant"
     """Margin mode for SDPO-V. Currently only 'constant' is supported."""
     sdpo_v_bad_video_mode: str = "blur"
-    """Bad-video construction strategy: 'blur', 'drop', 'blur_and_drop', 'shuffle', 'keyframe_blackout'."""
+    """Bad-video construction strategy: 'blur', 'drop', 'blur_and_drop', 'shuffle'."""
     sdpo_v_use_keyframe_mask: bool = False
     """Use deterministic keyframe masking from dataset metadata for bad-video construction."""
     sdpo_v_blur_sigma: float = 5.0

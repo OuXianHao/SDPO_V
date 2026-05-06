@@ -85,7 +85,6 @@ def create_dataloader(config: DataConfig, tokenizer: PreTrainedTokenizer, proces
         min_pixels=config.min_pixels,
         max_pixels=config.max_pixels,
         filter_overlong_prompts=config.filter_overlong_prompts,
-        filter_overlong_prompts_workers=config.filter_overlong_prompts_workers,
         dataset_mode=config.dataset_mode,
         target_num_frames=config.target_num_frames,
         frame_key=config.frame_key,

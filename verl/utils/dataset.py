@@ -603,7 +603,21 @@ class RLHFDataset(Dataset):
         return example
 
     def _getitem_rlsd_v_frames32_jsonl(self, example: dict[str, Any]) -> dict[str, Any]:
-        prompt_body, wrapped_prompt = self._build_rlsd_v_frames32_prompt_body(example)
+        question = str(example.get("question", "")).strip()
+        options = example.get("options", [])
+        if not isinstance(options, list):
+            raise TypeError(f"options must be list, got {type(options)}")
+        options_text = "\n".join(str(opt) for opt in options)
+        prompt_body = (
+            f"Question:\n{question}\n\n"
+            f"Options:\n{options_text}\n\n"
+            "Please reason about the video and answer the question.\n"
+            "You must output exactly in this format:\n"
+            "<thinking>your reasoning</thinking>\n"
+            "<answer>one uppercase letter from A to F</answer>\n\n"
+            "Do not output anything else."
+        )
+        wrapped_prompt = f"<video>\n{prompt_body}"
         example[self.prompt_key] = wrapped_prompt
         example[self.video_key] = example.get(self.frame_key, [])
         messages, prompt_text = self._build_messages(example)
@@ -647,45 +661,10 @@ class RLHFDataset(Dataset):
         out["input_ids"] = input_ids
         out["attention_mask"] = attention_mask
         out["position_ids"] = position_ids
-        out["raw_prompt_ids"] = self._encode_raw_prompt_ids(prompt)
-        out["raw_prompt_text"] = wrapped_prompt
-        out["prompt_text"] = prompt_text
-        if DEBUG_DUMP_WRITER.should_dump():
-            out["student_prompt_text"] = prompt
-        out["multi_modal_data"] = {
-            "videos": frame_paths,
-            "video_is_frame_paths": True,
-            "num_frames": self.target_num_frames,
-        }
+        out["raw_prompt_ids"] = self.tokenizer.encode(prompt, add_special_tokens=False)
+        out["raw_prompt_text"] = prompt_body
+        out["prompt_text"] = wrapped_prompt
+        out["multi_modal_data"] = {"videos": frame_paths}
         out["ground_truth"] = gt
         out["ground_frame_indices"] = example.get(self.ground_frame_key, [])
         return out
-
-    def _build_rlsd_v_frames32_prompt_body(self, example: dict[str, Any]) -> tuple[str, str]:
-        question = str(example.get("question", "")).strip()
-        options = example.get("options", [])
-        if not isinstance(options, list):
-            raise TypeError(f"options must be list, got {type(options)}")
-        options_text = "\n".join(str(opt) for opt in options)
-        prompt_body = (
-            f"Question:\n{question}\n\n"
-            f"Options:\n{options_text}\n\n"
-            "Please reason about the video and answer the question.\n"
-            "You must output exactly in this format:\n"
-            "<thinking>your reasoning</thinking>\n"
-            "<answer>one uppercase letter from A to F</answer>\n\n"
-            "Do not output anything else."
-        )
-        wrapped_prompt = f"<video>\n{prompt_body}"
-        return prompt_body, wrapped_prompt
-
-    def _encode_raw_prompt_ids(self, prompt: str) -> list[int]:
-        raw_prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
-        if len(raw_prompt_ids) > self.max_prompt_length:
-            if self.truncation == "left":
-                raw_prompt_ids = raw_prompt_ids[-self.max_prompt_length :]
-            elif self.truncation == "right":
-                raw_prompt_ids = raw_prompt_ids[: self.max_prompt_length]
-            elif self.truncation == "error":
-                raise RuntimeError(f"Prompt length {len(raw_prompt_ids)} is longer than {self.max_prompt_length}.")
-        return raw_prompt_ids

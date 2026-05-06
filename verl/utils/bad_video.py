@@ -201,36 +201,17 @@ def construct_bad_video_inputs(
 
         # Deterministic keyframe masking path (drop/blackout selected frames only).
         if use_keyframe_mask:
-            if mode not in {"keyframe_blackout", "drop"}:
-                raise ValueError(
-                    f"Unknown keyframe-mask bad-video mode: {mode}. "
-                    "Supported with use_keyframe_mask=True: 'keyframe_blackout' or 'drop'."
-                )
             raw_indices = keyframe_indices[vid_idx] if (keyframe_indices is not None and vid_idx < len(keyframe_indices)) else []
-            expected_raw_frames = t_frames * temporal_patch_size
-            valid_raw_indices = sorted({int(fi) for fi in raw_indices if 0 <= int(fi) < expected_raw_frames})
-            valid_temporal_indices = sorted(
-                {
-                    int(raw_idx) // temporal_patch_size
-                    for raw_idx in valid_raw_indices
-                    if 0 <= (int(raw_idx) // temporal_patch_size) < t_frames
-                }
-            )
+            valid_indices = sorted({int(fi) for fi in raw_indices if 0 <= int(fi) < t_frames})
             if debug:
                 sid = sample_ids[vid_idx] if sample_ids is not None and vid_idx < len(sample_ids) else str(vid_idx)
                 print(
                     f"[sdpo_v_keyframe_mask] sample={sid} mode={mode} "
-                    f"raw_ground_frame_indices={list(raw_indices)} "
-                    f"valid_raw_frame_indices={valid_raw_indices} "
-                    f"mapped_temporal_patch_indices={valid_temporal_indices} "
-                    f"t_frames={t_frames} temporal_patch_size={temporal_patch_size} "
-                    f"expected_raw_frames={expected_raw_frames} tokens_per_frame={tokens_per_frame}"
+                    f"ground_frame_indices={list(raw_indices)} valid_corrupted_frame_indices={valid_indices} "
+                    f"t_frames={t_frames} tokens_per_frame={tokens_per_frame}"
                 )
-            if len(valid_temporal_indices) == 0 and debug:
-                sid = sample_ids[vid_idx] if sample_ids is not None and vid_idx < len(sample_ids) else str(vid_idx)
-                print(f"[sdpo_v_keyframe_mask][warn] sample={sid} has no valid temporal indices; no-op corruption.")
-            for ti in valid_temporal_indices:
-                start = offset + ti * tokens_per_frame
+            for fi in valid_indices:
+                start = offset + fi * tokens_per_frame
                 end = start + tokens_per_frame
                 pixel_values[start:end] = 0.0
         elif mode == "blur":
