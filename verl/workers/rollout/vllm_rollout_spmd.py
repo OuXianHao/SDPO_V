@@ -78,18 +78,28 @@ def _process_multi_modal_data(
             processed_frames = [process_image(frame_path, min_pixels, max_pixels) for frame_path in frame_paths]
             if return_video_metadata:
                 # vLLM Qwen3-VL expects each video item as a tuple:
-                # (frames, metadata_dict). If metadata is missing/None, vLLM
-                # accesses metadata.get(...) and crashes.
-                # For frame-path datasets, frames are already sampled/extracted.
+                # (frames, metadata_dict). For frame-path datasets, frames are
+                # already sampled/extracted and should not be decoded again.
                 frame_count = len(processed_frames)
-                fps = float(multi_modal_data.get("video_fps", video_fps))
-                video_metadata = {
-                    "fps": fps,
-                    "video_fps": fps,
-                    "num_frames": frame_count,
+                fps = 2.0
+                allowed_video_metadata_keys = {
+                    "total_num_frames",
+                    "fps",
+                    "width",
+                    "height",
+                    "duration",
+                    "video_backend",
+                    "frames_indices",
+                }
+                raw_video_metadata = {
                     "total_num_frames": frame_count,
-                    "nframes": frame_count,
-                    "do_sample_frames": False,
+                    "fps": fps,
+                    "duration": frame_count / fps if fps > 0 else None,
+                    "video_backend": "frames",
+                    "frames_indices": list(range(frame_count)),
+                }
+                video_metadata = {
+                    key: value for key, value in raw_video_metadata.items() if key in allowed_video_metadata_keys
                 }
                 videos.append((processed_frames, video_metadata))
             else:
@@ -103,21 +113,22 @@ def _process_multi_modal_data(
                 metadata_obj = videos[-1][1] if return_video_metadata else None
                 metadata_type = type(metadata_obj).__name__ if metadata_obj is not None else None
                 metadata_keys = sorted(metadata_obj.keys()) if isinstance(metadata_obj, dict) else None
+                final_video_container = videos if not return_video_metadata else videos[-1][0]
                 print(
                     "[EASYR1_DEBUG_FRAME_PATH_VIDEO] "
                     f"video_is_frame_paths={video_is_frame_paths}, "
                     f"num_frame_paths={len(frame_paths)}, "
                     f"first_frame_path={first_frame}, "
-                    f"final_video_container={final_type}, "
-                    f"final_video_len={final_len}, "
+                    f"final_video_container={type(final_video_container).__name__}, "
+                    f"final_video_len={len(final_video_container)}, "
                     f"first_processed_frame_type={first_frame_type}, "
                     f"metadata_type={metadata_type}, "
                     f"metadata_keys={metadata_keys}, "
-                    f"fps={metadata_obj.get('fps') if isinstance(metadata_obj, dict) else None}, "
-                    f"video_fps={metadata_obj.get('video_fps') if isinstance(metadata_obj, dict) else None}, "
-                    f"num_frames={metadata_obj.get('num_frames') if isinstance(metadata_obj, dict) else None}, "
                     f"total_num_frames={metadata_obj.get('total_num_frames') if isinstance(metadata_obj, dict) else None}, "
-                    f"do_sample_frames={metadata_obj.get('do_sample_frames') if isinstance(metadata_obj, dict) else None}, "
+                    f"fps={metadata_obj.get('fps') if isinstance(metadata_obj, dict) else None}, "
+                    f"duration={metadata_obj.get('duration') if isinstance(metadata_obj, dict) else None}, "
+                    f"video_backend={metadata_obj.get('video_backend') if isinstance(metadata_obj, dict) else None}, "
+                    f"frames_indices_len={len(metadata_obj.get('frames_indices', [])) if isinstance(metadata_obj, dict) else None}, "
                     f"final_mm_keys={list({'video': videos}.keys())}"
                 )
                 _FRAME_PATH_VIDEO_DEBUG_COUNT += 1
