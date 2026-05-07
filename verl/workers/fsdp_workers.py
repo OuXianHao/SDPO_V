@@ -45,7 +45,7 @@ from ..protocol import DataProto
 from ..single_controller.base import Worker
 from ..single_controller.base.decorator import Dispatch, register
 from ..utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
-from ..utils.dataset import process_image, process_video
+from ..utils.dataset import process_frame_path_video, process_image, process_video
 from ..utils.flops_counter import FlopsCounter
 from ..utils.fsdp_utils import (
     get_fsdp_wrap_policy,
@@ -564,8 +564,21 @@ class FSDPWorker(Worker):
                             images.append(process_image(image, min_pixels, max_pixels))
 
                     if "videos" in multi_modal_data:
-                        for video in multi_modal_data["videos"]:
-                            videos.append(process_video(video, min_pixels, max_pixels, video_fps))
+                        if bool(multi_modal_data.get("video_is_frame_paths", False)):
+                            frame_paths = list(multi_modal_data["videos"])
+                            expected_num_frames = multi_modal_data.get("num_frames")
+                            videos.append(
+                                process_frame_path_video(
+                                    frame_paths,
+                                    min_pixels,
+                                    max_pixels,
+                                    expected_num_frames=expected_num_frames,
+                                    debug_source="fsdp_workers._process_multi_modal_inputs",
+                                )
+                            )
+                        else:
+                            for video in multi_modal_data["videos"]:
+                                videos.append(process_video(video, min_pixels, max_pixels, video_fps))
 
                     if len(images) != 0:
                         # it's necessary to add `dict` to properly convert batch features to dict

@@ -32,7 +32,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from ...protocol import DataProto, batch_collate
 from ...trainer.core_algos import compute_grpo_loss, compute_rlsd_token_advantages, compute_sdpo_logit_loss, compute_sdpo_v_loss, compute_sdpo_v_calibration_stats, compute_sdpo_v_softkl_loss
 from ...utils.bad_video import construct_bad_video_inputs
-from ...utils.dataset import process_image, process_video
+from ...utils.dataset import process_frame_path_video, process_image, process_video
 from ...utils import torch_functional as VF
 from ...utils.py_functional import append_to_dict
 from ...utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
@@ -1016,7 +1016,13 @@ class DataParallelPPOActor(BasePPOActor):
             if multi_modal_data is not None and "videos" in multi_modal_data:
                 if bool(multi_modal_data.get("video_is_frame_paths", False)):
                     frame_paths = list(multi_modal_data["videos"])
-                    processed_frames = [process_image(frame_path, self.min_pixels, self.max_pixels) for frame_path in frame_paths]
+                    processed_frames = process_frame_path_video(
+                        frame_paths,
+                        self.min_pixels,
+                        self.max_pixels,
+                        expected_num_frames=multi_modal_data.get("num_frames"),
+                        debug_source="dp_actor._compute_teacher_reweighting_inputs",
+                    )
                     processor_inputs = dict(
                         self.processor(
                             videos=[processed_frames],

@@ -42,6 +42,35 @@ _VIDEO_SAMPLING_STATS = {
     "short_video": 0,
     "other_reason": 0,
 }
+_FRAME_PATH_VIDEO_DEBUG_COUNT = 0
+
+
+def _maybe_debug_frame_path_video(
+    *,
+    source: str,
+    video_is_frame_paths: bool,
+    frame_paths: list[str],
+    processed_frames: list[Any],
+) -> None:
+    global _FRAME_PATH_VIDEO_DEBUG_COUNT
+    if os.getenv("EASYR1_DEBUG_FRAME_PATH_VIDEO", "0") != "1":
+        return
+    max_prints = int(os.getenv("EASYR1_DEBUG_FRAME_PATH_VIDEO_MAX", "20"))
+    if _FRAME_PATH_VIDEO_DEBUG_COUNT >= max_prints:
+        return
+    first_frame_path = frame_paths[0] if len(frame_paths) > 0 else None
+    first_processed_frame_type = type(processed_frames[0]).__name__ if len(processed_frames) > 0 else None
+    print(
+        "[EASYR1_DEBUG_FRAME_PATH_VIDEO] "
+        f"source={source}, "
+        f"video_is_frame_paths={video_is_frame_paths}, "
+        f"num_frame_paths={len(frame_paths)}, "
+        f"first_frame_path={first_frame_path}, "
+        f"processed_video_container_type={type(processed_frames).__name__}, "
+        f"processed_frame_count={len(processed_frames)}, "
+        f"first_processed_frame_type={first_processed_frame_type}"
+    )
+    _FRAME_PATH_VIDEO_DEBUG_COUNT += 1
 
 
 def _infer_video_backend(metadata: Optional[dict[str, Any]]) -> Optional[str]:
@@ -208,6 +237,27 @@ def process_image(
         image = image.convert("RGB")
 
     return image
+
+
+def process_frame_path_video(
+    frame_paths: list[str],
+    min_pixels: Optional[int],
+    max_pixels: Optional[int],
+    expected_num_frames: Optional[int] = None,
+    debug_source: str = "unknown",
+) -> list[ImageObject]:
+    if not isinstance(frame_paths, list):
+        raise TypeError(f"Expected frame_paths to be a list, but got {type(frame_paths).__name__}")
+    if expected_num_frames is not None and len(frame_paths) != int(expected_num_frames):
+        raise ValueError(f"Expected {expected_num_frames} frame paths, got {len(frame_paths)}")
+    processed_frames = [process_image(p, min_pixels, max_pixels) for p in frame_paths]
+    _maybe_debug_frame_path_video(
+        source=debug_source,
+        video_is_frame_paths=True,
+        frame_paths=frame_paths,
+        processed_frames=processed_frames,
+    )
+    return processed_frames
 
 
 def process_video(
@@ -637,7 +687,15 @@ class RLHFDataset(Dataset):
         frame_paths = self._normalize_video_paths(work_example.get(self.frame_key))
         if len(frame_paths) != self.target_num_frames:
             raise ValueError(f"Expected {self.target_num_frames} frames, got {len(frame_paths)}")
-        processed_videos = [[process_image(p, self.min_pixels, self.max_pixels) for p in frame_paths]]
+        processed_videos = [[
+            *process_frame_path_video(
+                frame_paths,
+                self.min_pixels,
+                self.max_pixels,
+                expected_num_frames=self.target_num_frames,
+                debug_source="dataset._getitem_rlsd_v_frames32_jsonl",
+            )
+        ]]
         model_inputs = self.processor(videos=processed_videos, text=[prompt], add_special_tokens=False, return_tensors="pt")
         input_ids = model_inputs.pop("input_ids")[0]
         attention_mask = model_inputs.pop("attention_mask")[0]
