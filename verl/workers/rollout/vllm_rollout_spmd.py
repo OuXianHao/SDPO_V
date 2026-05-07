@@ -32,6 +32,9 @@ from ...utils.vllm_utils import VLLMHijack
 from .base import BaseRollout
 from .config import RolloutConfig
 
+_FRAME_PATH_VIDEO_DEBUG_COUNT = 0
+_FRAME_PATH_VIDEO_DEBUG_MAX = 5
+
 
 def _repeat_interleave(value: Union[torch.Tensor, np.ndarray], repeats: int) -> Union[torch.Tensor, np.ndarray]:
     # repeat the elements, supports both tensor and numpy array
@@ -58,6 +61,7 @@ def _process_multi_modal_data(
     video_fps: float,
     return_video_metadata: bool = False,
 ) -> dict[str, Any]:
+    global _FRAME_PATH_VIDEO_DEBUG_COUNT
     # may convert image/video paths to preprocessed multimodal objects
     images, videos = [], []
 
@@ -72,13 +76,33 @@ def _process_multi_modal_data(
         if video_is_frame_paths:
             frame_paths = multi_modal_data["videos"]
             processed_frames = [process_image(frame_path, min_pixels, max_pixels) for frame_path in frame_paths]
-            videos.append(processed_frames)
+            if return_video_metadata:
+                # vLLM Qwen3-VL expects each video item as a tuple:
+                # (frames, metadata_dict). If metadata is missing/None, vLLM
+                # accesses metadata.get(...) and crashes.
+                # For frame-path datasets, frames are already sampled/extracted.
+                frame_count = len(processed_frames)
+                fps = float(multi_modal_data.get("video_fps", video_fps))
+                video_metadata = {
+                    "fps": fps,
+                    "video_fps": fps,
+                    "num_frames": frame_count,
+                    "total_num_frames": frame_count,
+                    "nframes": frame_count,
+                    "do_sample_frames": False,
+                }
+                videos.append((processed_frames, video_metadata))
+            else:
+                videos.append(processed_frames)
 
-            if debug_frame_path_video:
+            if debug_frame_path_video and _FRAME_PATH_VIDEO_DEBUG_COUNT < _FRAME_PATH_VIDEO_DEBUG_MAX:
                 first_frame = frame_paths[0] if len(frame_paths) > 0 else None
                 final_type = type(processed_frames).__name__
                 final_len = len(processed_frames)
                 first_frame_type = type(processed_frames[0]).__name__ if final_len > 0 else None
+                metadata_obj = videos[-1][1] if return_video_metadata else None
+                metadata_type = type(metadata_obj).__name__ if metadata_obj is not None else None
+                metadata_keys = sorted(metadata_obj.keys()) if isinstance(metadata_obj, dict) else None
                 print(
                     "[EASYR1_DEBUG_FRAME_PATH_VIDEO] "
                     f"video_is_frame_paths={video_is_frame_paths}, "
@@ -86,8 +110,17 @@ def _process_multi_modal_data(
                     f"first_frame_path={first_frame}, "
                     f"final_video_container={final_type}, "
                     f"final_video_len={final_len}, "
-                    f"first_processed_frame_type={first_frame_type}"
+                    f"first_processed_frame_type={first_frame_type}, "
+                    f"metadata_type={metadata_type}, "
+                    f"metadata_keys={metadata_keys}, "
+                    f"fps={metadata_obj.get('fps') if isinstance(metadata_obj, dict) else None}, "
+                    f"video_fps={metadata_obj.get('video_fps') if isinstance(metadata_obj, dict) else None}, "
+                    f"num_frames={metadata_obj.get('num_frames') if isinstance(metadata_obj, dict) else None}, "
+                    f"total_num_frames={metadata_obj.get('total_num_frames') if isinstance(metadata_obj, dict) else None}, "
+                    f"do_sample_frames={metadata_obj.get('do_sample_frames') if isinstance(metadata_obj, dict) else None}, "
+                    f"final_mm_keys={list({'video': videos}.keys())}"
                 )
+                _FRAME_PATH_VIDEO_DEBUG_COUNT += 1
         else:
             for video in multi_modal_data["videos"]:
                 processed_video = process_video(
@@ -106,7 +139,7 @@ def _process_multi_modal_data(
                 else:
                     videos.append(processed_video)
 
-            if debug_frame_path_video:
+            if debug_frame_path_video and _FRAME_PATH_VIDEO_DEBUG_COUNT < _FRAME_PATH_VIDEO_DEBUG_MAX:
                 print(
                     "[EASYR1_DEBUG_FRAME_PATH_VIDEO] "
                     f"video_is_frame_paths={video_is_frame_paths}, "
@@ -115,6 +148,7 @@ def _process_multi_modal_data(
                     f"final_video_container={type(videos).__name__}, "
                     f"final_video_len={len(videos)}"
                 )
+                _FRAME_PATH_VIDEO_DEBUG_COUNT += 1
 
     if len(images) != 0:
         return {"image": images}
