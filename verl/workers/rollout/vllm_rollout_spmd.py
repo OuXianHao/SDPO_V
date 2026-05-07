@@ -26,7 +26,7 @@ from vllm.lora.request import LoRARequest
 
 from ...protocol import DataProto
 from ...utils import torch_functional as VF
-from ...utils.dataset import process_image, process_video
+from ...utils.dataset import process_frame_path_video, process_image, process_video
 from ...utils.torch_dtypes import PrecisionType
 from ...utils.vllm_utils import VLLMHijack
 from .base import BaseRollout
@@ -75,7 +75,13 @@ def _process_multi_modal_data(
     if "videos" in multi_modal_data:
         if video_is_frame_paths:
             frame_paths = multi_modal_data["videos"]
-            processed_frames = [process_image(frame_path, min_pixels, max_pixels) for frame_path in frame_paths]
+            processed_frames = process_frame_path_video(
+                list(frame_paths),
+                min_pixels,
+                max_pixels,
+                expected_num_frames=multi_modal_data.get("num_frames"),
+                debug_source="vllm_rollout_spmd._process_multi_modal_data",
+            )
             if return_video_metadata:
                 # vLLM Qwen3-VL expects each video item as a tuple:
                 # (frames, metadata_dict). For frame-path datasets, frames are
