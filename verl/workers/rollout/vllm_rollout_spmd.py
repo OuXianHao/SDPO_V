@@ -58,29 +58,63 @@ def _process_multi_modal_data(
     video_fps: float,
     return_video_metadata: bool = False,
 ) -> dict[str, Any]:
-    # may convert image path to image object
+    # may convert image/video paths to preprocessed multimodal objects
     images, videos = [], []
+
+    debug_frame_path_video = os.getenv("EASYR1_DEBUG_FRAME_PATH_VIDEO", "0") == "1"
+    video_is_frame_paths = bool(multi_modal_data.get("video_is_frame_paths", False))
+
     if "images" in multi_modal_data:
         for image in multi_modal_data["images"]:
             images.append(process_image(image, min_pixels, max_pixels))
 
     if "videos" in multi_modal_data:
-        for video in multi_modal_data["videos"]:
-            processed_video = process_video(
-                video,
-                min_pixels,
-                max_pixels,
-                video_fps,
-                return_metadata=return_video_metadata,
-            )
-            # Keep metadata tuples for Qwen3-VL path. vLLM's Qwen3-VL video
-            # processor consumes metadata (e.g. do_sample_frames / fps info)
-            # from the tuple payload. Stripping to only frames makes metadata
-            # become None downstream and crashes in qwen3_vl.py.
-            if isinstance(processed_video, tuple) and not return_video_metadata:
-                videos.append(processed_video[0])
-            else:
-                videos.append(processed_video)
+        if video_is_frame_paths:
+            frame_paths = multi_modal_data["videos"]
+            processed_frames = [process_image(frame_path, min_pixels, max_pixels) for frame_path in frame_paths]
+            videos.append(processed_frames)
+
+            if debug_frame_path_video:
+                first_frame = frame_paths[0] if len(frame_paths) > 0 else None
+                final_type = type(processed_frames).__name__
+                final_len = len(processed_frames)
+                first_frame_type = type(processed_frames[0]).__name__ if final_len > 0 else None
+                print(
+                    "[EASYR1_DEBUG_FRAME_PATH_VIDEO] "
+                    f"video_is_frame_paths={video_is_frame_paths}, "
+                    f"num_frame_paths={len(frame_paths)}, "
+                    f"first_frame_path={first_frame}, "
+                    f"final_video_container={final_type}, "
+                    f"final_video_len={final_len}, "
+                    f"first_processed_frame_type={first_frame_type}"
+                )
+        else:
+            for video in multi_modal_data["videos"]:
+                processed_video = process_video(
+                    video,
+                    min_pixels,
+                    max_pixels,
+                    video_fps,
+                    return_metadata=return_video_metadata,
+                )
+                # Keep metadata tuples for Qwen3-VL path. vLLM's Qwen3-VL video
+                # processor consumes metadata (e.g. do_sample_frames / fps info)
+                # from the tuple payload. Stripping to only frames makes metadata
+                # become None downstream and crashes in qwen3_vl.py.
+                if isinstance(processed_video, tuple) and not return_video_metadata:
+                    videos.append(processed_video[0])
+                else:
+                    videos.append(processed_video)
+
+            if debug_frame_path_video:
+                print(
+                    "[EASYR1_DEBUG_FRAME_PATH_VIDEO] "
+                    f"video_is_frame_paths={video_is_frame_paths}, "
+                    f"num_frame_paths=0, "
+                    f"first_frame_path=None, "
+                    f"final_video_container={type(videos).__name__}, "
+                    f"final_video_len={len(videos)}"
+                )
 
     if len(images) != 0:
         return {"image": images}
