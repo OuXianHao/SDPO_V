@@ -202,6 +202,7 @@ class ActorConfig:
     visual_cf_final_weight_clip_low: float = field(default=0.0, init=False)
     visual_cf_final_weight_clip_high: float = field(default=10.0, init=False)
     visual_cf_bad_video_mode: str = field(default="reuse_existing", init=False)
+    visual_cf_use_keyframe_mask: bool = field(default=False, init=False)
     visual_cf_debug: bool = field(default=False, init=False)
     # ---- Combined DAPO+SDPO lambda weights (set from AlgorithmConfig) ----
     lambda_dapo: float = field(default=1.0, init=False)
