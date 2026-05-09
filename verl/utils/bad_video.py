@@ -202,13 +202,17 @@ def construct_bad_video_inputs(
         # Deterministic keyframe masking path (drop/blackout selected frames only).
         if use_keyframe_mask:
             raw_indices = keyframe_indices[vid_idx] if (keyframe_indices is not None and vid_idx < len(keyframe_indices)) else []
-            valid_indices = sorted({int(fi) for fi in raw_indices if 0 <= int(fi) < t_frames})
+            expected_raw_frames = t_frames * max(int(temporal_patch_size), 1)
+            valid_raw_indices = sorted({int(fi) for fi in raw_indices if 0 <= int(fi) < expected_raw_frames})
+            valid_indices = sorted({int(fi) // max(int(temporal_patch_size), 1) for fi in valid_raw_indices if 0 <= (int(fi) // max(int(temporal_patch_size), 1)) < t_frames})
             if debug:
                 sid = sample_ids[vid_idx] if sample_ids is not None and vid_idx < len(sample_ids) else str(vid_idx)
                 print(
                     f"[sdpo_v_keyframe_mask] sample={sid} mode={mode} "
-                    f"ground_frame_indices={list(raw_indices)} valid_corrupted_frame_indices={valid_indices} "
-                    f"t_frames={t_frames} tokens_per_frame={tokens_per_frame}"
+                    f"ground_frame_indices={list(raw_indices)} valid_raw_frame_indices={valid_raw_indices} "
+                    f"mapped_temporal_patch_indices={valid_indices} temporal_patch_size={temporal_patch_size} "
+                    f"t_frames={t_frames} expected_raw_frames={expected_raw_frames} "
+                    f"masked_temporal_patch_count={len(valid_indices)} tokens_per_frame={tokens_per_frame}"
                 )
             for fi in valid_indices:
                 start = offset + fi * tokens_per_frame

@@ -238,6 +238,8 @@ class AlgorithmConfig:
     """Upper clip bound for final token weight when final clip is enabled."""
     visual_cf_bad_video_mode: str = "reuse_existing"
     """Bad-video mode for visual_cf: 'reuse_existing' or explicit mode supported by bad_video utility."""
+    visual_cf_use_keyframe_mask: bool = False
+    """Use dataset-provided ground_frame_indices (raw frame indices) for visual_cf bad-video masking."""
     visual_cf_debug: bool = False
     """Enable extra debug metrics/logging for visual_cf path."""
 
@@ -376,6 +378,7 @@ class PPOConfig:
         self.worker.actor.visual_cf_final_weight_clip_low = self.algorithm.visual_cf_final_weight_clip_low
         self.worker.actor.visual_cf_final_weight_clip_high = self.algorithm.visual_cf_final_weight_clip_high
         self.worker.actor.visual_cf_bad_video_mode = self.algorithm.visual_cf_bad_video_mode
+        self.worker.actor.visual_cf_use_keyframe_mask = self.algorithm.visual_cf_use_keyframe_mask
         self.worker.actor.visual_cf_debug = self.algorithm.visual_cf_debug
         # Combined DAPO+SDPO lambda propagation
         self.worker.actor.lambda_dapo = self.algorithm.lambda_dapo

@@ -2001,6 +2001,10 @@ class DataParallelPPOActor(BasePPOActor):
                 patch_size=_patch_size,
                 temporal_patch_size=_temporal_patch_size,
                 in_channels=_in_channels,
+                keyframe_indices=model_inputs.get("ground_frame_indices", None),
+                use_keyframe_mask=self.config.visual_cf_use_keyframe_mask,
+                debug=self.config.visual_cf_debug,
+                sample_ids=model_inputs.get("question_id", None),
             )
 
             teacher_bad_logits = self._forward_response_logits(
@@ -2085,6 +2089,17 @@ class DataParallelPPOActor(BasePPOActor):
                         metrics["answer_span_visual_delta_mean"] = 0.0
             elif answer_span_mask is not None:
                 metrics["answer_span_visual_delta_mean"] = 0.0
+            metrics["keyframe_mask_enabled"] = float(bool(self.config.visual_cf_use_keyframe_mask))
+            metrics["keyframe_indices_received"] = float(
+                model_inputs.get("ground_frame_indices", None) is not None
+            )
+            if self.config.visual_cf_debug and self.rank == 0:
+                print(
+                    f"[visual_cf] mode={bad_mode} keyframe_mask={self.config.visual_cf_use_keyframe_mask} "
+                    f"keyframe_indices_received={model_inputs.get('ground_frame_indices', None) is not None} "
+                    f"temporal_patch_size={_temporal_patch_size} t_frames_shape="
+                    f"{tuple(teacher_multi_modal_inputs.get('video_grid_thw', torch.empty(0)).shape)}"
+                )
 
         return {
             "base_gate": base_gate,
