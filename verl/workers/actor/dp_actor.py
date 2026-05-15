@@ -2046,12 +2046,20 @@ class DataParallelPPOActor(BasePPOActor):
                 | (teacher_student_delta > self.config.visual_cf_base_gate_tsdelta_threshold)
             )
             mode = self.config.visual_cf_base_gate_mode
-            if mode == "existing_rlsd_only":
+            reweight_mode = getattr(self.config, "visual_cf_reweight_mode", "rlsd_composed")
+            if reweight_mode == "visual_only":
+                if mode in ("visual_only", "all_valid_response_tokens"):
+                    base_gate = torch.ones_like(existing_rlsd_gate, dtype=torch.bool)
+                else:
+                    base_gate = torch.ones_like(existing_rlsd_gate, dtype=torch.bool)
+            elif mode == "existing_rlsd_only":
                 base_gate = existing_rlsd_gate
             elif mode == "entropy_or_tsdelta":
                 base_gate = informative_gate
             elif mode == "existing_rlsd_and_informative":
                 base_gate = existing_rlsd_gate & informative_gate
+            elif mode in ("visual_only", "all_valid_response_tokens"):
+                base_gate = torch.ones_like(existing_rlsd_gate, dtype=torch.bool)
             else:
                 raise ValueError(f"Unknown visual_cf_base_gate_mode: {mode}")
 
@@ -2100,6 +2108,7 @@ class DataParallelPPOActor(BasePPOActor):
                     f"temporal_patch_size={_temporal_patch_size} t_frames_shape="
                     f"{tuple(teacher_multi_modal_inputs.get('video_grid_thw', torch.empty(0)).shape)}"
                 )
+            metrics["reweight_mode_visual_only"] = float(reweight_mode == "visual_only")
 
         return {
             "base_gate": base_gate,
@@ -2236,6 +2245,11 @@ class DataParallelPPOActor(BasePPOActor):
         # difference to modulate magnitude only (direction unchanged).
         # ================================================================
         if teacher_reweight_active:
+            if (
+                getattr(self.config, "visual_cf_reweight_mode", "rlsd_composed") == "visual_only"
+                and not self.config.visual_cf_enabled
+            ):
+                raise ValueError("visual_cf_reweight_mode=visual_only requires visual_cf_enabled=true.")
             with torch.no_grad():
                 teacher_log_probs = self.log_probs_from_logits(teacher_logits, responses)
             response_len_per_sample = response_mask.sum(dim=-1).long()
@@ -2282,6 +2296,7 @@ class DataParallelPPOActor(BasePPOActor):
                     visual_cf_enabled=True,
                     base_gate=visual_cf_tensors["base_gate"],
                     visual_factor=visual_cf_tensors["visual_factor"],
+                    visual_cf_reweight_mode=self.config.visual_cf_reweight_mode,
                     final_weight_clip_enabled=self.config.visual_cf_final_weight_clip_enabled,
                     final_weight_clip_low=self.config.visual_cf_final_weight_clip_low,
                     final_weight_clip_high=self.config.visual_cf_final_weight_clip_high,
@@ -2300,6 +2315,7 @@ class DataParallelPPOActor(BasePPOActor):
                     delta_clamp=self.config.teacher_reweight_delta_clamp,
                     answer_span_mask=answer_span_mask,
                     skip_rlsd_reweight_mask=skip_reweight_due_to_long_response_mask,
+                    visual_cf_reweight_mode=getattr(self.config, "visual_cf_reweight_mode", "rlsd_composed"),
                     return_debug_tensors=True,
                 )
             metrics.update({f"reweight/{k}": v for k, v in reweight_metrics.items()})
