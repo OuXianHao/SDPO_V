@@ -1,7 +1,7 @@
 import torch
 
 from verl.trainer.config import PPOConfig
-from verl.trainer.core_algos import compute_grpo_outcome_advantage, compute_sdpo_logit_loss
+from verl.trainer.core_algos import compute_grpo_outcome_advantage, compute_rlsd_token_advantages, compute_sdpo_logit_loss
 
 
 def test_grpo_advantage_group_relative_shape_and_centering():
@@ -75,6 +75,7 @@ def test_config_wires_algorithm_modes_into_actor_config():
     config.algorithm.sdpo_divergence = "reverse_kl"
     config.algorithm.sdpo_use_tail = False
     config.algorithm.sdpo_feedback_mode = "scalar_text"
+    config.algorithm.visual_cf_reweight_mode = "visual_only"
     config.post_init()
 
     assert config.worker.actor.loss_mode == "sdpo_logit"
@@ -82,6 +83,7 @@ def test_config_wires_algorithm_modes_into_actor_config():
     assert config.worker.actor.sdpo_divergence == "reverse_kl"
     assert config.worker.actor.sdpo_use_tail is False
     assert config.worker.actor.sdpo_feedback_mode == "scalar_text"
+    assert config.worker.actor.visual_cf_reweight_mode == "visual_only"
 
 
 def test_config_wires_successful_rollout_feedback_mode():
@@ -92,3 +94,51 @@ def test_config_wires_successful_rollout_feedback_mode():
 
     assert config.worker.actor.loss_mode == "sdpo_logit"
     assert config.worker.actor.sdpo_feedback_mode == "successful_rollout"
+
+
+def test_visual_cf_visual_only_reweight_ignores_rlsd_delta_weight():
+    advantages = torch.tensor([[-1.0, -1.0]], dtype=torch.float32)
+    teacher = torch.tensor([[2.0, 2.0]], dtype=torch.float32)
+    student = torch.tensor([[0.0, 0.0]], dtype=torch.float32)
+    response_mask = torch.tensor([[1, 1]], dtype=torch.bool)
+    visual_factor = torch.tensor([[1.5, 1.1]], dtype=torch.float32)
+    base_gate = torch.tensor([[1, 1]], dtype=torch.bool)
+
+    _, metrics_composed, dbg_composed = compute_rlsd_token_advantages(
+        advantages=advantages,
+        teacher_logprobs=teacher,
+        student_logprobs=student,
+        response_mask=response_mask,
+        rlsd_lambda=0.5,
+        rlsd_eps_w_low=0.2,
+        rlsd_eps_w_high=0.2,
+        delta_clamp=5.0,
+        visual_cf_enabled=True,
+        visual_cf_reweight_mode="rlsd_composed",
+        base_gate=base_gate,
+        visual_factor=visual_factor,
+        return_debug_tensors=True,
+    )
+    _, metrics_visual_only, dbg_visual_only = compute_rlsd_token_advantages(
+        advantages=advantages,
+        teacher_logprobs=teacher,
+        student_logprobs=student,
+        response_mask=response_mask,
+        rlsd_lambda=0.5,
+        rlsd_eps_w_low=0.2,
+        rlsd_eps_w_high=0.2,
+        delta_clamp=5.0,
+        visual_cf_enabled=True,
+        visual_cf_reweight_mode="visual_only",
+        base_gate=base_gate,
+        visual_factor=visual_factor,
+        return_debug_tensors=True,
+    )
+
+    assert torch.allclose(dbg_visual_only["final_token_weight_for_loss"], visual_factor, atol=1e-6)
+    assert not torch.allclose(
+        dbg_composed["final_token_weight_for_loss"],
+        dbg_visual_only["final_token_weight_for_loss"],
+        atol=1e-6,
+    )
+    assert metrics_visual_only["reweight_mode_visual_only"] == 1.0

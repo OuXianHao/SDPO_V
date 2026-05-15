@@ -1216,6 +1216,7 @@ def compute_rlsd_token_advantages(
     answer_span_mask: Optional[torch.Tensor] = None,
     skip_rlsd_reweight_mask: Optional[torch.Tensor] = None,
     visual_cf_enabled: bool = False,
+    visual_cf_reweight_mode: str = "rlsd_composed",
     base_gate: Optional[torch.Tensor] = None,
     visual_factor: Optional[torch.Tensor] = None,
     final_weight_clip_enabled: bool = False,
@@ -1290,15 +1291,24 @@ def compute_rlsd_token_advantages(
 
     token_weight_rlsd = (1.0 - rlsd_lambda) + rlsd_lambda * w_t_after_answer_mask
 
+    if visual_cf_reweight_mode not in {"rlsd_composed", "visual_only"}:
+        raise ValueError(f"Unknown visual_cf_reweight_mode: {visual_cf_reweight_mode}")
+
+    if visual_cf_reweight_mode == "visual_only" and not visual_cf_enabled:
+        raise ValueError("visual_cf_reweight_mode=visual_only requires visual_cf_enabled=True.")
+
     if visual_cf_enabled:
         if base_gate is None:
-            base_gate = existing_rlsd_gate
+            base_gate = existing_rlsd_gate if visual_cf_reweight_mode == "rlsd_composed" else response_mask.bool()
         base_gate = base_gate.bool()
         if visual_factor is None:
             visual_factor = torch.ones_like(token_weight_rlsd)
         if visual_factor.shape != token_weight_rlsd.shape:
             raise ValueError("visual_factor must align with token_weight shape.")
-        token_weight = 1.0 + base_gate.float() * (token_weight_rlsd - 1.0) * visual_factor
+        if visual_cf_reweight_mode == "visual_only":
+            token_weight = torch.where(base_gate, visual_factor, torch.ones_like(visual_factor))
+        else:
+            token_weight = 1.0 + base_gate.float() * (token_weight_rlsd - 1.0) * visual_factor
         if final_weight_clip_enabled:
             token_weight = torch.clamp(token_weight, final_weight_clip_low, final_weight_clip_high)
     else:
@@ -1318,10 +1328,20 @@ def compute_rlsd_token_advantages(
     }
     if visual_cf_enabled:
         metrics["visual_cf_enabled"] = 1.0
+        metrics["reweight_mode_visual_only"] = 1.0 if visual_cf_reweight_mode == "visual_only" else 0.0
         metrics["base_gate_frac"] = VF.masked_mean(base_gate.float(), mask_f).detach().item()
         metrics["visual_factor_mean"] = VF.masked_mean(visual_factor, mask_f).detach().item()
+        if visual_cf_reweight_mode == "visual_only":
+            metrics["visual_only_enabled"] = 1.0
+            metrics["visual_only_token_weight_mean"] = metrics["token_weight_mean"]
+            metrics["visual_only_token_weight_std"] = metrics["token_weight_std"]
+            metrics["visual_only_applied_frac"] = VF.masked_mean(base_gate.float(), mask_f).detach().item()
+        else:
+            metrics["visual_only_enabled"] = 0.0
     else:
         metrics["visual_cf_enabled"] = 0.0
+        metrics["reweight_mode_visual_only"] = 0.0
+        metrics["visual_only_enabled"] = 0.0
     if answer_span_mask is not None:
         ans_count = (answer_span_mask & response_mask.bool()).sum().item()
         total_count = response_mask.sum().item()

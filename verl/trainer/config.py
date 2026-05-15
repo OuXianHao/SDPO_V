@@ -214,6 +214,8 @@ class AlgorithmConfig:
     # ---- Visual counterfactual branch for RLSD token reweighting ----
     visual_cf_enabled: bool = False
     """Enable visual counterfactual emphasis in RLSD token reweight path (dapo_with_sdpo + teacher_reweight only)."""
+    visual_cf_reweight_mode: str = "rlsd_composed"
+    """How visual_cf composes token reweight: 'rlsd_composed' (default) or 'visual_only'."""
     visual_cf_base_gate_mode: str = "existing_rlsd_only"
     """Base gate mode: 'existing_rlsd_only', 'entropy_or_tsdelta', 'existing_rlsd_and_informative'."""
     visual_cf_base_gate_entropy_threshold: float = 0.0
@@ -366,6 +368,7 @@ class PPOConfig:
         self.worker.actor.sdpo_v_softkl_kl_max = self.algorithm.sdpo_v_softkl_kl_max
         # visual_cf propagation
         self.worker.actor.visual_cf_enabled = self.algorithm.visual_cf_enabled
+        self.worker.actor.visual_cf_reweight_mode = self.algorithm.visual_cf_reweight_mode
         self.worker.actor.visual_cf_base_gate_mode = self.algorithm.visual_cf_base_gate_mode
         self.worker.actor.visual_cf_base_gate_entropy_threshold = self.algorithm.visual_cf_base_gate_entropy_threshold
         self.worker.actor.visual_cf_base_gate_tsdelta_threshold = self.algorithm.visual_cf_base_gate_tsdelta_threshold

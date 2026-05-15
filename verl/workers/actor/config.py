@@ -190,6 +190,7 @@ class ActorConfig:
     teacher_reweight_dump_max_incorrect: int = field(default=10, init=False)
     # ---- visual_cf auto-keys (set from AlgorithmConfig) ----
     visual_cf_enabled: bool = field(default=False, init=False)
+    visual_cf_reweight_mode: str = field(default="rlsd_composed", init=False)
     visual_cf_base_gate_mode: str = field(default="existing_rlsd_only", init=False)
     visual_cf_base_gate_entropy_threshold: float = field(default=0.0, init=False)
     visual_cf_base_gate_tsdelta_threshold: float = field(default=0.0, init=False)
